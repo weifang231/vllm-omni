@@ -57,7 +57,10 @@ from vllm_omni.experimental.fullduplex.engine.messages import (
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.runtime_instrumentation import RUNTIME_CONTROL_FILE_ENV
+from vllm_omni.utils.runtime_instrumentation import (
+    RUNTIME_CONTROL_FILE_ENV,
+    RUNTIME_METRICS_DIR_ENV,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -602,6 +605,34 @@ async def test_runtime_queue_control_enforces_wip_and_edf_at_stage_submit(
     await _enqueue_abort_request(fixture, ["early"])
     await _wait_for(lambda: len(stage.add_request_calls) == 3)
     assert stage.add_request_calls[2][0].request_id == "late"
+
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_default_off_without_runtime_env_bypasses_queue_controller(
+    monkeypatch: pytest.MonkeyPatch,
+    orchestrator_factory,
+) -> None:
+    monkeypatch.delenv(RUNTIME_CONTROL_FILE_ENV, raising=False)
+    monkeypatch.delenv(RUNTIME_METRICS_DIR_ENV, raising=False)
+
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    await _enqueue_add_request(
+        fixture,
+        request_id="stock-path",
+        prompt=FakePromptRequest("stock-path", [1]),
+        original_prompt={"prompt": "stock-path"},
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    await _wait_for(lambda: len(stage.add_request_calls) == 1)
+
+    snapshot = fixture.orchestrator._queue_controller.snapshot()
+    assert snapshot["enqueued_total"] == 0
+    assert snapshot["active_requests"] == 0
+    assert snapshot["active_by_stage"] == {}
 
     await _shutdown_orchestrator(fixture)
 

@@ -651,7 +651,12 @@ class Orchestrator:
 
     def _write_queue_control_snapshot(self, *, force: bool = False) -> None:
         instrumentation = getattr(self, "_queue_instrumentation", None)
-        if instrumentation is None:
+        if instrumentation is None or not instrumentation.metrics_enabled:
+            return
+        # Building a controller snapshot walks active and pending requests.
+        # Check the rate limit before constructing it so telemetry cannot add
+        # O(WIP) work to every stage dispatch on the orchestrator event loop.
+        if not force and not instrumentation.snapshot_due():
             return
         instrumentation.write_snapshot(
             self._ensure_queue_controller().snapshot(),
@@ -697,6 +702,16 @@ class Orchestrator:
             )
 
         controller = self._ensure_queue_controller()
+        instrumentation = getattr(self, "_queue_instrumentation", None)
+        if not controller.enabled and (
+            instrumentation is None
+            or not (instrumentation.control_enabled or instrumentation.metrics_enabled)
+        ):
+            # Preserve the stock hot path when runtime control and telemetry
+            # are both absent. A configured control file still goes through
+            # the controller while disabled so live enabling sees all leases.
+            await guarded_dispatch()
+            return
         controller.enqueue(
             PendingStageDispatch(
                 request_id=request_id,
