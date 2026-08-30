@@ -41,6 +41,7 @@ from vllm_omni.entrypoints.openai.playback_start import (
     PLAYBACK_DEADLINE_EVENT,
     PlaybackStartBuffer,
     PlaybackStartConfig,
+    PlaybackTerminalStatus,
     iterate_with_playback_deadline,
     playback_start_config_from_headers,
 )
@@ -1511,27 +1512,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if playback_start_config is not None and adapter is not None and adapter.supports_playback_start
             else None
         )
-        playback_telemetry_recorded = False
 
-        def record_playback_telemetry(status: str) -> None:
-            nonlocal playback_telemetry_recorded
-            if playback_start is None or playback_telemetry_recorded:
-                return
-            telemetry = playback_start.telemetry(status=status)
-            playback_telemetry_recorded = True
-            if raw_request is not None:
-                raw_request.state.playback_start_telemetry = telemetry
-            logger.info(
-                "[PlaybackStart] request_id=%s status=%s target_ms=%.3f "
-                "buffered_audio_ms=%.3f hold_ms=%.3f release_reason=%s deadline_fallback=%s",
-                request_id,
-                telemetry["status"],
-                telemetry["target_ms"],
-                telemetry["buffered_audio_ms"],
-                telemetry["hold_ms"],
-                telemetry["release_reason"],
-                telemetry["deadline_fallback"],
-            )
+        def record_playback_telemetry(status: PlaybackTerminalStatus) -> None:
+            if playback_start is not None:
+                playback_start.record_telemetry(
+                    request_id=request_id,
+                    status=status,
+                    request_state=getattr(raw_request, "state", None),
+                )
 
         def queue_audio_chunk(audio_bytes, chunk_np, result, output_sample_rate, wav_header):
             packet = (audio_bytes, chunk_np, result, output_sample_rate)
@@ -1540,7 +1528,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return (*prefixes, packet)
             return playback_start.add_pcm(
                 packet,
-                pcm_bytes=audio_bytes,
+                pcm_byte_count=len(audio_bytes),
                 sample_rate=output_sample_rate,
                 num_channels=_infer_audio_num_channels(np.asarray(chunk_np)),
                 prefix_items=prefixes,
@@ -1782,7 +1770,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if result_stream is not generator:
                 await result_stream.aclose()
-            if playback_start is not None and not playback_telemetry_recorded:
+            if playback_start is not None:
                 playback_start.terminate("cancelled")
                 record_playback_telemetry("cancelled")
             if not artifact_ready:

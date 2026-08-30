@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Opt-in playback-start buffering for streaming speech responses.
+"""Opt-in playback-start buffering for streaming audio responses.
 
 The controller chooses a startup-buffer target.  This module only implements
 the serving mechanism that holds playable PCM until that target, the
@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from vllm.logger import init_logger
 
 from vllm_omni.engine.queue_control import (
     FIRST_OUTPUT_DEADLINE_MS_HEADER,
@@ -32,7 +34,10 @@ PLAYBACK_BUFFER_MS_HEADER = "x-vllm-omni-playback-buffer-ms"
 MAX_PLAYBACK_BUFFER_MS = 60_000.0
 
 PlaybackReleaseReason = Literal["target", "deadline", "eos", "cancelled", "error"]
+PlaybackTerminalStatus = Literal["ok", "cancelled", "engine_dead", "error"]
 PLAYBACK_DEADLINE_EVENT = object()
+
+logger = init_logger(__name__)
 
 
 def _nonnegative_header_ms(value: Any, *, field_name: str, maximum: float | None = None) -> float:
@@ -102,6 +107,7 @@ class PlaybackStartBuffer:
     _first_audio_ready_s: float | None = None
     _released_s: float | None = None
     _release_reason: PlaybackReleaseReason | None = None
+    _telemetry_recorded: bool = False
 
     @property
     def released(self) -> bool:
@@ -125,7 +131,7 @@ class PlaybackStartBuffer:
         self,
         delivery_item: Any,
         *,
-        pcm_bytes: bytes | bytearray,
+        pcm_byte_count: int,
         sample_rate: int,
         num_channels: int,
         prefix_items: tuple[Any, ...] = (),
@@ -137,17 +143,17 @@ class PlaybackStartBuffer:
         if num_channels <= 0:
             raise ValueError("PCM channel count must be positive")
         frame_width = 2 * num_channels
-        if len(pcm_bytes) % frame_width:
+        if pcm_byte_count < 0 or pcm_byte_count % frame_width:
             raise ValueError("PCM16 byte count must align to complete audio frames")
 
         current = self.clock() if now is None else now
         if self.released:
             return (*prefix_items, delivery_item)
-        if self._first_audio_ready_s is None:
+        if pcm_byte_count > 0 and self._first_audio_ready_s is None:
             self._first_audio_ready_s = current
         self._pending.extend(prefix_items)
         self._pending.append(delivery_item)
-        frames = len(pcm_bytes) // frame_width
+        frames = pcm_byte_count // frame_width
         self._buffered_audio_ms += frames * 1000.0 / sample_rate
         if self._buffered_audio_ms >= self.config.target_ms:
             return self.release("target", now=current)
@@ -183,7 +189,7 @@ class PlaybackStartBuffer:
         self._pending.clear()
         return pending
 
-    def telemetry(self, *, status: str) -> dict[str, Any]:
+    def telemetry(self, *, status: PlaybackTerminalStatus) -> dict[str, Any]:
         """Return one bounded-cardinality record for the completed stream."""
         hold_ms = 0.0
         if self._first_audio_ready_s is not None and self._released_s is not None:
@@ -197,8 +203,38 @@ class PlaybackStartBuffer:
             "deadline_fallback": self._release_reason == "deadline",
         }
 
+    def record_telemetry(
+        self,
+        *,
+        request_id: str,
+        status: PlaybackTerminalStatus,
+        request_state: Any | None = None,
+    ) -> dict[str, Any] | None:
+        """Store and log at most one terminal record for this request."""
+        if self._telemetry_recorded:
+            return None
+        self._telemetry_recorded = True
+        telemetry = self.telemetry(status=status)
+        if request_state is not None:
+            request_state.playback_start_telemetry = telemetry
+        logger.info(
+            "[PlaybackStart] request_id=%s status=%s target_ms=%.3f "
+            "buffered_audio_ms=%.3f hold_ms=%.3f release_reason=%s deadline_fallback=%s",
+            request_id,
+            telemetry["status"],
+            telemetry["target_ms"],
+            telemetry["buffered_audio_ms"],
+            telemetry["hold_ms"],
+            telemetry["release_reason"],
+            telemetry["deadline_fallback"],
+        )
+        return telemetry
 
-async def iterate_with_playback_deadline(generator, buffer: PlaybackStartBuffer):
+
+async def iterate_with_playback_deadline(
+    generator: AsyncIterator[Any],
+    buffer: PlaybackStartBuffer,
+) -> AsyncGenerator[Any, None]:
     """Yield engine results and one event when the fallback deadline expires.
 
     A pending ``__anext__`` call remains active at the deadline so opening the

@@ -62,7 +62,7 @@ def test_buffer_counts_pcm_frames_across_sample_rates_exactly() -> None:
     assert (
         buffer.add_pcm(
             "a",
-            pcm_bytes=b"\x00" * 200,
+            pcm_byte_count=200,
             sample_rate=1000,
             num_channels=1,
             prefix_items=("header",),
@@ -73,7 +73,7 @@ def test_buffer_counts_pcm_frames_across_sample_rates_exactly() -> None:
     # 100 stereo PCM16 frames at 2 kHz = 50 ms.
     released = buffer.add_pcm(
         "b",
-        pcm_bytes=b"\x00" * 400,
+        pcm_byte_count=400,
         sample_rate=2000,
         num_channels=2,
     )
@@ -90,12 +90,12 @@ def test_buffer_counts_pcm_frames_across_sample_rates_exactly() -> None:
 
 def test_eos_flushes_short_audio_and_error_discards_it() -> None:
     buffer = PlaybackStartBuffer(PlaybackStartConfig(target_ms=500.0), clock=lambda: 1.0)
-    assert buffer.add_pcm("pcm", pcm_bytes=b"\x00" * 200, sample_rate=1000, num_channels=1) == ()
+    assert buffer.add_pcm("pcm", pcm_byte_count=200, sample_rate=1000, num_channels=1) == ()
     assert buffer.finish() == ("pcm",)
     assert buffer.telemetry(status="ok")["release_reason"] == "eos"
 
     failed = PlaybackStartBuffer(PlaybackStartConfig(target_ms=500.0), clock=lambda: 1.0)
-    assert failed.add_pcm("pcm", pcm_bytes=b"\x00" * 200, sample_rate=1000, num_channels=1) == ()
+    assert failed.add_pcm("pcm", pcm_byte_count=200, sample_rate=1000, num_channels=1) == ()
     failed.terminate("error")
     assert failed.finish() == ()
     assert failed.telemetry(status="error")["release_reason"] == "error"
@@ -152,7 +152,7 @@ async def test_deadline_iterator_cancels_pending_pull_when_client_cancels() -> N
         clock=loop.time,
     )
     stream = iterate_with_playback_deadline(engine_results(), buffer)
-    pending_delivery = asyncio.create_task(anext(stream))
+    pending_delivery = asyncio.ensure_future(anext(stream))
     await asyncio.wait_for(engine_waiting.wait(), timeout=1.0)
     pending_delivery.cancel()
     with pytest.raises(asyncio.CancelledError):
