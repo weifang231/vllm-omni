@@ -28,6 +28,18 @@ FIRST_OUTPUT_DEADLINE_MS_HEADER = "x-vllm-omni-first-output-deadline-ms"
 TRUST_SCHEDULING_HEADERS_ENV = "VLLM_OMNI_TRUST_SCHEDULING_HEADERS"
 
 
+def scheduling_headers_trusted(*, trusted: bool | None = None) -> bool:
+    """Return whether caller-supplied scheduling metadata is trusted."""
+    if trusted is not None:
+        return trusted
+    return os.environ.get(TRUST_SCHEDULING_HEADERS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _label(value: str | None, *, default: str, field_name: str) -> str:
     if value is None:
         return default
@@ -51,14 +63,7 @@ def scheduling_kwargs_from_headers(
     EDF priority. Operators may opt in only when a trusted proxy owns these
     headers, or callers may pass ``trusted=True`` at an internal boundary.
     """
-    if trusted is None:
-        trusted = os.environ.get(TRUST_SCHEDULING_HEADERS_ENV, "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-    if not trusted or headers is None:
+    if not scheduling_headers_trusted(trusted=trusted) or headers is None:
         return {}
     normalized_headers = {str(key).lower(): value for key, value in headers.items()}
     kwargs: dict[str, Any] = {}

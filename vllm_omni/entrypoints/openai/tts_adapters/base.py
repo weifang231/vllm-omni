@@ -166,6 +166,8 @@ class TTSModelAdapter(ABC):
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Whether HTTP streaming may apply the runtime playback-start gate.
+    supports_playback_start: ClassVar[bool] = False
 
     max_new_tokens_min = 1
 

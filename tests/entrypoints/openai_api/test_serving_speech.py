@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import struct
+import time
 import wave
 from dataclasses import FrozenInstanceError, replace
 from inspect import Signature, signature
@@ -31,6 +32,7 @@ from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.playback_start import PlaybackStartConfig
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     CreateAudio,
@@ -3031,7 +3033,9 @@ class TestStreamingResponse:
             usage_acc=None,
             tts_params=None,
             collect=None,
+            playback_start_config=None,
         ):
+            del playback_start_config
             captured["tts_params"] = tts_params
             yield b"\x00\x00"
 
@@ -5153,6 +5157,237 @@ class TestTTSAsyncOffloading:
 
         assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
         assert ("artifact-close", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
+
+    @pytest.mark.asyncio
+    async def test_playback_start_drains_engine_before_first_delivery(self, qwen3_tts_server):
+        engine_resumed = asyncio.Event()
+        allow_second_chunk = asyncio.Event()
+
+        async def pcm_generator():
+            yield SimpleNamespace(multimodal_output={"audio": torch.zeros(100), "sr": 1000})
+            engine_resumed.set()
+            await allow_second_chunk.wait()
+            yield SimpleNamespace(multimodal_output={"audio": torch.zeros(100), "sr": 1000})
+
+        stream = qwen3_tts_server._generate_audio_chunks(
+            pcm_generator(),
+            "req-playback-drain",
+            playback_start_config=PlaybackStartConfig(target_ms=150.0),
+        )
+        first_delivery = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(engine_resumed.wait(), timeout=1.0)
+        assert not first_delivery.done()
+
+        allow_second_chunk.set()
+        assert len(await asyncio.wait_for(first_delivery, timeout=1.0)) == 200
+        assert len(await anext(stream)) == 200
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+    @pytest.mark.asyncio
+    async def test_playback_start_holds_wav_header_and_preserves_order(self, qwen3_tts_server):
+        async def pcm_generator():
+            yield SimpleNamespace(multimodal_output={"audio": torch.zeros(100), "sr": 1000})
+            yield SimpleNamespace(multimodal_output={"audio": torch.ones(100), "sr": 1000})
+
+        chunks = [
+            chunk
+            async for chunk in qwen3_tts_server._generate_audio_chunks(
+                pcm_generator(),
+                "req-playback-wav",
+                response_format="wav",
+                playback_start_config=PlaybackStartConfig(target_ms=150.0),
+            )
+        ]
+
+        assert len(chunks) == 3
+        assert chunks[0][:4] == b"RIFF"
+        assert chunks[0][8:12] == b"WAVE"
+        assert struct.unpack_from("<I", chunks[0], 24)[0] == 1000
+        assert len(chunks[1]) == len(chunks[2]) == 200
+        assert chunks[1] != chunks[2]
+
+    @pytest.mark.asyncio
+    async def test_playback_start_flushes_short_stream_at_eos(self, qwen3_tts_server):
+        async def pcm_generator():
+            yield SimpleNamespace(multimodal_output={"audio": torch.zeros(100), "sr": 1000})
+
+        chunks = [
+            chunk
+            async for chunk in qwen3_tts_server._generate_audio_chunks(
+                pcm_generator(),
+                "req-playback-eos",
+                playback_start_config=PlaybackStartConfig(target_ms=500.0),
+            )
+        ]
+
+        assert len(chunks) == 1
+        assert len(chunks[0]) == 200
+
+    @pytest.mark.asyncio
+    async def test_playback_start_deadline_flushes_while_engine_pull_continues(self, qwen3_tts_server):
+        engine_waiting = asyncio.Event()
+        allow_second_chunk = asyncio.Event()
+
+        async def pcm_generator():
+            yield SimpleNamespace(multimodal_output={"audio": torch.zeros(100), "sr": 1000})
+            engine_waiting.set()
+            await allow_second_chunk.wait()
+            yield SimpleNamespace(multimodal_output={"audio": torch.ones(100), "sr": 1000})
+
+        raw_request = SimpleNamespace(state=SimpleNamespace())
+        stream = qwen3_tts_server._generate_audio_chunks(
+            pcm_generator(),
+            "req-playback-deadline",
+            raw_request=raw_request,
+            playback_start_config=PlaybackStartConfig(
+                target_ms=500.0,
+                deadline_monotonic_s=time.perf_counter() + 0.01,
+            ),
+        )
+        first_chunk = await asyncio.wait_for(anext(stream), timeout=1.0)
+        assert len(first_chunk) == 200
+        assert engine_waiting.is_set()
+        allow_second_chunk.set()
+        assert len(await anext(stream)) == 200
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+        telemetry = raw_request.state.playback_start_telemetry
+        assert telemetry["status"] == "ok"
+        assert telemetry["release_reason"] == "deadline"
+        assert telemetry["deadline_fallback"] is True
+        assert telemetry["buffered_audio_ms"] == 100.0
+        assert telemetry["hold_ms"] > 0.0
+
+    @pytest.mark.asyncio
+    async def test_playback_start_sse_error_does_not_replay_held_audio(self, qwen3_tts_server):
+        async def failing_generator():
+            yield SimpleNamespace(multimodal_output={"audio": torch.zeros(100), "sr": 1000})
+            raise RuntimeError("boom")
+
+        raw_request = SimpleNamespace(state=SimpleNamespace())
+        events = [
+            event
+            async for event in qwen3_tts_server._generate_audio_sse_events(
+                failing_generator(),
+                "req-playback-error",
+                raw_request=raw_request,
+                playback_start_config=PlaybackStartConfig(target_ms=500.0),
+            )
+        ]
+
+        assert len(events) == 1
+        assert "event: speech.audio.error" in events[0]
+        payload = json.loads(next(line for line in events[0].splitlines() if line.startswith("data: "))[6:])
+        assert "partial_audio" not in payload["error"]
+        assert raw_request.state.playback_start_telemetry["release_reason"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_playback_start_cancellation_discards_held_audio(self, qwen3_tts_server):
+        engine_waiting = asyncio.Event()
+        engine_closed = asyncio.Event()
+
+        async def pcm_generator():
+            try:
+                yield SimpleNamespace(multimodal_output={"audio": torch.zeros(100), "sr": 1000})
+                engine_waiting.set()
+                await asyncio.Event().wait()
+            finally:
+                engine_closed.set()
+
+        raw_request = SimpleNamespace(state=SimpleNamespace())
+        stream = qwen3_tts_server._generate_audio_chunks(
+            pcm_generator(),
+            "req-playback-cancel",
+            raw_request=raw_request,
+            playback_start_config=PlaybackStartConfig(
+                target_ms=500.0,
+                deadline_monotonic_s=time.perf_counter() + 60.0,
+            ),
+        )
+        delivery = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(engine_waiting.wait(), timeout=1.0)
+        delivery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
+
+        assert engine_closed.is_set()
+        telemetry = raw_request.state.playback_start_telemetry
+        assert telemetry["status"] == "cancelled"
+        assert telemetry["release_reason"] == "cancelled"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream_format", ["audio", "sse"])
+    async def test_create_speech_passes_trusted_playback_headers_to_stream_adapter(
+        self,
+        qwen3_tts_server,
+        mocker: MockerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        stream_format: str,
+    ):
+        monkeypatch.setenv("VLLM_OMNI_TRUST_SCHEDULING_HEADERS", "1")
+        qwen3_tts_server._check_model = mocker.AsyncMock(return_value=None)
+        qwen3_tts_server._prepare_speech_generation = mocker.AsyncMock(
+            return_value=("req-playback-route", object(), {})
+        )
+        captured: dict[str, PlaybackStartConfig | None] = {}
+
+        async def generate_chunks(*_args, playback_start_config=None, **_kwargs):
+            captured["config"] = playback_start_config
+            yield b"\x00\x00"
+
+        qwen3_tts_server._generate_audio_chunks = generate_chunks
+        raw_request = SimpleNamespace(
+            headers={
+                "x-vllm-omni-playback-buffer-ms": "300",
+                "x-vllm-omni-first-output-deadline-ms": "900",
+            },
+            state=SimpleNamespace(),
+        )
+        response = await qwen3_tts_server.create_speech(
+            OpenAICreateSpeechRequest(
+                input="hello",
+                stream_format=stream_format,
+                response_format="pcm",
+            ),
+            raw_request,
+        )
+        body = [chunk async for chunk in response.body_iterator]
+
+        assert body
+        config = captured["config"]
+        assert config is not None
+        assert config.target_ms == 300.0
+        assert config.deadline_monotonic_s is not None
+
+    @pytest.mark.asyncio
+    async def test_create_speech_rejects_invalid_trusted_playback_target_before_dispatch(
+        self,
+        qwen3_tts_server,
+        mocker: MockerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("VLLM_OMNI_TRUST_SCHEDULING_HEADERS", "1")
+        qwen3_tts_server._check_model = mocker.AsyncMock(return_value=None)
+        qwen3_tts_server._prepare_speech_generation = mocker.AsyncMock()
+        raw_request = SimpleNamespace(
+            headers={"x-vllm-omni-playback-buffer-ms": "nan"},
+            state=SimpleNamespace(),
+        )
+
+        response = await qwen3_tts_server.create_speech(
+            OpenAICreateSpeechRequest(
+                input="hello",
+                stream_format="audio",
+                response_format="pcm",
+            ),
+            raw_request,
+        )
+
+        assert isinstance(response, ErrorResponse)
+        assert "playback-buffer-ms" in response.error.message
+        qwen3_tts_server._prepare_speech_generation.assert_not_awaited()
 
     def test_qwen3_ref_audio_artifact_ready_requires_live_resolve_cache_entry(self, qwen3_tts_server):
         qwen3_tts_server._request_ref_audio_artifact_keys["req-evicted"] = ("artifact-evicted", False)
