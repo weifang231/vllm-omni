@@ -66,6 +66,14 @@ by the controller. The orchestrator polls it without preempting active work:
     "path_wip_limits": {"audio": 7, "text": 1},
     "class_wip_limits": {"interactive": 4},
     "stage_wip_limits": {"0": 8, "1": 7, "2": 7},
+    "online_allocator": {
+      "schema_version": 1,
+      "revision": 12,
+      "source_runtime_id": "2f23d1...",
+      "source_snapshot_sequence": 91,
+      "source_config_generation": 11,
+      "profile_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
     "admission": {
       "enabled": true,
       "score_method": "erlang_empirical",
@@ -85,6 +93,11 @@ by the controller. The orchestrator polls it without preempting active work:
 Omitted limits are unbounded. A limit of zero pauses new matching dispatches.
 Lowering a limit never preempts a lease that is already active. Malformed JSON
 or an invalid schema leaves the most recent valid configuration in effect.
+The optional `online_allocator` object versions allocations made by a
+cooperating external controller. Its revision must increase whenever any
+versioned queue-control field changes; the runtime rejects a replayed lower
+revision or changed fields under the same revision. The complete validated
+configuration is then swapped as one object on the orchestrator event loop.
 
 Admission is disabled unless `queue_control.admission.enabled` is true. For
 each configured class, `effective_k` is the class concurrency limit, `mu` is
@@ -111,6 +124,9 @@ intervals can be set with `VLLM_OMNI_RUNTIME_CONTROL_INTERVAL_S` and
 The snapshot also exposes the class-identifiable state required by an external
 causal allocator:
 
+- `runtime_id` identifies one orchestrator lifetime even if a PID is reused;
+- `snapshot_sequence` and `monotonic_time_s` strictly order samples without
+  relying on an adjustable wall clock;
 - `arrivals_by_class_total` is a monotone offered-arrival counter. It advances
   once when a logical request first enters stage 0, before admission, and does
   not advance for streaming updates, CFG companions, retries within the same
@@ -119,6 +135,15 @@ causal allocator:
   waiting to acquire their end-to-end request lease. It excludes downstream
   dispatches and streaming updates. Together with `active_by_class`, it is the
   runtime observation of the model's class queue and running count.
+- `config_generation`, `class_wip_limits`, and `online_allocator` acknowledge
+  exactly which atomic control revision produced the observed queue state.
+
+A controller should admit at most one unacknowledged update: atomically replace
+the complete control document, then wait until the same `online_allocator`
+revision appears in a later snapshot before computing another allocation from
+the new limits. This prevents a fast controller from repeatedly optimizing
+against stale runtime state. Cooperating writers should also serialize updates
+with a sibling lock file before reading and replacing the control document.
 
 `enqueued_total` remains a dispatch-path diagnostic and can advance multiple
 times for one logical request. It must not be used to estimate request arrival

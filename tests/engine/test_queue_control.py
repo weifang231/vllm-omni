@@ -11,6 +11,7 @@ import pytest
 from vllm_omni.engine.queue_control import (
     AdmissionClassConfig,
     AdmissionControlConfig,
+    OnlineAllocatorMetadata,
     PendingStageDispatch,
     QueueControlConfig,
     RequestSchedulingMetadata,
@@ -104,6 +105,63 @@ def test_queue_control_config_defaults_and_validation() -> None:
             {"queue_control": {"stage_wip_limits": {"1": 1}}},
             num_stages=1,
         )
+
+
+def test_online_allocator_metadata_is_parsed_and_acknowledged_in_snapshot() -> None:
+    metadata = {
+        "schema_version": 1,
+        "revision": 7,
+        "source_runtime_id": "runtime-a",
+        "source_snapshot_sequence": 13,
+        "source_config_generation": 2,
+        "profile_fingerprint": "a" * 64,
+    }
+    config = QueueControlConfig.from_document(
+        {
+            "queue_control": {
+                "enabled": True,
+                "class_wip_limits": {"audio": 3, "text": 1},
+                "online_allocator": metadata,
+            }
+        }
+    )
+    assert config.online_allocator == OnlineAllocatorMetadata(
+        revision=7,
+        source_runtime_id="runtime-a",
+        source_snapshot_sequence=13,
+        source_config_generation=2,
+        profile_fingerprint="a" * 64,
+    )
+
+    controller = RuntimeQueueController(num_stages=1, config=config)
+    assert controller.snapshot()["online_allocator"] == metadata
+
+
+def test_online_allocator_revision_prevents_stale_or_torn_logical_updates() -> None:
+    def config(revision: int, audio_limit: int) -> QueueControlConfig:
+        return QueueControlConfig(
+            enabled=True,
+            class_wip_limits={"audio": audio_limit},
+            online_allocator=OnlineAllocatorMetadata(
+                revision=revision,
+                source_runtime_id="runtime-a",
+                source_snapshot_sequence=revision,
+                source_config_generation=revision - 1,
+                profile_fingerprint="b" * 64,
+            ),
+        )
+
+    controller = RuntimeQueueController(num_stages=1, config=config(2, 2))
+    assert controller.configure(config(3, 3))
+    assert controller.snapshot()["class_wip_limits"] == {"audio": 3}
+    assert controller.snapshot()["config_generation"] == 1
+
+    with pytest.raises(ValueError, match="must not decrease"):
+        controller.configure(config(2, 1))
+    with pytest.raises(ValueError, match="without advancing"):
+        controller.configure(config(3, 1))
+    assert controller.snapshot()["class_wip_limits"] == {"audio": 3}
+    assert controller.snapshot()["config_generation"] == 1
 
 
 def test_admission_config_parses_calibrated_class_inputs() -> None:

@@ -645,10 +645,10 @@ class Orchestrator:
                 instrumentation.read_control(),
                 num_stages=self.num_stages,
             )
+            return self._ensure_queue_controller().configure(config)
         except ValueError as exc:
             logger.warning("[Orchestrator] Ignoring invalid queue-control config: %s", exc)
             return False
-        return self._ensure_queue_controller().configure(config)
 
     def _write_queue_control_snapshot(self, *, force: bool = False) -> None:
         instrumentation = getattr(self, "_queue_instrumentation", None)

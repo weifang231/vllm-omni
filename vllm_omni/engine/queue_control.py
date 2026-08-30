@@ -359,6 +359,85 @@ class RequestSchedulingMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class OnlineAllocatorMetadata:
+    """Versioned provenance for one externally selected class allocation.
+
+    The runtime treats this metadata and all queue-control fields as one
+    immutable configuration object.  ``revision`` is monotonically increasing
+    for cooperating writers, while the source fields identify the causal
+    runtime snapshot from which the allocation was computed.
+    """
+
+    revision: int
+    source_runtime_id: str
+    source_snapshot_sequence: int
+    source_config_generation: int
+    profile_fingerprint: str
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> OnlineAllocatorMetadata | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise ValueError("queue_control.online_allocator must be a JSON object")
+        if raw.get("schema_version") != 1:
+            raise ValueError("queue_control.online_allocator.schema_version must be 1")
+        revision = _optional_limit(
+            raw.get("revision"),
+            field_name="queue_control.online_allocator.revision",
+        )
+        source_snapshot_sequence = _optional_limit(
+            raw.get("source_snapshot_sequence"),
+            field_name="queue_control.online_allocator.source_snapshot_sequence",
+        )
+        source_config_generation = _optional_limit(
+            raw.get("source_config_generation"),
+            field_name="queue_control.online_allocator.source_config_generation",
+        )
+        if revision is None or revision < 1:
+            raise ValueError("queue_control.online_allocator.revision must be at least 1")
+        if source_snapshot_sequence is None or source_snapshot_sequence < 1:
+            raise ValueError("queue_control.online_allocator.source_snapshot_sequence must be at least 1")
+        if source_config_generation is None:
+            raise ValueError("queue_control.online_allocator.source_config_generation is required")
+        source_runtime_id = _label(
+            raw.get("source_runtime_id"),
+            default="",
+            field_name="queue_control.online_allocator.source_runtime_id",
+        )
+        if not source_runtime_id:
+            raise ValueError("queue_control.online_allocator.source_runtime_id is required")
+        profile_fingerprint = _label(
+            raw.get("profile_fingerprint"),
+            default="",
+            field_name="queue_control.online_allocator.profile_fingerprint",
+        )
+        if len(profile_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in profile_fingerprint
+        ):
+            raise ValueError(
+                "queue_control.online_allocator.profile_fingerprint must be a lowercase SHA-256 hex digest"
+            )
+        return cls(
+            revision=revision,
+            source_runtime_id=source_runtime_id,
+            source_snapshot_sequence=source_snapshot_sequence,
+            source_config_generation=source_config_generation,
+            profile_fingerprint=profile_fingerprint,
+        )
+
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "revision": self.revision,
+            "source_runtime_id": self.source_runtime_id,
+            "source_snapshot_sequence": self.source_snapshot_sequence,
+            "source_config_generation": self.source_config_generation,
+            "profile_fingerprint": self.profile_fingerprint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class QueueControlConfig:
     """Validated queue-control settings loaded from ``queue_control`` JSON."""
 
@@ -369,6 +448,7 @@ class QueueControlConfig:
     path_wip_limits: dict[str, int] = field(default_factory=dict)
     class_wip_limits: dict[str, int] = field(default_factory=dict)
     admission: AdmissionControlConfig = field(default_factory=AdmissionControlConfig)
+    online_allocator: OnlineAllocatorMetadata | None = None
 
     def __post_init__(self) -> None:
         if self.admission.enabled and self.policy != "edf":
@@ -424,6 +504,7 @@ class QueueControlConfig:
                 key_parser=_string_key,
             ),
             admission=admission,
+            online_allocator=OnlineAllocatorMetadata.from_mapping(raw.get("online_allocator")),
         )
 
 
@@ -521,6 +602,18 @@ class RuntimeQueueController:
     def configure(self, config: QueueControlConfig) -> bool:
         if config == self.config:
             return False
+        current_update = self.config.online_allocator
+        incoming_update = config.online_allocator
+        if current_update is not None and incoming_update is not None:
+            if incoming_update.revision < current_update.revision:
+                raise ValueError(
+                    "queue_control.online_allocator.revision must not decrease "
+                    f"({incoming_update.revision} < {current_update.revision})"
+                )
+            if incoming_update.revision == current_update.revision:
+                raise ValueError(
+                    "queue_control fields changed without advancing queue_control.online_allocator.revision"
+                )
         self.config = config
         self._config_generation += 1
         return True
@@ -917,6 +1010,9 @@ class RuntimeQueueController:
             "stage_wip_limits": {str(key): value for key, value in sorted(self.config.stage_wip_limits.items())},
             "path_wip_limits": dict(sorted(self.config.path_wip_limits.items())),
             "class_wip_limits": dict(sorted(self.config.class_wip_limits.items())),
+            "online_allocator": (
+                None if self.config.online_allocator is None else self.config.online_allocator.to_snapshot()
+            ),
             "admission": {
                 "enabled": self.config.admission.enabled,
                 "score_method": self.config.admission.score_method,
