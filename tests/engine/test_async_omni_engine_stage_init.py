@@ -13,6 +13,8 @@ import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
+from vllm_omni.engine import stage_init_utils as stage_init_utils_module
+from vllm_omni.engine import stage_runtime as runtime_mod
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
@@ -940,6 +942,105 @@ def test_remote_replicas_use_distinct_init_group_keys():
         "remote:1:0",
         "remote:1:1",
     ]
+
+
+def test_device_lock_acquisition_releases_partial_set_before_retry(monkeypatch):
+    device_env = stage_init_utils_module.current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env, "0,1")
+
+    opened_fds = iter((10, 11, 12, 13))
+    events: list[tuple[str, int, int | None]] = []
+
+    monkeypatch.setattr(
+        stage_init_utils_module.os,
+        "open",
+        lambda *_args, **_kwargs: next(opened_fds),
+    )
+
+    def _flock(fd: int, operation: int) -> None:
+        events.append(("flock", fd, operation))
+        if fd == 11 and operation == (stage_init_utils_module.fcntl.LOCK_EX | stage_init_utils_module.fcntl.LOCK_NB):
+            raise BlockingIOError
+
+    monkeypatch.setattr(stage_init_utils_module.fcntl, "flock", _flock)
+    monkeypatch.setattr(stage_init_utils_module.os, "ftruncate", lambda *_args: None)
+    monkeypatch.setattr(stage_init_utils_module.os, "write", lambda *_args: 1)
+    monkeypatch.setattr(stage_init_utils_module.os, "fsync", lambda *_args: None)
+    monkeypatch.setattr(
+        stage_init_utils_module.os,
+        "close",
+        lambda fd: events.append(("close", fd, None)),
+    )
+    monkeypatch.setattr(
+        stage_init_utils_module,
+        "_cleanup_stale_lock_if_dead",
+        lambda _path: False,
+    )
+    monkeypatch.setattr(stage_init_utils_module.time, "time", lambda: 0.0)
+    monkeypatch.setattr(stage_init_utils_module.time, "sleep", lambda _seconds: None)
+
+    acquired = stage_init_utils_module.acquire_device_locks(
+        stage_id=0,
+        engine_args_dict={"tensor_parallel_size": 2},
+        stage_init_timeout=10,
+    )
+
+    assert acquired == [12, 13]
+    unlock_first = events.index(("flock", 10, stage_init_utils_module.fcntl.LOCK_UN))
+    retry_first = events.index(
+        (
+            "flock",
+            12,
+            stage_init_utils_module.fcntl.LOCK_EX | stage_init_utils_module.fcntl.LOCK_NB,
+        )
+    )
+    assert unlock_first < retry_first
+    assert ("close", 10, None) in events
+    assert ("close", 11, None) in events
+
+
+def test_local_llm_replica_uses_consistent_launch_and_device_lock_order(monkeypatch):
+    runtime = _make_stage_runtime()
+    plan = _make_llm_plan(
+        0,
+        stage_id=0,
+        vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64)),
+    ).replicas[0]
+    plan.engine_args_dict = {}
+
+    observed: list[str] = []
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_args: "0")
+
+    def _acquire_device_locks(*_args):
+        assert runtime._replica_launch_lock.locked()
+        observed.append("device-lock")
+        return []
+
+    @contextlib.contextmanager
+    def _launch_stage_replica(**_kwargs):
+        assert runtime._replica_launch_lock.locked()
+        observed.append("launch")
+        yield types.SimpleNamespace(
+            manager=object(),
+            coordinator=None,
+            addresses=types.SimpleNamespace(
+                inputs=["in"],
+                outputs=["out"],
+                frontend_stats_publish_address=None,
+            ),
+        )
+
+    client = object()
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", _acquire_device_locks)
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        lambda **_kwargs: client,
+    )
+
+    assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=123) is client
+    assert observed == ["device-lock", "launch"]
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):

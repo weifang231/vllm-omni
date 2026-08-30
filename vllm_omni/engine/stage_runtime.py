@@ -569,28 +569,38 @@ class StageRuntime:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing executor_class")
             if plan.engine_args_dict is None:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing engine args")
-            with self._scoped_spawn_device_env(physical_devices):
-                lock_fds = acquire_device_locks(
+            # Use one lock order for device selection, initialization locks,
+            # and engine-core spawning.  Acquiring a device lock while holding
+            # ``_spawn_device_lock`` and only later taking
+            # ``_replica_launch_lock`` can deadlock another stage that holds
+            # those locks in the opposite order when their device sets overlap.
+            with self._replica_launch_lock:
+                with self._scoped_spawn_device_env(physical_devices):
+                    lock_fds = acquire_device_locks(
+                        plan.metadata.stage_id,
+                        plan.engine_args_dict,
+                        stage_init_timeout,
+                    )
+                # Serialize engine-core spawning across all LLM replicas to
+                # avoid ZMQ port-allocation races and simultaneous CUDA
+                # context initialization.
+                with stage_runtime_env(
                     plan.metadata.stage_id,
-                    plan.engine_args_dict,
-                    stage_init_timeout,
-                )
-            # Serialize engine-core spawning across all LLM replicas to avoid
-            # ZMQ port-allocation races and simultaneous CUDA context init.
-            with self._replica_launch_lock, stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
-                with launch_stage_replica(
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    log_stats=self._log_stats,
-                    stage_id=plan.metadata.stage_id,
-                    replica_id=plan.replica_id,
-                    stage_config=plan.stage_cfg,
-                    omni_master_server=self._get_omni_master_server(),
-                    omni_coordinator_address=self._get_coordinator_address(),
-                    stage_visible_devices=physical_devices,
-                    spawn_device_lock=self._spawn_device_lock,
-                ) as resources:
-                    pass
+                    plan.metadata.runtime_cfg,
+                ):
+                    with launch_stage_replica(
+                        vllm_config=vllm_config,
+                        executor_class=executor_class,
+                        log_stats=self._log_stats,
+                        stage_id=plan.metadata.stage_id,
+                        replica_id=plan.replica_id,
+                        stage_config=plan.stage_cfg,
+                        omni_master_server=self._get_omni_master_server(),
+                        omni_coordinator_address=self._get_coordinator_address(),
+                        stage_visible_devices=physical_devices,
+                        spawn_device_lock=self._spawn_device_lock,
+                    ) as resources:
+                        pass
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:

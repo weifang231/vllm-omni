@@ -1598,9 +1598,14 @@ def acquire_device_locks(
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
+    A multi-device stage acquires its lock set atomically: if any device is
+    busy, locks acquired earlier in the same attempt are released before the
+    retry.  Holding a partial set while waiting can deadlock two concurrently
+    initialized stages whose device sets overlap (for example, ``0,1,2,3``
+    and ``3`` in the bundled Ming deployment).
+
     Returns list of lock file descriptors that must be released after init.
     """
-    lock_fds: list[int] = []
     try:
         # Get parallel sizes
         if "parallel_config" in engine_args_dict:
@@ -1664,14 +1669,18 @@ def acquire_device_locks(
             devices_to_lock,
         )
 
-        # Acquire locks
+        # Acquire the complete device set or none of it.  Retrying individual
+        # devices while retaining earlier locks creates a circular wait when
+        # concurrently initialized stages have partially overlapping sets.
         wait_start = time.time()
-        for device_id in devices_to_lock:
-            lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
-            lock_acquired = False
-            already_cleaned_stale = False  # only try stale cleanup once per device
-
-            while not lock_acquired:
+        stale_cleanup_attempted: set[int] = set()
+        while True:
+            attempt_fds: list[int] = []
+            blocked_device: int | None = None
+            retry_immediately = False
+            for device_id in devices_to_lock:
+                lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+                lock_fd: int | None = None
                 try:
                     lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
                     try:
@@ -1679,34 +1688,45 @@ def acquire_device_locks(
                         os.ftruncate(lock_fd, 0)
                         os.write(lock_fd, f"{os.getpid()}\n".encode())
                         os.fsync(lock_fd)
-                        lock_acquired = True
-                        lock_fds.append(lock_fd)
+                        attempt_fds.append(lock_fd)
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
-                        # Detect and clean stale locks from dead processes.
-                        if not already_cleaned_stale:
-                            already_cleaned_stale = True
+                        lock_fd = None
+                        blocked_device = device_id
+                        # Detect and clean a stale lock at most once per device.
+                        if device_id not in stale_cleanup_attempted:
+                            stale_cleanup_attempted.add(device_id)
                             if _cleanup_stale_lock_if_dead(lock_file):
-                                continue  # retry flock immediately
-                        if time.time() - wait_start > stage_init_timeout:
-                            logger.warning(
-                                "Timeout waiting for device %s initialization lock, proceeding anyway",
-                                device_id,
-                            )
-                            break
-                        time.sleep(0.01)
+                                retry_immediately = True
+                        break
                 except OSError as e:
                     logger.debug(
                         "Failed to acquire lock for device %s: %s, continuing anyway",
                         device_id,
                         e,
                     )
-                    try:
-                        os.close(lock_fd)
-                    except (OSError, NameError):
-                        pass
+                    if lock_fd is not None:
+                        try:
+                            os.close(lock_fd)
+                        except OSError:
+                            pass
+                    blocked_device = device_id
                     break
+
+            if blocked_device is None:
+                return attempt_fds
+
+            release_device_locks(attempt_fds)
+            if time.time() - wait_start > stage_init_timeout:
+                logger.warning(
+                    "Timeout waiting for complete device lock set %s (blocked on device %s), proceeding without locks",
+                    devices_to_lock,
+                    blocked_device,
+                )
+                return []
+            if not retry_immediately:
+                time.sleep(0.01)
 
     except Exception as e:
         logger.debug(
@@ -1715,7 +1735,7 @@ def acquire_device_locks(
             e,
         )
 
-    return lock_fds
+    return []
 
 
 def release_device_locks(lock_fds: list[int]) -> None:
