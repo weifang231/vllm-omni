@@ -103,6 +103,22 @@ reason counts, and the latest 128 admission decisions. Poll and snapshot
 intervals can be set with `VLLM_OMNI_RUNTIME_CONTROL_INTERVAL_S` and
 `VLLM_OMNI_RUNTIME_METRICS_INTERVAL_S`.
 
+The snapshot also exposes the class-identifiable state required by an external
+causal allocator:
+
+- `arrivals_by_class_total` is a monotone offered-arrival counter. It advances
+  once when a logical request first enters stage 0, before admission, and does
+  not advance for streaming updates, CFG companions, retries within the same
+  request lifetime, or downstream stage dispatches.
+- `queued_by_class` counts only accepted initial stage-0 requests that are
+  waiting to acquire their end-to-end request lease. It excludes downstream
+  dispatches and streaming updates. Together with `active_by_class`, it is the
+  runtime observation of the model's class queue and running count.
+
+`enqueued_total` remains a dispatch-path diagnostic and can advance multiple
+times for one logical request. It must not be used to estimate request arrival
+rates.
+
 ## Request metadata
 
 The Python API accepts `request_class`, `request_path`, and

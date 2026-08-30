@@ -488,6 +488,8 @@ class RuntimeQueueController:
         self._active_requests: dict[str, RequestSchedulingMetadata] = {}
         self._request_to_logical: dict[str, str] = {}
         self._active_stages: set[tuple[str, int]] = set()
+        self._observed_initial_requests: set[str] = set()
+        self._arrivals_by_class_total: Counter[str] = Counter()
         self._config_generation = 0
         self._enqueued_total = 0
         self._dispatch_attempts_total = 0
@@ -533,6 +535,13 @@ class RuntimeQueueController:
         return decision
 
     def _stamp_pending(self, pending: PendingStageDispatch) -> None:
+        if (
+            pending.starts_request
+            and pending.stage_id == 0
+            and pending.logical_request_id not in self._observed_initial_requests
+        ):
+            self._observed_initial_requests.add(pending.logical_request_id)
+            self._arrivals_by_class_total[pending.metadata.request_class] += 1
         pending.sequence = self._next_sequence
         self._next_sequence += 1
         pending.enqueued_monotonic_s = self._clock()
@@ -877,6 +886,7 @@ class RuntimeQueueController:
             for actual_id, mapped_logical in list(self._request_to_logical.items()):
                 if mapped_logical == logical_id:
                     self._request_to_logical.pop(actual_id, None)
+            self._observed_initial_requests.discard(logical_id)
         else:
             self._pending = [item for item in self._pending if item.request_id != request_id]
             self._active_stages = {key for key in self._active_stages if key[0] != request_id}
@@ -887,6 +897,11 @@ class RuntimeQueueController:
         path_counts, class_counts = self._request_counts()
         stage_counts = Counter(stage_id for _, stage_id in self._active_stages)
         queued_stage_counts = Counter(item.stage_id for item in self._pending)
+        queued_class_counts = Counter(
+            item.metadata.request_class
+            for item in self._pending
+            if item.starts_request and item.stage_id == 0 and item.logical_request_id not in self._active_requests
+        )
         blocked = Counter(reason for pending in self._pending for reason in self._blocked_reasons(pending))
         now = self._clock()
         return {
@@ -921,6 +936,8 @@ class RuntimeQueueController:
             "active_by_class": dict(sorted(class_counts.items())),
             "queued_requests": len(self._pending),
             "queued_by_stage": {str(key): value for key, value in sorted(queued_stage_counts.items())},
+            "queued_by_class": dict(sorted(queued_class_counts.items())),
+            "arrivals_by_class_total": dict(sorted(self._arrivals_by_class_total.items())),
             "blocked_by_limit": dict(sorted(blocked.items())),
             "oldest_queue_wait_s": max(
                 (max(now - pending.enqueued_monotonic_s, 0.0) for pending in self._pending),
