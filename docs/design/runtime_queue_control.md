@@ -25,7 +25,7 @@ stage-0 submission and holds that lease until success, cancellation, or failure.
 Per-stage WIP limits are a separately configured runtime extension; they are
 not an implementation of the paper's current class-level optimizer.
 
-The control layer is responsible only for:
+The control layer is responsible for:
 
 1. enforcing configured pipeline, path, class, and per-stage work-in-progress
    limits without preempting requests that already hold a lease;
@@ -33,11 +33,14 @@ The control layer is responsible only for:
 3. carrying observable request class, path, and deadline metadata from the
    public engine API through the orchestrator and downstream stage requests;
 4. exposing bounded-cardinality queue, active-lease, dispatch, and wait-time
-   telemetry for evaluation and controller feedback.
+   telemetry for evaluation and controller feedback; and
+5. optionally applying the paper's calibrated Erlang--empirical ingress score
+   before a request first enters stage 0, with rechecks after queue/configuration
+   changes and immediately before dispatch.
 
-It does not implement the paper's admission score, dynamic-program optimizer,
-or playback-start rule. Those policies may update this runtime mechanism, but
-must not be represented as implemented merely because the mechanism exists.
+It does not implement the paper's dynamic-program optimizer or playback-start
+rule. The admission implementation is a model-based score using operator-
+supplied calibration data; it is not a formal out-of-sample guarantee.
 
 Full-duplex session submissions currently preserve scheduling metadata but do
 not pass through this queue. The standard Qwen3-Omni and Qwen3-TTS request,
@@ -57,7 +60,19 @@ by the controller. The orchestrator polls it without preempting active work:
     "global_wip_limit": 8,
     "path_wip_limits": {"audio": 7, "text": 1},
     "class_wip_limits": {"interactive": 4},
-    "stage_wip_limits": {"0": 8, "1": 7, "2": 7}
+    "stage_wip_limits": {"0": 8, "1": 7, "2": 7},
+    "admission": {
+      "enabled": true,
+      "score_method": "erlang_empirical",
+      "classes": {
+        "interactive": {
+          "effective_k": 4,
+          "mu": 0.31,
+          "service_samples_s": [0.72, 0.84, 1.05, 1.31],
+          "gamma": 0.9
+        }
+      }
+    }
   }
 }
 ```
@@ -66,9 +81,25 @@ Omitted limits are unbounded. A limit of zero pauses new matching dispatches.
 Lowering a limit never preempts a lease that is already active. Malformed JSON
 or an invalid schema leaves the most recent valid configuration in effect.
 
+Admission is disabled unless `queue_control.admission.enabled` is true. For
+each configured class, `effective_k` is the class concurrency limit, `mu` is
+the measured per-occupied-slot service rate at that limit, and
+`service_samples_s` contains calibration samples from execution start to a
+valid first output. `gamma` is the frozen threshold selected on disjoint
+calibration data. A configured request without a deadline bypasses the score;
+an unconfigured class is unchanged. A rejection is request-scoped and returns
+HTTP 429 with error type `AdmissionRejectedError` before an HTTP response is
+committed, while the server continues serving other requests. An SSE response
+that has already started emits `speech.audio.error` with code 429 and the same
+type. A raw-audio stream cannot change its HTTP status after headers have been
+sent and therefore terminates with the exception instead. Admission requires
+`policy: "edf"`; operators should also use mutually consistent class/global
+limits so runtime ordering and available capacity match the fitted model.
+
 `VLLM_OMNI_RUNTIME_METRICS_DIR` enables an atomic, bounded-cardinality JSON
 snapshot containing queue lengths, active leases, blocked reasons, dispatch
-attempts, failures, cancellations, and queue-wait totals. Poll and snapshot
+attempts, failures, cancellations, queue-wait totals, admission counters,
+reason counts, and the latest 128 admission decisions. Poll and snapshot
 intervals can be set with `VLLM_OMNI_RUNTIME_CONTROL_INTERVAL_S` and
 `VLLM_OMNI_RUNTIME_METRICS_INTERVAL_S`.
 
@@ -90,5 +121,6 @@ claim another class or an earlier deadline.
 
 The deadline is converted once, at request arrival, to an absolute monotonic
 deadline. EDF is stable FIFO for equal deadlines; requests without deadlines
-sort after requests with deadlines. No request is rejected merely because its
-deadline has passed.
+sort after requests with deadlines. With admission disabled, no request is
+rejected merely because its deadline has passed. With calibrated admission
+enabled for its class, an expired request is rejected with HTTP 429.
