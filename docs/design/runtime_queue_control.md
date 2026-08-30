@@ -36,11 +36,16 @@ The control layer is responsible for:
    telemetry for evaluation and controller feedback; and
 5. optionally applying the paper's calibrated Erlang--empirical ingress score
    before a request first enters stage 0, with rechecks after queue/configuration
-   changes and immediately before dispatch.
+   changes and immediately before dispatch; and
+6. for Qwen3-TTS HTTP streams, optionally holding client-visible PCM until a
+   controller-selected startup buffer is available or the first-output
+   deadline expires.
 
-It does not implement the paper's dynamic-program optimizer or playback-start
-rule. The admission implementation is a model-based score using operator-
-supplied calibration data; it is not a formal out-of-sample guarantee.
+It does not implement the paper's dynamic-program optimizer or compute the
+Brownian startup-buffer formula. The admission implementation is a model-based
+score using operator-supplied calibration data; it is not a formal
+out-of-sample guarantee. The playback adapter is the runtime mechanism to apply
+a target computed by that controller.
 
 Full-duplex session submissions currently preserve scheduling metadata but do
 not pass through this queue. The standard Qwen3-Omni and Qwen3-TTS request,
@@ -124,3 +129,31 @@ deadline. EDF is stable FIFO for equal deadlines; requests without deadlines
 sort after requests with deadlines. With admission disabled, no request is
 rejected merely because its deadline has passed. With calibrated admission
 enabled for its class, an expired request is rejected with HTTP 429.
+
+## Qwen3-TTS playback-start adapter
+
+The HTTP raw-audio and SSE streaming paths recognize one additional trusted
+header:
+
+- `x-vllm-omni-playback-buffer-ms`
+
+The header is ignored unless `VLLM_OMNI_TRUST_SCHEDULING_HEADERS=1`. When it is
+present, Qwen3-TTS continues draining decoded audio from the engine but
+withholds the WAV header and PCM chunks from the client until their exact PCM16
+frame duration reaches the requested target. It then flushes the original
+chunks in order and streams subsequent chunks normally. A clean end of stream
+flushes a short utterance even when it never reaches the target.
+
+If `x-vllm-omni-first-output-deadline-ms` is also present, expiration opens the
+gate with whatever audio is available; if no chunk is available yet, the first
+later chunk is delivered immediately. The pending engine pull is not cancelled
+or restarted when this fallback fires. Targets must be finite, non-negative,
+and at most 60 seconds. Each enabled request emits one bounded telemetry record
+with the target, buffered audio duration at release, actual wall-clock hold,
+release reason, and whether deadline fallback was used.
+
+This interface deliberately accepts the selected target rather than deriving
+one. The paper's Brownian rule can run in an external or future in-process
+controller using calibrated generation drift and variance. The current adapter
+does not apply to non-Qwen3-TTS models, non-streaming responses, or the
+sentence-oriented WebSocket endpoint.

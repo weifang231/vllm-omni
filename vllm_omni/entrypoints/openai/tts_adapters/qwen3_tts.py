@@ -46,6 +46,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     """Adapter for Qwen3-TTS (AR ``engine_client`` backend)."""
 
     validates_generation = True
+    supports_playback_start = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
     supported_output_sample_rates = frozenset({8000, 24000})

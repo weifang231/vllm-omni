@@ -200,6 +200,8 @@ class TTSModelAdapter(ABC):
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
+    #: Whether HTTP streaming may apply the runtime playback-start gate.
+    supports_playback_start: ClassVar[bool] = False
 
     max_new_tokens_min = 1
 
