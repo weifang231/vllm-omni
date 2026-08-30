@@ -92,13 +92,17 @@ def test_request_metadata_builds_absolute_deadline() -> None:
         RequestSchedulingMetadata.create(first_output_deadline_s=-0.1)
 
 
-def test_http_headers_map_to_generate_kwargs() -> None:
+def test_http_headers_require_explicit_trust(monkeypatch: pytest.MonkeyPatch) -> None:
+    headers = {
+        "X-VLLM-OMNI-REQUEST-CLASS": "interactive",
+        "x-vllm-omni-request-path": "audio",
+        "x-vllm-omni-first-output-deadline-ms": "400",
+    }
+    assert scheduling_kwargs_from_headers(headers) == {}
+
+    monkeypatch.setenv("VLLM_OMNI_TRUST_SCHEDULING_HEADERS", "1")
     assert scheduling_kwargs_from_headers(
-        {
-            "X-VLLM-OMNI-REQUEST-CLASS": "interactive",
-            "x-vllm-omni-request-path": "audio",
-            "x-vllm-omni-first-output-deadline-ms": "400",
-        }
+        headers
     ) == {
         "request_class": "interactive",
         "request_path": "audio",
@@ -106,7 +110,10 @@ def test_http_headers_map_to_generate_kwargs() -> None:
     }
 
     with pytest.raises(ValueError, match="finite and non-negative"):
-        scheduling_kwargs_from_headers({"x-vllm-omni-first-output-deadline-ms": "-1"})
+        scheduling_kwargs_from_headers(
+            {"x-vllm-omni-first-output-deadline-ms": "-1"},
+            trusted=True,
+        )
 
 
 def test_edf_reorders_only_ready_requests_and_is_stable() -> None:
