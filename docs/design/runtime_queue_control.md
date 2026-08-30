@@ -37,9 +37,9 @@ The control layer is responsible for:
 5. optionally applying the paper's calibrated Erlang--empirical ingress score
    before a request first enters stage 0, with rechecks after queue/configuration
    changes and immediately before dispatch; and
-6. for Qwen3-TTS HTTP streams, optionally holding client-visible PCM until a
-   controller-selected startup buffer is available or the first-output
-   deadline expires.
+6. for Qwen3-TTS speech streams and standard Qwen3-Omni chat audio streams,
+   optionally holding client-visible PCM until a controller-selected startup
+   buffer is available or the first-output deadline expires.
 
 It does not implement the paper's dynamic-program optimizer or compute the
 Brownian startup-buffer formula. The admission implementation is a model-based
@@ -146,19 +146,28 @@ sort after requests with deadlines. With admission disabled, no request is
 rejected merely because its deadline has passed. With calibrated admission
 enabled for its class, an expired request is rejected with HTTP 429.
 
-## Qwen3-TTS playback-start adapter
+## Audio playback-start adapters
 
-The HTTP raw-audio and SSE streaming paths recognize one additional trusted
-header:
+The Qwen3-TTS HTTP raw-audio/SSE paths and the standard Qwen3-Omni
+`/v1/chat/completions` SSE path recognize one additional trusted header:
 
 - `x-vllm-omni-playback-buffer-ms`
 
 The header is ignored unless `VLLM_OMNI_TRUST_SCHEDULING_HEADERS=1`. When it is
-present, Qwen3-TTS continues draining decoded audio from the engine but
-withholds the WAV header and PCM chunks from the client until their exact PCM16
-frame duration reaches the requested target. It then flushes the original
-chunks in order and streams subsequent chunks normally. A clean end of stream
-flushes a short utterance even when it never reaches the target.
+present, the server continues draining decoded audio from the engine but
+withholds the client-visible audio chunks until their exact PCM16 frame
+duration reaches the requested target. The Qwen3-Omni chat path uses its mono
+sample count, while the Qwen3-TTS path also accounts for the output channel
+count and holds the WAV header for raw WAV responses. The adapter then flushes
+the original audio chunks in order and streams subsequent audio normally. A
+clean end of stream flushes a short utterance even when it never reaches the
+target.
+
+For Qwen3-Omni chat, only audio deltas are held. Text deltas remain immediately
+visible and can therefore pass audio that is waiting behind the playback gate;
+the deadline is a first-audio delivery fallback, not a text-output gate. This
+keeps text streaming semantics unchanged while buffering audio in its original
+audio-delta order.
 
 If `x-vllm-omni-first-output-deadline-ms` is also present, expiration opens the
 gate with whatever audio is available; if no chunk is available yet, the first
@@ -170,6 +179,6 @@ release reason, and whether deadline fallback was used.
 
 This interface deliberately accepts the selected target rather than deriving
 one. The paper's Brownian rule can run in an external or future in-process
-controller using calibrated generation drift and variance. The current adapter
-does not apply to non-Qwen3-TTS models, non-streaming responses, or the
-sentence-oriented WebSocket endpoint.
+controller using calibrated generation drift and variance. The current
+adapters do not apply to other model families, non-streaming responses,
+full-duplex chat, or the sentence-oriented speech WebSocket endpoint.
