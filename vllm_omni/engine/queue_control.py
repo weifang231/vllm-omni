@@ -11,6 +11,7 @@ the corresponding pipeline, path, class, and stage credits are available.
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
@@ -23,6 +24,7 @@ DispatchCallable = Callable[[], Awaitable[bool]]
 REQUEST_CLASS_HEADER = "x-vllm-omni-request-class"
 REQUEST_PATH_HEADER = "x-vllm-omni-request-path"
 FIRST_OUTPUT_DEADLINE_MS_HEADER = "x-vllm-omni-first-output-deadline-ms"
+TRUST_SCHEDULING_HEADERS_ENV = "VLLM_OMNI_TRUST_SCHEDULING_HEADERS"
 
 
 def _label(value: str | None, *, default: str, field_name: str) -> str:
@@ -36,9 +38,26 @@ def _label(value: str | None, *, default: str, field_name: str) -> str:
     return normalized
 
 
-def scheduling_kwargs_from_headers(headers: Mapping[str, str] | None) -> dict[str, Any]:
-    """Translate opt-in HTTP headers into :meth:`AsyncOmni.generate` kwargs."""
-    if headers is None:
+def scheduling_kwargs_from_headers(
+    headers: Mapping[str, str] | None,
+    *,
+    trusted: bool | None = None,
+) -> dict[str, Any]:
+    """Translate trusted HTTP headers into :meth:`AsyncOmni.generate` kwargs.
+
+    Headers are ignored by default because accepting caller-selected classes or
+    deadlines at a public ingress would let clients evade class limits or gain
+    EDF priority. Operators may opt in only when a trusted proxy owns these
+    headers, or callers may pass ``trusted=True`` at an internal boundary.
+    """
+    if trusted is None:
+        trusted = os.environ.get(TRUST_SCHEDULING_HEADERS_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    if not trusted or headers is None:
         return {}
     normalized_headers = {str(key).lower(): value for key, value in headers.items()}
     kwargs: dict[str, Any] = {}

@@ -82,6 +82,12 @@ metadata through these optional headers:
 - `x-vllm-omni-request-path`
 - `x-vllm-omni-first-output-deadline-ms`
 
+HTTP scheduling headers are ignored by default. Set
+`VLLM_OMNI_TRUST_SCHEDULING_HEADERS=1` only when a trusted ingress proxy strips
+caller-provided values and supplies authenticated class, path, and deadline
+metadata. Enabling the gate directly on a public endpoint would let a client
+claim another class or an earlier deadline.
+
 The deadline is converted once, at request arrival, to an absolute monotonic
 deadline. EDF is stable FIFO for equal deadlines; requests without deadlines
 sort after requests with deadlines. No request is rejected merely because its
