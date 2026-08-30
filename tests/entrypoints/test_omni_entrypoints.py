@@ -682,6 +682,36 @@ async def test_async_omni_propagates_client_error_status(monkeypatch: pytest.Mon
     assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
 
 
+def _enqueue_admission_rejection(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=0,
+            error="OMNI_ADMISSION_REJECTED: score below gamma",
+            status_code=429,
+            error_type="AdmissionRejectedError",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_admission_rejection_metadata(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_admission_rejection)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            async for _ in app.generate(prompt="deadline", request_id="req-admission"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.error_type == "AdmissionRejectedError"
+    assert str(exc_info.value).startswith("OMNI_ADMISSION_REJECTED:")
+
+
 def _enqueue_server_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
     engine.output_q.put_nowait(
         ErrorMessage(

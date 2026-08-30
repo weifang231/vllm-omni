@@ -27,6 +27,7 @@ from fastapi.responses import Response, StreamingResponse
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.engine.protocol import (
+    ErrorInfo,
     ErrorResponse,
     RequestResponseMetadata,
 )
@@ -64,6 +65,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     tts_entry_stage_archs,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
     estimate_fish_voice_clone_prompt_len_from_normalized,
@@ -2417,6 +2419,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             yield f"event: speech.audio.done\ndata: {done}\n\n"
         except asyncio.CancelledError:
             raise
+        except OmniClientError as e:
+            error_payload = {
+                "type": "speech.audio.error",
+                "error": {
+                    "message": e.message,
+                    "type": e.error_type,
+                    "param": None,
+                    "code": e.status_code,
+                    **({"partial_audio": True, "action": "discard"} if emitted_audio else {}),
+                },
+            }
+            data = json.dumps(error_payload, separators=(",", ":"))
+            yield f"event: speech.audio.error\ndata: {data}\n\n"
         except Exception as e:
             error: dict[str, Any] = {
                 "message": str(e),
@@ -3471,6 +3486,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._diffusion_error_response("Client disconnected")
         except (EngineGenerateError, EngineDeadError):
             raise  # Propagate to the global Omni exception handler
+        except OmniClientError as e:
+            return self._diffusion_error_response(
+                e.message,
+                status_code=e.status_code,
+                error_type=e.error_type,
+            )
         except ValueError as e:
             return self._diffusion_error_response(str(e), status_code=400)
         except Exception as e:
@@ -3478,7 +3499,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._diffusion_error_response(f"Speech generation failed: {e}")
 
     @staticmethod
-    def _diffusion_error_response(message: str, status_code: int = 500) -> Response:
+    def _diffusion_error_response(
+        message: str,
+        status_code: int = 500,
+        error_type: str | None = None,
+    ) -> Response:
         """Create a JSON error response without depending on OpenAIServing.
 
         Args:
@@ -3487,7 +3512,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 client-input validation failures so the response semantics match
                 the OpenAI-compatible behavior used by ``create_speech``.
         """
-        err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
+        err_type = error_type or ("BadRequestError" if 400 <= status_code < 500 else "server_error")
         error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
         return Response(content=error_body, media_type="application/json", status_code=status_code)
 
@@ -3699,6 +3724,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
             )
             raise  # Propagate to the global Omni exception handler
+        except OmniClientError as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.info(
+                "[SpeechE2E] request_id=%s stream=%s status=client_error http_status=%d total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                e.status_code,
+                total_ms,
+                e,
+            )
+            return ErrorResponse(
+                error=ErrorInfo(
+                    message=e.message,
+                    type=e.error_type,
+                    param=None,
+                    code=e.status_code,
+                )
+            )
         except ValueError as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.warning(

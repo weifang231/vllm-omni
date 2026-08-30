@@ -55,6 +55,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supporte
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -751,6 +752,31 @@ class TestSpeechAPI:
         assert b"Invalid voice" in response.body
 
     @pytest.mark.asyncio
+    async def test_diffusion_admission_rejection_preserves_429(self, mocker: MockerFixture):
+        async def rejected_generate(*_args, **_kwargs):
+            raise OmniClientError(
+                "OMNI_ADMISSION_REJECTED: score below gamma",
+                status_code=429,
+                error_type="AdmissionRejectedError",
+            )
+            yield  # pragma: no cover
+
+        engine_client = mocker.MagicMock()
+        engine_client.default_sampling_params_list = [mocker.MagicMock(extra_args={})]
+        engine_client.generate = mocker.MagicMock(side_effect=rejected_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=engine_client,
+            model_name="test-model",
+        )
+
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="test-input"))
+
+        assert response.status_code == 429
+        payload = json.loads(response.body)
+        assert payload["error"]["type"] == "AdmissionRejectedError"
+        assert payload["error"]["code"] == 429
+
+    @pytest.mark.asyncio
     async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
         """Test public diffusion speech success and extra_params propagation."""
         # Mock the engine client
@@ -832,6 +858,57 @@ class TestTTSMethods:
         # Fixture creates server with stage_configs = [] -> _is_tts should be False
         assert speech_server._is_tts is False
         assert speech_server._tts_stage is None
+
+    @pytest.mark.asyncio
+    async def test_nonstream_admission_rejection_preserves_429(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ) -> None:
+        speech_server._check_model = mocker.AsyncMock(return_value=None)
+        speech_server._generate_audio_bytes = mocker.AsyncMock(
+            side_effect=OmniClientError(
+                "OMNI_ADMISSION_REJECTED: score below gamma",
+                status_code=429,
+                error_type="AdmissionRejectedError",
+            )
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == 429
+        assert response.error.type == "AdmissionRejectedError"
+        assert "OMNI_ADMISSION_REJECTED" in response.error.message
+
+    @pytest.mark.asyncio
+    async def test_sse_admission_rejection_emits_identifiable_error(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ) -> None:
+        async def rejected_chunks(*_args, **_kwargs):
+            raise OmniClientError(
+                "OMNI_ADMISSION_REJECTED: score below gamma",
+                status_code=429,
+                error_type="AdmissionRejectedError",
+            )
+            yield b""  # pragma: no cover
+
+        mocker.patch.object(speech_server, "_generate_audio_chunks", side_effect=rejected_chunks)
+        events = [
+            event
+            async for event in speech_server._generate_audio_sse_events(
+                object(),
+                "speech-rejected",
+            )
+        ]
+
+        assert len(events) == 1
+        payload = json.loads(events[0].split("data: ", 1)[1])
+        assert payload["type"] == "speech.audio.error"
+        assert payload["error"]["code"] == 429
+        assert payload["error"]["type"] == "AdmissionRejectedError"
 
     @pytest.mark.parametrize(
         ("model_type", "expected_speed"),
@@ -2940,7 +3017,8 @@ class TestStreamingResponse:
         finalized_tts_params = {"_qwen3_tts_effective_max_tokens": [192]}
         captured: dict = {}
 
-        async def prepare(_request, request_id=None):
+        async def prepare(_request, request_id=None, raw_request=None):
+            del raw_request
             return request_id, object(), finalized_tts_params
 
         async def generate_chunks(
@@ -3354,6 +3432,35 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
 
     _assert_openai_error_response(response, status_code=400, message="bad request")
+
+
+def test_api_server_create_speech_preserves_admission_rejection_429(mocker: MockerFixture):
+    handler = mocker.MagicMock()
+    handler.create_speech = mocker.AsyncMock(
+        return_value=ErrorResponse(
+            error=ErrorInfo(
+                message="OMNI_ADMISSION_REJECTED: score below gamma",
+                type="AdmissionRejectedError",
+                param=None,
+                code=429,
+            ),
+        )
+    )
+    raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
+
+    response = asyncio.run(
+        api_server_module.create_speech(
+            OpenAICreateSpeechRequest(input="Hello"),
+            raw_request,
+        )
+    )
+
+    _assert_openai_error_response(
+        response,
+        status_code=429,
+        message="OMNI_ADMISSION_REJECTED",
+        err_type="AdmissionRejectedError",
+    )
 
 
 def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:

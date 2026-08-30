@@ -59,6 +59,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.runtime_instrumentation import (
     RUNTIME_CONTROL_FILE_ENV,
+    RUNTIME_CONTROL_INTERVAL_ENV,
     RUNTIME_METRICS_DIR_ENV,
 )
 
@@ -633,6 +634,145 @@ async def test_default_off_without_runtime_env_bypasses_queue_controller(
     assert snapshot["enqueued_total"] == 0
     assert snapshot["active_requests"] == 0
     assert snapshot["active_by_stage"] == {}
+
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_rejection_is_nonfatal_429_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "admission-control.json"
+    control_path.write_text(
+        """{
+          "queue_control": {
+            "enabled": false,
+            "policy": "edf",
+            "admission": {
+              "enabled": true,
+              "classes": {
+                "interactive": {
+                  "effective_k": 0,
+                  "mu": 0,
+                  "service_samples_s": [0.1],
+                  "gamma": 0.9
+                }
+              }
+            }
+          }
+        }""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    await _enqueue_add_request(
+        fixture,
+        request_id="rejected",
+        prompt=FakePromptRequest("rejected", [1]),
+        original_prompt={"prompt": "rejected"},
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        scheduling_metadata=RequestSchedulingMetadata(
+            request_class="interactive",
+            deadline_monotonic_s=time.monotonic() + 10.0,
+        ),
+    )
+
+    await _wait_for(lambda: not fixture.output_sync_q.empty())
+    error = fixture.output_sync_q.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == "rejected"
+    assert error.stage_id == 0
+    assert error.fatal is False
+    assert error.status_code == 429
+    assert error.error_type == "AdmissionRejectedError"
+    assert error.error.startswith("OMNI_ADMISSION_REJECTED:")
+    assert "reason=zero_effective_k" in error.error
+    assert stage.add_request_calls == []
+    await _wait_for(lambda: "rejected" not in fixture.orchestrator.request_states)
+    assert fixture.orchestrator._queue_controller.snapshot()["active_requests"] == 0
+    assert fixture.orchestrator._queue_controller.snapshot()["queued_requests"] == 0
+
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_rechecks_expiry_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "admission-control.json"
+    control_path.write_text(
+        """{
+          "queue_control": {
+            "enabled": false,
+            "policy": "edf",
+            "admission": {
+              "enabled": true,
+              "classes": {
+                "interactive": {
+                  "effective_k": 1,
+                  "mu": 100,
+                  "service_samples_s": [0.01],
+                  "gamma": 0.5
+                }
+              }
+            }
+          }
+        }""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    monkeypatch.setenv(RUNTIME_CONTROL_INTERVAL_ENV, "10")
+
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    now = [100.0]
+    fixture.orchestrator._queue_controller._clock = lambda: now[0]
+    params = [_sampling_params()]
+    await _enqueue_add_request(
+        fixture,
+        request_id="running",
+        prompt=FakePromptRequest("running", [1]),
+        original_prompt={"prompt": "running"},
+        sampling_params_list=params,
+        final_stage_id=0,
+        scheduling_metadata=RequestSchedulingMetadata(
+            request_class="interactive",
+            deadline_monotonic_s=110.0,
+        ),
+    )
+    await _wait_for(lambda: len(stage.add_request_calls) == 1)
+
+    await _enqueue_add_request(
+        fixture,
+        request_id="waiting",
+        prompt=FakePromptRequest("waiting", [1]),
+        original_prompt={"prompt": "waiting"},
+        sampling_params_list=params,
+        final_stage_id=0,
+        scheduling_metadata=RequestSchedulingMetadata(
+            request_class="interactive",
+            deadline_monotonic_s=101.0,
+        ),
+    )
+    await _wait_for(lambda: fixture.orchestrator._queue_controller.snapshot()["queued_requests"] == 1)
+    now[0] = 102.0
+    await _enqueue_abort_request(fixture, ["running"])
+
+    await _wait_for(lambda: not fixture.output_sync_q.empty())
+    error = fixture.output_sync_q.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == "waiting"
+    assert error.status_code == 429
+    assert "reason=deadline_expired" in error.error
+    assert len(stage.add_request_calls) == 1
+    await _wait_for(lambda: "waiting" not in fixture.orchestrator.request_states)
 
     await _shutdown_orchestrator(fixture)
 

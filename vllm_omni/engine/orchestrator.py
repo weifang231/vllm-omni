@@ -57,6 +57,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.queue_control import (
+    AdmissionDecision,
     PendingStageDispatch,
     QueueControlConfig,
     RequestSchedulingMetadata,
@@ -713,9 +714,8 @@ class Orchestrator:
             required_active_stage_id=required_active_stage_id,
         )
         instrumentation = getattr(self, "_queue_instrumentation", None)
-        if not controller.enabled and (
-            instrumentation is None
-            or not (instrumentation.control_enabled or instrumentation.metrics_enabled)
+        if not controller.active and (
+            instrumentation is None or not (instrumentation.control_enabled or instrumentation.metrics_enabled)
         ):
             # Preserve the stock hot path when runtime control and telemetry
             # are both absent. A configured control file still goes through
@@ -733,7 +733,11 @@ class Orchestrator:
                 controller.rollback(acquired)
             self._write_queue_control_snapshot()
             return
-        controller.enqueue(pending)
+        admission_decision = controller.enqueue(pending)
+        if admission_decision is not None and not admission_decision.admitted:
+            await self._fail_request_admission(logical_request_id, admission_decision)
+            self._write_queue_control_snapshot()
+            return
         await self._drain_queue_control()
 
     async def _drain_queue_control(self) -> None:
@@ -742,7 +746,15 @@ class Orchestrator:
         self._queue_control_draining = True
         controller = self._ensure_queue_controller()
         try:
-            while acquired := controller.pop_ready():
+            while True:
+                for rejected in controller.recheck_admission():
+                    await self._fail_request_admission(
+                        rejected.pending.logical_request_id,
+                        rejected.decision,
+                    )
+                acquired = controller.pop_ready()
+                if acquired is None:
+                    break
                 try:
                     succeeded = await acquired.pending.dispatch()
                 except BaseException:
@@ -753,6 +765,34 @@ class Orchestrator:
         finally:
             self._queue_control_draining = False
             self._write_queue_control_snapshot()
+
+    async def _fail_request_admission(
+        self,
+        request_id: str,
+        decision: AdmissionDecision,
+    ) -> None:
+        score = "none" if decision.score is None else f"{decision.score:.6f}"
+        gamma = "none" if decision.gamma is None else f"{decision.gamma:.6f}"
+        error = (
+            "OMNI_ADMISSION_REJECTED: "
+            f"class={decision.request_class!r} reason={decision.reason} "
+            f"score={score} gamma={gamma} k={decision.effective_k} "
+            f"active={decision.active_count} q={decision.queue_position}"
+        )
+        logger.info("[Orchestrator] req=%s %s", request_id, error)
+        await self.output_async_queue.put(
+            ErrorMessage(
+                error=error,
+                status_code=HTTPStatus.TOO_MANY_REQUESTS.value,
+                error_type="AdmissionRejectedError",
+                request_id=request_id,
+                stage_id=0,
+            )
+        )
+        await self._cleanup_request_ids(
+            [request_id, *self._cfg_tracker.cleanup_parent(request_id)],
+            abort=True,
+        )
 
     async def _release_stage_credit(self, request_id: str, stage_id: int) -> None:
         if self._ensure_queue_controller().release_stage(request_id, stage_id):
