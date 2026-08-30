@@ -56,6 +56,12 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
+from vllm_omni.engine.queue_control import (
+    PendingStageDispatch,
+    QueueControlConfig,
+    RequestSchedulingMetadata,
+    RuntimeQueueController,
+)
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
@@ -64,6 +70,7 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.runtime_instrumentation import RuntimeInstrumentation
 
 logger = init_logger(__name__)
 
@@ -147,6 +154,7 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
+    scheduling_metadata: RequestSchedulingMetadata | None = None,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -196,6 +204,7 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        scheduling_metadata=scheduling_metadata,
     )
 
 
@@ -228,6 +237,7 @@ class OrchestratorRequestState:
     duplex_config_generation: int = -1
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
+    scheduling_metadata: RequestSchedulingMetadata = field(default_factory=RequestSchedulingMetadata)
 
 
 @dataclass
@@ -377,6 +387,7 @@ class _OrchestratorDuplexStagePort:
             params=context.stage_sampling_params,
             model_config=self._stage_pools[context.stage_id].stage_vllm_config.model_config,
             resumable=True,
+            scheduling_metadata=request_state.scheduling_metadata,
         )
         request.external_req_id = request.request_id
         pool = self._stage_pools[context.stage_id]
@@ -427,6 +438,9 @@ class Orchestrator:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    _queue_controller: RuntimeQueueController | None = None
+    _queue_instrumentation: RuntimeInstrumentation | None = None
+    _queue_control_draining = False
     duplex_control_plane: DuplexControlPlanePort | None = None
 
     def __init__(
@@ -456,6 +470,24 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self._queue_instrumentation = RuntimeInstrumentation(
+            engine="vllm-omni",
+            component="queue-controller",
+            stage_id="pipeline",
+        )
+        try:
+            initial_queue_config = QueueControlConfig.from_document(
+                self._queue_instrumentation.read_control(),
+                num_stages=self.num_stages,
+            )
+        except ValueError as exc:
+            logger.warning("[Orchestrator] Ignoring invalid initial queue-control config: %s", exc)
+            initial_queue_config = QueueControlConfig()
+        self._queue_controller = RuntimeQueueController(
+            num_stages=self.num_stages,
+            config=initial_queue_config,
+        )
+        self._queue_control_draining = False
         self.log_stats = log_stats
         self._prom_metrics = prom_metrics
         self._stage_replica_waiting: dict[tuple[int, int], int] = {}
@@ -594,6 +626,113 @@ class Orchestrator:
             logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
             self._stat_logger = None
 
+    def _ensure_queue_controller(self) -> RuntimeQueueController:
+        controller = getattr(self, "_queue_controller", None)
+        if controller is None:
+            num_stages = getattr(self, "num_stages", len(getattr(self, "stage_pools", ())))
+            controller = RuntimeQueueController(num_stages=num_stages)
+            self._queue_controller = controller
+            self._queue_control_draining = False
+        return controller
+
+    def _refresh_queue_control(self) -> bool:
+        instrumentation = getattr(self, "_queue_instrumentation", None)
+        if instrumentation is None or not instrumentation.control_enabled:
+            return False
+        try:
+            config = QueueControlConfig.from_document(
+                instrumentation.read_control(),
+                num_stages=self.num_stages,
+            )
+        except ValueError as exc:
+            logger.warning("[Orchestrator] Ignoring invalid queue-control config: %s", exc)
+            return False
+        return self._ensure_queue_controller().configure(config)
+
+    def _write_queue_control_snapshot(self, *, force: bool = False) -> None:
+        instrumentation = getattr(self, "_queue_instrumentation", None)
+        if instrumentation is None:
+            return
+        instrumentation.write_snapshot(
+            self._ensure_queue_controller().snapshot(),
+            force=force,
+        )
+
+    async def _queue_control_housekeeping_loop(self) -> None:
+        instrumentation = self._queue_instrumentation
+        if instrumentation is None:
+            return
+        intervals = []
+        if instrumentation.control_enabled:
+            intervals.append(instrumentation.control_interval_s)
+        if instrumentation.metrics_enabled:
+            intervals.append(instrumentation.snapshot_interval_s)
+        interval_s = max(min(intervals or [1.0]), 0.01)
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval_s)
+            except TimeoutError:
+                self._refresh_queue_control()
+                await self._drain_queue_control()
+
+    async def _enqueue_stage_dispatch(
+        self,
+        dispatch: Callable[[], Awaitable[Any]],
+        *,
+        request_id: str,
+        logical_request_id: str,
+        stage_id: int,
+        metadata: RequestSchedulingMetadata,
+        operation: str,
+        starts_request: bool = False,
+        required_active_stage_id: int | None = None,
+    ) -> None:
+        async def guarded_dispatch() -> bool:
+            return await self._dispatch_or_fail_request(
+                dispatch,
+                req_id=logical_request_id,
+                stage_id=stage_id,
+                operation=operation,
+                dispatch_req_id=request_id,
+            )
+
+        controller = self._ensure_queue_controller()
+        controller.enqueue(
+            PendingStageDispatch(
+                request_id=request_id,
+                logical_request_id=logical_request_id,
+                stage_id=stage_id,
+                metadata=metadata,
+                dispatch=guarded_dispatch,
+                operation=operation,
+                starts_request=starts_request,
+                required_active_stage_id=required_active_stage_id,
+            )
+        )
+        await self._drain_queue_control()
+
+    async def _drain_queue_control(self) -> None:
+        if getattr(self, "_queue_control_draining", False):
+            return
+        self._queue_control_draining = True
+        controller = self._ensure_queue_controller()
+        try:
+            while acquired := controller.pop_ready():
+                try:
+                    succeeded = await acquired.pending.dispatch()
+                except BaseException:
+                    controller.rollback(acquired)
+                    raise
+                if not succeeded:
+                    controller.rollback(acquired)
+        finally:
+            self._queue_control_draining = False
+            self._write_queue_control_snapshot()
+
+    async def _release_stage_credit(self, request_id: str, stage_id: int) -> None:
+        if self._ensure_queue_controller().release_stage(request_id, stage_id):
+            await self._drain_queue_control()
+
     @property
     def duplex_sessions(self) -> DuplexSessionRuntimeManager:
         if self.duplex_control_plane is None:
@@ -626,6 +765,15 @@ class Orchestrator:
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
+        if self._queue_instrumentation is not None and (
+            self._queue_instrumentation.control_enabled or self._queue_instrumentation.metrics_enabled
+        ):
+            tasks.append(
+                asyncio.create_task(
+                    self._queue_control_housekeeping_loop(),
+                    name="orchestrator-queue-control",
+                )
+            )
         if self.duplex_control_plane is not None:
             tasks.append(asyncio.create_task(self._duplex_reaper_loop(), name="orchestrator-duplex-reaper"))
         if membership_watcher is not None:
@@ -669,6 +817,7 @@ class Orchestrator:
                 self._membership.shutdown()
 
             self._orch_monitor.flush()
+            self._write_queue_control_snapshot(force=True)
             self._shutdown_stages()
 
             loop = asyncio.get_running_loop()
@@ -778,32 +927,42 @@ class Orchestrator:
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
+            scheduling_metadata=(
+                msg.scheduling_metadata
+                or getattr(prompt, "scheduling_metadata", None)
+                or RequestSchedulingMetadata.create(default_path=f"stage-{final_stage_id}")
+            ),
         )
         self.request_states[request_id] = req_state
-        self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
-        if enqueue_ts > 0:
-            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        if not await self._dispatch_or_fail_request(
-            lambda: self.stage_pools[stage_id].submit_initial(
+
+        async def dispatch_initial() -> None:
+            req_state.stage_submit_ts[stage_id] = _time.time()
+            if enqueue_ts > 0:
+                req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
+            await self.stage_pools[stage_id].submit_initial(
                 request_id,
                 req_state,
                 prompt,
                 prompt_text=msg.output_prompt_text,
-            ),
-            req_id=request_id,
-            stage_id=stage_id,
-            operation="add_request",
-        ):
-            return
+            )
+            self._register_running_request(req_state)
+            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+        await self._enqueue_stage_dispatch(
+            dispatch_initial,
+            request_id=request_id,
+            logical_request_id=request_id,
+            stage_id=stage_id,
+            metadata=req_state.scheduling_metadata,
+            operation="add_request",
+            starts_request=True,
+        )
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -829,22 +988,26 @@ class Orchestrator:
             req_state.sampling_params_list = msg.sampling_params_list
 
         req_state.streaming.enabled = True
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        if not await self._dispatch_or_fail_request(
-            lambda: self.stage_pools[stage_id].submit_update(
+
+        async def dispatch_update() -> None:
+            req_state.stage_submit_ts[stage_id] = _time.time()
+            await self.stage_pools[stage_id].submit_update(
                 request_id,
                 req_state,
                 request,
                 prompt_text=msg.output_prompt_text,
-            ),
-            req_id=request_id,
-            stage_id=stage_id,
-            operation="streaming_update",
-        ):
-            return
+            )
+            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, request, req_state)
+        await self._enqueue_stage_dispatch(
+            dispatch_update,
+            request_id=request_id,
+            logical_request_id=request_id,
+            stage_id=stage_id,
+            metadata=req_state.scheduling_metadata,
+            operation="streaming_update",
+        )
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -873,24 +1036,32 @@ class Orchestrator:
             final_stage_id=0,
             final_output_stage_ids={0},
             request_timestamp=parent_state.request_timestamp,
+            scheduling_metadata=parent_state.scheduling_metadata,
         )
         self.request_states[companion_id] = companion_state
-        companion_state.stage_submit_ts[0] = _time.time()
-        # A dead-stage failure is attributed to the parent request; its cleanup
-        # also releases this companion.
-        if not await self._dispatch_or_fail_request(
-            lambda: self.stage_pools[0].submit_initial(
+
+        async def dispatch_companion() -> None:
+            companion_state.stage_submit_ts[0] = _time.time()
+            await self.stage_pools[0].submit_initial(
                 companion_id,
                 companion_state,
                 companion_prompt,
                 prompt_text=msg.companion_prompt_text,
                 affinity_request_id=parent_id,
-            ),
-            req_id=parent_id,
+            )
+
+        # A dead-stage failure is attributed to the parent request; its cleanup
+        # also releases this companion.
+        await self._enqueue_stage_dispatch(
+            dispatch_companion,
+            request_id=companion_id,
+            logical_request_id=parent_id,
             stage_id=0,
+            metadata=parent_state.scheduling_metadata,
             operation=f"companion {companion_id}",
-            dispatch_req_id=companion_id,
-        ):
+        )
+
+        if self.stage_pools[0].get_bound_replica_id(companion_id) is None:
             return
 
         logger.info(
@@ -1829,6 +2000,9 @@ class Orchestrator:
 
         abort_outputs: list[OutputMessage] = []
         try:
+            controller = self._ensure_queue_controller()
+            for request_id in cleanup_ids:
+                controller.cancel_request(request_id)
             if abort:
                 abort_outputs = await self._abort_request_ids(cleanup_ids)
             self._release_request_bindings(cleanup_ids)
@@ -1840,6 +2014,7 @@ class Orchestrator:
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
                     req_state.running_counter_registered = False
+            await self._drain_queue_control()
         except BaseException:
             if closing_session_ids and self.duplex_control_plane is not None:
                 self.duplex_control_plane.defer_request_cleanups(closing_session_ids)
@@ -1980,6 +2155,8 @@ class Orchestrator:
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
+        if finished and not segment_finished:
+            await self._release_stage_credit(req_id, stage_id)
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -2130,13 +2307,15 @@ class Orchestrator:
                 log_prefix="Orchestrator stage input",
             )
 
-        if prompt_embeds is None and additional_information is None:
+        scheduling_metadata = getattr(request, "scheduling_metadata", None)
+        if prompt_embeds is None and additional_information is None and scheduling_metadata is None:
             return request
 
         return OmniEngineCoreRequest.from_request(
             request,
             prompt_embeds=prompt_embeds,
             additional_information=additional_information,
+            scheduling_metadata=scheduling_metadata,
         )
 
     def _next_stage_input_is_tokens(self, next_input: Any) -> bool:
@@ -2151,6 +2330,7 @@ class Orchestrator:
         *,
         mm_features: list | None = None,
         resumable: bool = False,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
     ) -> Any:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2161,6 +2341,7 @@ class Orchestrator:
                 model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=resumable,
+                scheduling_metadata=scheduling_metadata,
             )
             request.external_req_id = request.request_id
             return request
@@ -2183,6 +2364,11 @@ class Orchestrator:
             resumable=resumable,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
+        if scheduling_metadata is not None:
+            request = OmniEngineCoreRequest.from_request(
+                request,
+                scheduling_metadata=scheduling_metadata,
+            )
         request.external_req_id = req_id
         return request
 
@@ -2473,19 +2659,14 @@ class Orchestrator:
         is_final_update: bool = False,
     ) -> None:
         """Forward output to the next stage; a dead stage fails only this request."""
-        await self._dispatch_or_fail_request(
-            lambda: self._forward_to_next_stage_unguarded(
-                req_id,
-                src_stage_id,
-                output,
-                req_state,
-                src_replica_id=src_replica_id,
-                is_streaming_session=is_streaming_session,
-                is_final_update=is_final_update,
-            ),
-            req_id=req_id,
-            stage_id=src_stage_id + 1,
-            operation="inter-stage forward",
+        await self._forward_to_next_stage_unguarded(
+            req_id,
+            src_stage_id,
+            output,
+            req_state,
+            src_replica_id=src_replica_id,
+            is_streaming_session=is_streaming_session,
+            is_final_update=is_final_update,
         )
 
     async def _forward_to_next_stage_unguarded(
@@ -2511,9 +2692,7 @@ class Orchestrator:
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
-        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
-        _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
             # Gate: never dispatch with an incomplete CFG bundle. Checked
@@ -2642,36 +2821,46 @@ class Orchestrator:
             else:
                 diffusion_prompt = req_state.prompt
 
-            if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
-            else:
-                replica_id = await next_pool.submit_initial(
+            async def dispatch_diffusion() -> None:
+                submit_start = _time.perf_counter()
+                if self._next_stage_already_submitted(src_stage_id, req_state):
+                    replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                else:
+                    replica_id = await next_pool.submit_initial(
+                        req_id,
+                        req_state,
+                        diffusion_prompt,
+                        submit_kwargs={
+                            "kv_sender_info": self._build_kv_sender_info(
+                                list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
+                                request_id=req_id,
+                            )
+                        },
+                        params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    )
+                self._record_duplex_stage_submission(
+                    next_logical,
                     req_id,
+                    replica_id,
                     req_state,
-                    diffusion_prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                            request_id=req_id,
-                        )
-                    },
-                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
-            self._record_duplex_stage_submission(
-                next_logical,
-                req_id,
-                replica_id,
-                req_state,
-            )
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            self._emit_tx_edge(
-                from_stage=src_stage_id,
-                from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
-                to_pool=next_pool,
+                req_state.stage_submit_ts[next_logical] = _time.time()
+                self._emit_tx_edge(
+                    from_stage=src_stage_id,
+                    from_replica=src_replica_id if src_replica_id is not None else 0,
+                    to_stage=next_logical,
+                    to_pool=next_pool,
+                    request_id=req_id,
+                    tx_ms=(_time.perf_counter() - submit_start) * 1000.0,
+                )
+
+            await self._enqueue_stage_dispatch(
+                dispatch_diffusion,
                 request_id=req_id,
-                tx_ms=_tx_ms,
+                logical_request_id=req_id,
+                stage_id=next_logical,
+                metadata=req_state.scheduling_metadata,
+                operation="inter-stage diffusion forward",
             )
             return
 
@@ -2696,36 +2885,57 @@ class Orchestrator:
                     )
                 decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
 
+            requests = []
             for decode_input in decode_inputs:
-                request = build_engine_core_request_from_tokens(
+                stage_request = build_engine_core_request_from_tokens(
                     request_id=req_id,
                     prompt=decode_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                     mm_features=req_state.mm_features,
                     resumable=next_stage_resumable,
+                    scheduling_metadata=req_state.scheduling_metadata,
                 )
-                request.external_req_id = request.request_id
-                if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
-                else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                self._record_duplex_stage_submission(
-                    next_logical,
-                    req_id,
-                    replica_id,
-                    req_state,
+                stage_request.external_req_id = stage_request.request_id
+                requests.append(stage_request)
+
+            async def dispatch_pd_decode() -> None:
+                submit_start = _time.perf_counter()
+                already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+                for stage_request in requests:
+                    if already_submitted:
+                        replica_id = await next_pool.submit_update(req_id, req_state, stage_request)
+                    else:
+                        replica_id = await next_pool.submit_initial(
+                            req_id,
+                            req_state,
+                            stage_request,
+                            prompt_text=None,
+                        )
+                    self._record_duplex_stage_submission(
+                        next_logical,
+                        req_id,
+                        replica_id,
+                        req_state,
+                    )
+
+                req_state.stage_submit_ts[next_logical] = _time.time()
+                self._emit_tx_edge(
+                    from_stage=src_stage_id,
+                    from_replica=src_replica_id if src_replica_id is not None else 0,
+                    to_stage=next_logical,
+                    to_pool=next_pool,
+                    request_id=req_id,
+                    tx_ms=(_time.perf_counter() - submit_start) * 1000.0,
                 )
 
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            self._emit_tx_edge(
-                from_stage=src_stage_id,
-                from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
-                to_pool=next_pool,
+            await self._enqueue_stage_dispatch(
+                dispatch_pd_decode,
                 request_id=req_id,
-                tx_ms=_tx_ms,
+                logical_request_id=req_id,
+                stage_id=next_logical,
+                metadata=req_state.scheduling_metadata,
+                operation="inter-stage PD decode forward",
             )
             return
 
@@ -2816,41 +3026,62 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
             return
 
-        # Build and submit requests for each input
+        # Build requests before acquiring a stage lease. Input processing can
+        # legitimately produce no dispatch, which must not consume WIP credit.
+        requests = []
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
-            request = self._build_next_stage_request(
+            stage_request = self._build_next_stage_request(
                 req_id,
                 next_logical,
                 next_input,
                 params=params,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
+                scheduling_metadata=req_state.scheduling_metadata,
+            )
+            requests.append(stage_request)
+
+        async def dispatch_next_stage() -> None:
+            submit_start = _time.perf_counter()
+            already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+            for stage_request in requests:
+                if already_submitted:
+                    replica_id = await next_pool.submit_update(req_id, req_state, stage_request)
+                else:
+                    replica_id = await next_pool.submit_initial(
+                        req_id,
+                        req_state,
+                        stage_request,
+                        prompt_text=None,
+                    )
+                self._record_duplex_stage_submission(
+                    next_logical,
+                    req_id,
+                    replica_id,
+                    req_state,
+                )
+
+            req_state.stage_submit_ts[next_logical] = _time.time()
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=(_time.perf_counter() - submit_start) * 1000.0,
             )
 
-            if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, request)
-            else:
-                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-            self._record_duplex_stage_submission(
-                next_logical,
-                req_id,
-                replica_id,
-                req_state,
-            )
-
-        req_state.stage_submit_ts[next_logical] = _time.time()
-        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-        self._emit_tx_edge(
-            from_stage=src_stage_id,
-            from_replica=src_replica_id if src_replica_id is not None else 0,
-            to_stage=next_logical,
-            to_pool=next_pool,
+        await self._enqueue_stage_dispatch(
+            dispatch_next_stage,
             request_id=req_id,
-            tx_ms=_tx_ms,
+            logical_request_id=req_id,
+            stage_id=next_logical,
+            metadata=req_state.scheduling_metadata,
+            operation="inter-stage forward",
         )
 
     async def _prewarm_async_chunk_stages(
@@ -2906,9 +3137,6 @@ class Orchestrator:
                 # execute before that conditioning payload arrives.
                 continue
 
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
-            _t_submit_start = _time.perf_counter()
-
             if next_pool.stage_type == "diffusion":
                 submit_kwargs = {
                     "kv_sender_info": self._build_kv_sender_info(
@@ -2916,17 +3144,17 @@ class Orchestrator:
                         request_id=request_id,
                     )
                 }
-                submitted = await self._dispatch_or_fail_request(
-                    lambda: next_pool.submit_initial(
+
+                async def submit_prewarm(
+                    stage_pool: StagePool = next_pool,
+                    kwargs: dict[str, Any] = submit_kwargs,
+                ) -> None:
+                    await stage_pool.submit_initial(
                         request_id,
                         req_state,
                         req_state.prompt,
-                        submit_kwargs=submit_kwargs,
-                    ),
-                    req_id=request_id,
-                    stage_id=next_stage_id,
-                    operation="async-chunk prewarm",
-                )
+                        submit_kwargs=kwargs,
+                    )
             else:
                 import copy
 
@@ -2953,47 +3181,54 @@ class Orchestrator:
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
+                    scheduling_metadata=req_state.scheduling_metadata,
                 )
                 request.external_req_id = request.request_id
-                submitted = await self._dispatch_or_fail_request(
-                    lambda: next_pool.submit_initial(
+
+                async def submit_prewarm(
+                    stage_pool: StagePool = next_pool,
+                    stage_request: Any = request,
+                ) -> None:
+                    await stage_pool.submit_initial(
                         request_id,
                         req_state,
-                        request,
+                        stage_request,
                         prompt_text=None,
-                    ),
-                    req_id=request_id,
-                    stage_id=next_stage_id,
-                    operation="async-chunk prewarm",
+                    )
+
+            async def dispatch_prewarm(
+                submit: Callable[[], Awaitable[None]] = submit_prewarm,
+                stage_id: int = next_stage_id,
+                stage_pool: StagePool = next_pool,
+            ) -> None:
+                submit_start = _time.perf_counter()
+                req_state.stage_submit_ts[stage_id] = _time.time()
+                await submit()
+                bound_replica_id = stage_pool.get_bound_replica_id(request_id)
+                self._record_duplex_stage_submission(
+                    stage_id,
+                    request_id,
+                    bound_replica_id if bound_replica_id is not None else 0,
+                    req_state,
+                )
+                src_replica = self.stage_pools[stage_id - 1].get_bound_replica_id(request_id)
+                self._emit_tx_edge(
+                    from_stage=stage_id - 1,
+                    from_replica=src_replica if src_replica is not None else 0,
+                    to_stage=stage_id,
+                    to_pool=stage_pool,
+                    request_id=request_id,
+                    tx_ms=(_time.perf_counter() - submit_start) * 1000.0,
                 )
 
-            # Attribute the failure to the stage that failed, not stage 0; the
-            # request is already cleaned up, so stop prewarming.
-            if not submitted:
-                return False
-
-            # The guard swallows submit_initial's return value; the pool binding
-            # it recorded carries the same replica.
-            bound_replica_id = next_pool.get_bound_replica_id(request_id)
-            self._record_duplex_stage_submission(
-                next_stage_id,
-                request_id,
-                bound_replica_id if bound_replica_id is not None else 0,
-                req_state,
-            )
-
-            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
-            # replica is stage 0's bound replica (single-replica thinker in
-            # all current configs); fall back to 0 if unknown.
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
-            self._emit_tx_edge(
-                from_stage=next_stage_id - 1,
-                from_replica=src_replica if src_replica is not None else 0,
-                to_stage=next_stage_id,
-                to_pool=next_pool,
+            await self._enqueue_stage_dispatch(
+                dispatch_prewarm,
                 request_id=request_id,
-                tx_ms=_tx_ms,
+                logical_request_id=request_id,
+                stage_id=next_stage_id,
+                metadata=req_state.scheduling_metadata,
+                operation="async-chunk prewarm",
+                required_active_stage_id=next_stage_id - 1,
             )
 
         return True

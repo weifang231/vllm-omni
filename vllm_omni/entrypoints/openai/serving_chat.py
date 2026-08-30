@@ -109,6 +109,7 @@ from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.engine.queue_control import scheduling_kwargs_from_headers
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64_with_compression,
@@ -798,6 +799,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     output_modalities=output_modalities,
                     arrival_time=request_timestamp,
                     lora_request=lora_request,
+                    **scheduling_kwargs_from_headers(raw_request.headers if raw_request is not None else None),
                 )
 
                 generators.append(generator)

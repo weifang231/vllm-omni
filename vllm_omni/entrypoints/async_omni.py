@@ -28,6 +28,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.queue_control import RequestSchedulingMetadata
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
@@ -483,6 +484,9 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        request_class: str | None = None,
+        request_path: str | None = None,
+        first_output_deadline_s: float | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -506,6 +510,12 @@ class AsyncOmni(EngineClient, OmniBase):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            request_class: Optional queue-control class label. Defaults to the
+                request path.
+            request_path: Optional queue-control path label. Defaults to the
+                requested output modalities, or the final stage id.
+            first_output_deadline_s: Optional non-negative relative deadline
+                budget, measured from this ``generate`` call.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -588,6 +598,17 @@ class AsyncOmni(EngineClient, OmniBase):
             # Determine the final stage for E2E stats
             final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
             final_output_stage_ids = self._compute_final_output_stage_ids(output_modalities) or [final_stage_id_for_e2e]
+            default_path = (
+                "+".join(sorted(dict.fromkeys(output_modalities)))
+                if output_modalities
+                else f"stage-{final_stage_id_for_e2e}"
+            )
+            scheduling_metadata = RequestSchedulingMetadata.create(
+                request_class=request_class,
+                path=request_path,
+                default_path=default_path,
+                first_output_deadline_s=first_output_deadline_s,
+            )
 
             metrics = OrchestratorMetrics(
                 self.num_stages,
@@ -627,6 +648,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    scheduling_metadata=scheduling_metadata,
                     first_chunk_submitted=first_chunk_submitted,
                 )
                 await first_chunk_submitted
@@ -639,6 +661,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    scheduling_metadata=scheduling_metadata,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -707,6 +730,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
         lora_request: Any = None,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
@@ -751,6 +775,7 @@ class AsyncOmni(EngineClient, OmniBase):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                scheduling_metadata=scheduling_metadata,
                                 resumable=True,
                             )
                         )
@@ -767,6 +792,7 @@ class AsyncOmni(EngineClient, OmniBase):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                scheduling_metadata=scheduling_metadata,
                                 resumable=True,
                             )
                         )
@@ -802,6 +828,7 @@ class AsyncOmni(EngineClient, OmniBase):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    scheduling_metadata=scheduling_metadata,
                                     resumable=False,
                                 )
                             )
@@ -816,6 +843,7 @@ class AsyncOmni(EngineClient, OmniBase):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    scheduling_metadata=scheduling_metadata,
                                     resumable=False,
                                 )
                             )

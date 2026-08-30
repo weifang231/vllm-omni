@@ -38,6 +38,7 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
+from vllm_omni.engine.queue_control import RequestSchedulingMetadata
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
@@ -56,6 +57,7 @@ from vllm_omni.experimental.fullduplex.engine.messages import (
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.runtime_instrumentation import RUNTIME_CONTROL_FILE_ENV
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -533,6 +535,7 @@ async def _enqueue_add_request(
     original_prompt,
     sampling_params_list,
     final_stage_id: int,
+    scheduling_metadata: RequestSchedulingMetadata | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -546,8 +549,61 @@ async def _enqueue_add_request(
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
+            scheduling_metadata=scheduling_metadata,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_queue_control_enforces_wip_and_edf_at_stage_submit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        '{"queue_control":{"enabled":true,"policy":"edf","global_wip_limit":1}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    params = [_sampling_params()]
+
+    await _enqueue_add_request(
+        fixture,
+        request_id="running",
+        prompt=FakePromptRequest("running", [1]),
+        original_prompt={"prompt": "running"},
+        sampling_params_list=params,
+        final_stage_id=0,
+        scheduling_metadata=RequestSchedulingMetadata(deadline_monotonic_s=30.0),
+    )
+    await _wait_for(lambda: len(stage.add_request_calls) == 1)
+
+    for request_id, deadline in (("late", 20.0), ("early", 10.0)):
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=FakePromptRequest(request_id, [1]),
+            original_prompt={"prompt": request_id},
+            sampling_params_list=params,
+            final_stage_id=0,
+            scheduling_metadata=RequestSchedulingMetadata(deadline_monotonic_s=deadline),
+        )
+    await _wait_for(lambda: fixture.orchestrator._queue_controller.snapshot()["queued_requests"] == 2)
+    assert len(stage.add_request_calls) == 1
+
+    await _enqueue_abort_request(fixture, ["running"])
+    await _wait_for(lambda: len(stage.add_request_calls) == 2)
+    assert stage.add_request_calls[1][0].request_id == "early"
+
+    await _enqueue_abort_request(fixture, ["early"])
+    await _wait_for(lambda: len(stage.add_request_calls) == 3)
+    assert stage.add_request_calls[2][0].request_id == "late"
+
+    await _shutdown_orchestrator(fixture)
 
 
 async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, request_ids: list[str]) -> None:

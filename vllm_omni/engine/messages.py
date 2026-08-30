@@ -6,6 +6,7 @@ import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_omni.engine.queue_control import RequestSchedulingMetadata
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -28,6 +29,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    scheduling_metadata: RequestSchedulingMetadata | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -38,6 +40,7 @@ class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
     prompt: EngineCoreRequest
     companion_prompt_text: object | None
     sampling_params_list: list[OmniSamplingParams]
+    scheduling_metadata: RequestSchedulingMetadata | None = None
 
 
 class AbortRequestMessage(EngineQueueMessage, kw_only=True):
