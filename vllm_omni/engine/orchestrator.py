@@ -702,6 +702,16 @@ class Orchestrator:
             )
 
         controller = self._ensure_queue_controller()
+        pending = PendingStageDispatch(
+            request_id=request_id,
+            logical_request_id=logical_request_id,
+            stage_id=stage_id,
+            metadata=metadata,
+            dispatch=guarded_dispatch,
+            operation=operation,
+            starts_request=starts_request,
+            required_active_stage_id=required_active_stage_id,
+        )
         instrumentation = getattr(self, "_queue_instrumentation", None)
         if not controller.enabled and (
             instrumentation is None
@@ -712,18 +722,18 @@ class Orchestrator:
             # the controller while disabled so live enabling sees all leases.
             await guarded_dispatch()
             return
-        controller.enqueue(
-            PendingStageDispatch(
-                request_id=request_id,
-                logical_request_id=logical_request_id,
-                stage_id=stage_id,
-                metadata=metadata,
-                dispatch=guarded_dispatch,
-                operation=operation,
-                starts_request=starts_request,
-                required_active_stage_id=required_active_stage_id,
-            )
-        )
+        if not controller.requires_queue(pending):
+            acquired = controller.acquire_immediate(pending)
+            try:
+                succeeded = await guarded_dispatch()
+            except BaseException:
+                controller.rollback(acquired)
+                raise
+            if not succeeded:
+                controller.rollback(acquired)
+            self._write_queue_control_snapshot()
+            return
+        controller.enqueue(pending)
         await self._drain_queue_control()
 
     async def _drain_queue_control(self) -> None:
