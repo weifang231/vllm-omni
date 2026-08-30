@@ -7,7 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any, Final, cast
@@ -115,6 +115,14 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64_with_compression,
     validate_layered_layers,
 )
+from vllm_omni.entrypoints.openai.playback_start import (
+    PLAYBACK_DEADLINE_EVENT,
+    PlaybackStartBuffer,
+    PlaybackStartConfig,
+    PlaybackTerminalStatus,
+    iterate_with_playback_deadline,
+    playback_start_config_from_headers,
+)
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
@@ -148,6 +156,19 @@ from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, Diffusio
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 
 logger = init_logger(__name__)
+
+_QWEN3_OMNI_PLAYBACK_MODEL_TYPES = frozenset({"qwen3_omni_moe"})
+
+
+@dataclass(frozen=True, slots=True)
+class _ChatAudioDelivery:
+    """One serialized chat audio delta plus its PCM timing metadata."""
+
+    data: str
+    omni_res: OmniRequestOutput
+    request_state: Any
+    pcm_byte_count: int
+    sample_rate: int
 
 
 async def _identity_async(value: Any) -> Any:
@@ -433,6 +454,68 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return metrics
         return None
 
+    def _supports_chat_playback_start(self) -> bool:
+        """Return whether this is the standard Qwen3-Omni chat pipeline."""
+        hf_config = self._stage_get(self.model_config, "hf_config", self.model_config)
+        return self._stage_get(hf_config, "model_type") in _QWEN3_OMNI_PLAYBACK_MODEL_TYPES
+
+    def _chat_playback_start_config(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+        *,
+        request_start_s: float,
+    ) -> PlaybackStartConfig | None:
+        """Resolve the trusted first-audio delivery gate for standard chat."""
+        if not request.stream or not request.modalities or "audio" not in request.modalities:
+            return None
+        if not self._supports_chat_playback_start():
+            return None
+        return playback_start_config_from_headers(
+            raw_request.headers if raw_request is not None else None,
+            request_start_s=request_start_s,
+        )
+
+    def _record_chat_audio_delivery(
+        self,
+        omni_res: OmniRequestOutput,
+        request_state: Any,
+        *,
+        pcm_byte_count: int,
+        sample_rate: int,
+    ) -> None:
+        """Record audio metrics when a chunk becomes client-visible."""
+        req_state = request_state
+        if req_state is None:
+            return
+        now_ts = time.time()
+        if req_state.first_audio_ts is None:
+            req_state.first_audio_ts = now_ts
+            stage_id = omni_res.stage_id
+            replica_id = getattr(omni_res, "replica_id", None) if stage_id is not None else None
+            if replica_id is None and stage_id is not None:
+                stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                replica_id = (
+                    stage_pools[stage_id].get_bound_replica_id(req_state.request_id)
+                    if stage_pools is not None and 0 <= stage_id < len(stage_pools)
+                    else None
+                )
+            req_state.audio_emit_stage_id = stage_id
+            req_state.audio_emit_replica_id = replica_id
+            if stage_id is not None:
+                observe_audio_first_packet(
+                    self.engine_client.mod_metrics,
+                    stage_id=stage_id,
+                    replica_id=replica_id,
+                    arrival_ts=req_state.request_arrival_ts,
+                    now_ts=now_ts,
+                )
+        if req_state.request_arrival_ts > 0 and pcm_byte_count > 0:
+            req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
+            req_state.audio_chunk_bytes.append(pcm_byte_count)
+            if req_state.audio_sample_rate is None:
+                req_state.audio_sample_rate = sample_rate
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -457,6 +540,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        request_start_s = time.perf_counter()
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
@@ -616,6 +700,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             audio_format_check = self._resolve_audio_format(request)
             if isinstance(audio_format_check, ErrorResponse):
                 return audio_format_check
+
+        try:
+            playback_start_config = self._chat_playback_start_config(
+                request,
+                raw_request,
+                request_start_s=request_start_s,
+            )
+        except ValueError as exc:
+            return self.create_error_response(exc)
 
         num_inference_steps = None
         extra_body = diffusion_request_args
@@ -822,6 +915,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 reasoning_parser,
                 mm_token_counts=mm_token_counts,
                 raw_request=raw_request,
+                playback_start_config=playback_start_config,
             )
 
         try:
@@ -1397,9 +1491,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         reasoning_parser: ReasoningParser | None = None,
         mm_token_counts: dict[str, int] | None = None,
         raw_request: Request | None = None,
+        playback_start_config: PlaybackStartConfig | None = None,
     ):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
+        playback_start = PlaybackStartBuffer(playback_start_config) if playback_start_config is not None else None
+
+        def record_playback_telemetry(status: PlaybackTerminalStatus) -> None:
+            if playback_start is not None:
+                playback_start.record_telemetry(
+                    request_id=request_id,
+                    status=status,
+                    request_state=getattr(raw_request, "state", None),
+                )
+
         first_iteration_dict = {}
         assert hasattr(request, "modalities") and request.modalities is not None, (
             "Streaming request must specify output modalities"
@@ -1460,6 +1565,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 tool_parsers = [None] * num_choices
         except Exception as e:
+            if playback_start is not None:
+                playback_start.terminate("error")
+            record_playback_telemetry("error")
             logger.exception("Error in tool parser creation.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
@@ -1475,8 +1583,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # _log_summary_and_cleanup, which pops request_states[request_id]
         # before this outer block runs.
         req_state_audio_ref: Any = None
+        result_stream = result_generator
+        deadline_stream = None
+        if playback_start is not None and playback_start.deadline_monotonic_s is not None:
+            deadline_stream = iterate_with_playback_deadline(result_generator, playback_start)
+            result_stream = deadline_stream
         try:
-            async for omni_res in result_generator:
+            async for omni_res in result_stream:
+                if omni_res is PLAYBACK_DEADLINE_EVENT:
+                    assert playback_start is not None
+                    for held_delivery in playback_start.release_deadline():
+                        self._record_chat_audio_delivery(
+                            held_delivery.omni_res,
+                            held_delivery.request_state,
+                            pcm_byte_count=held_delivery.pcm_byte_count,
+                            sample_rate=held_delivery.sample_rate,
+                        )
+                        yield held_delivery.data
+                    continue
                 final_output_type = omni_res.final_output_type
                 res = omni_res
                 if final_output_type not in first_iteration_dict:
@@ -2084,30 +2208,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
                     if req_state is not None and req_state_audio_ref is None:
                         req_state_audio_ref = req_state
-                    now_ts = time.time()
-                    if req_state is not None and req_state.first_audio_ts is None:
-                        req_state.first_audio_ts = now_ts
-                        replica_id = getattr(omni_res, "replica_id", None)
-                        if replica_id is None:
-                            stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
-                            # Fallback for older outputs. The orchestrator binds
-                            # requests by internal id, but can release that
-                            # binding before the API sees the final audio chunk,
-                            # so prefer the OutputMessage replica copied onto
-                            # OmniRequestOutput above.
-                            replica_id = (
-                                stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
-                                if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
-                                else None
-                            )
-                        req_state.audio_emit_stage_id = omni_res.stage_id
-                        req_state.audio_emit_replica_id = replica_id
-                        observe_audio_first_packet(
-                            self.engine_client.mod_metrics,
-                            stage_id=omni_res.stage_id,
-                            replica_id=replica_id,
-                            arrival_ts=req_state.request_arrival_ts,
-                            now_ts=now_ts,
+                    if playback_start is None and req_state is not None:
+                        pcm_byte_count = audio_chunk_pcm_bytes(omni_res)
+                        self._record_chat_audio_delivery(
+                            omni_res,
+                            req_state,
+                            pcm_byte_count=pcm_byte_count,
+                            sample_rate=(
+                                audio_chunk_sample_rate(omni_res)
+                                if pcm_byte_count > 0
+                                else _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE
+                            ),
                         )
 
                     role = self.get_chat_request_role(request)
@@ -2130,15 +2241,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choice.finish_reason = None
                         else:
                             stop_reason_emitted[choice.index] = True
-                    # Record per-chunk PCM byte count + arrival timestamp for
-                    # audio_underrun_s / audio_continuity_ok_total at finalize.
-                    if req_state is not None and req_state.request_arrival_ts > 0:
-                        chunk_bytes = audio_chunk_pcm_bytes(omni_res)
-                        if chunk_bytes > 0:
-                            req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
-                            req_state.audio_chunk_bytes.append(chunk_bytes)
-                            if req_state.audio_sample_rate is None:
-                                req_state.audio_sample_rate = audio_chunk_sample_rate(omni_res)
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -2154,7 +2256,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         total_tokens=num_prompt_tokens,
                     )
                     data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                    serialized = f"data: {data}\n\n"
+                    if playback_start is None:
+                        yield serialized
+                        continue
+
+                    pcm_byte_count = audio_chunk_pcm_bytes(omni_res)
+                    sample_rate = audio_chunk_sample_rate(omni_res)
+                    delivery = _ChatAudioDelivery(
+                        data=serialized,
+                        omni_res=omni_res,
+                        request_state=req_state,
+                        pcm_byte_count=pcm_byte_count,
+                        sample_rate=sample_rate,
+                    )
+                    for ready_delivery in playback_start.add_pcm(
+                        delivery,
+                        pcm_byte_count=pcm_byte_count,
+                        sample_rate=sample_rate,
+                        num_channels=1,
+                    ):
+                        self._record_chat_audio_delivery(
+                            ready_delivery.omni_res,
+                            ready_delivery.request_state,
+                            pcm_byte_count=ready_delivery.pcm_byte_count,
+                            sample_rate=ready_delivery.sample_rate,
+                        )
+                        yield ready_delivery.data
 
                 elif final_output_type == "image":
                     role = self.get_chat_request_role(request)
@@ -2198,6 +2326,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")
                     continue
+
+            if playback_start is not None:
+                for held_delivery in playback_start.finish():
+                    self._record_chat_audio_delivery(
+                        held_delivery.omni_res,
+                        held_delivery.request_state,
+                        pcm_byte_count=held_delivery.pcm_byte_count,
+                        sample_rate=held_delivery.sample_rate,
+                    )
+                    yield held_delivery.data
 
             # Fallback: if a choice had modalities finish but no finish_reason="stop"
             # was emitted (e.g. request.modalities included a modality the engine
@@ -2290,7 +2428,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         delta=False,
                     )
 
+            record_playback_telemetry("ok")
+
+        except asyncio.CancelledError:
+            if playback_start is not None:
+                playback_start.terminate("cancelled")
+            record_playback_telemetry("cancelled")
+            raise
         except EngineDeadError as e:
+            if playback_start is not None:
+                playback_start.terminate("error")
+            record_playback_telemetry("engine_dead")
             logger.error(
                 "EngineDeadError during streaming for request %s: %s",
                 request_id,
@@ -2306,9 +2454,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     engine=self.engine_client,
                 )
         except Exception as e:
+            if playback_start is not None:
+                playback_start.terminate("error")
+            record_playback_telemetry("error")
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            if deadline_stream is not None:
+                await deadline_stream.aclose()
+            if playback_start is not None:
+                playback_start.terminate("cancelled")
+                record_playback_telemetry("cancelled")
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
