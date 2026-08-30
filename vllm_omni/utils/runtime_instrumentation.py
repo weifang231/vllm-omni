@@ -16,6 +16,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,14 @@ class RuntimeInstrumentation:
             RUNTIME_METRICS_INTERVAL_ENV,
             1.0,
         )
+        # ``runtime_id`` distinguishes a restarted process even if the OS
+        # happens to reuse its PID.  The sequence and monotonic timestamp form
+        # the causal clock consumed by the external allocator; wall time is
+        # retained only for correlating the snapshot with experiment logs.
+        self.runtime_id = uuid.uuid4().hex
+        self._snapshot_sequence = 0
         self._last_snapshot_monotonic = float("-inf")
+        self._snapshot_lock = threading.Lock()
         self._control_signature: tuple[int, int, int] | None = None
         self._control: dict[str, Any] = {}
         self._warned: set[str] = set()
@@ -132,44 +140,58 @@ class RuntimeInstrumentation:
         output_path = self.snapshot_path
         if output_path is None:
             return False
-        now_monotonic = time.monotonic()
-        if not force and now_monotonic - self._last_snapshot_monotonic < self.snapshot_interval_s:
-            return False
+        with self._snapshot_lock:
+            now_monotonic = time.monotonic()
+            if not force and now_monotonic - self._last_snapshot_monotonic < self.snapshot_interval_s:
+                return False
 
-        snapshot = {
-            "timestamp_s": time.time(),
-            "engine": self.engine,
-            "component": self.component,
-            "stage_id": self.stage_id,
-            "pid": os.getpid(),
-        }
-        snapshot.update(payload)
+            next_sequence = self._snapshot_sequence + 1
+            snapshot = dict(payload)
+            # Write the authoritative envelope last so a caller cannot spoof
+            # the causal clock or process identity through its payload.
+            snapshot.update(
+                {
+                    "snapshot_schema_version": 1,
+                    "timestamp_s": time.time(),
+                    "monotonic_time_s": now_monotonic,
+                    "runtime_id": self.runtime_id,
+                    "snapshot_sequence": next_sequence,
+                    "engine": self.engine,
+                    "component": self.component,
+                    "stage_id": self.stage_id,
+                    "pid": os.getpid(),
+                }
+            )
 
-        temporary_path: str | None = None
-        try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=output_path.parent,
-                prefix=f".{output_path.name}.{threading.get_ident()}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary:
-                temporary_path = temporary.name
-                json.dump(snapshot, temporary, sort_keys=True, separators=(",", ":"))
-                temporary.write("\n")
-            os.replace(temporary_path, output_path)
-            self._last_snapshot_monotonic = now_monotonic
-            return True
-        except OSError as exc:
-            self._warn_once("snapshot-write", "Cannot write runtime snapshot %s: %s", output_path, exc)
-            return False
-        finally:
-            if temporary_path is not None:
-                try:
-                    os.unlink(temporary_path)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
+            temporary_path: str | None = None
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=output_path.parent,
+                    prefix=f".{output_path.name}.{threading.get_ident()}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary_path = temporary.name
+                    json.dump(snapshot, temporary, sort_keys=True, separators=(",", ":"))
+                    temporary.write("\n")
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(temporary_path, output_path)
+                temporary_path = None
+                self._snapshot_sequence = next_sequence
+                self._last_snapshot_monotonic = now_monotonic
+                return True
+            except OSError as exc:
+                self._warn_once("snapshot-write", "Cannot write runtime snapshot %s: %s", output_path, exc)
+                return False
+            finally:
+                if temporary_path is not None:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass

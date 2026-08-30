@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import queue
 import threading
@@ -606,6 +607,57 @@ async def test_runtime_queue_control_enforces_wip_and_edf_at_stage_submit(
     await _enqueue_abort_request(fixture, ["early"])
     await _wait_for(lambda: len(stage.add_request_calls) == 3)
     assert stage.add_request_calls[2][0].request_id == "late"
+
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_runtime_queue_control_applies_only_increasing_allocator_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+
+    def document(revision: int, limit: int) -> dict[str, Any]:
+        return {
+            "queue_control": {
+                "enabled": True,
+                "policy": "fifo",
+                "global_wip_limit": 4,
+                "class_wip_limits": {"audio": limit},
+                "online_allocator": {
+                    "schema_version": 1,
+                    "revision": revision,
+                    "source_runtime_id": "runtime-a",
+                    "source_snapshot_sequence": revision,
+                    "source_config_generation": revision - 1,
+                    "profile_fingerprint": "a" * 64,
+                },
+            }
+        }
+
+    control_path.write_text(json.dumps(document(2, 2)), encoding="utf-8")
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    monkeypatch.setenv(RUNTIME_CONTROL_INTERVAL_ENV, "3600")
+    fixture = orchestrator_factory([FakeStageClient(final_output=True)])
+    controller = fixture.orchestrator._queue_controller
+    assert controller is not None
+    assert controller.snapshot()["online_allocator"]["revision"] == 2
+
+    stale_path = tmp_path / "stale.json"
+    stale_path.write_text(json.dumps(document(1, 1)), encoding="utf-8")
+    stale_path.replace(control_path)
+    assert not fixture.orchestrator._refresh_queue_control()
+    assert controller.snapshot()["class_wip_limits"] == {"audio": 2}
+    assert controller.snapshot()["online_allocator"]["revision"] == 2
+
+    fresh_path = tmp_path / "fresh.json"
+    fresh_path.write_text(json.dumps(document(3, 1)), encoding="utf-8")
+    fresh_path.replace(control_path)
+    assert fixture.orchestrator._refresh_queue_control()
+    assert controller.snapshot()["class_wip_limits"] == {"audio": 1}
+    assert controller.snapshot()["online_allocator"]["revision"] == 3
 
     await _shutdown_orchestrator(fixture)
 
