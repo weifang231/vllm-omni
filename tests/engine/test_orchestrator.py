@@ -639,6 +639,39 @@ async def test_default_off_without_runtime_env_bypasses_queue_controller(
 
 
 @pytest.mark.asyncio
+async def test_metrics_only_mode_counts_logical_arrivals_by_class_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    monkeypatch.delenv(RUNTIME_CONTROL_FILE_ENV, raising=False)
+    monkeypatch.setenv(RUNTIME_METRICS_DIR_ENV, str(tmp_path / "metrics"))
+
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    await _enqueue_add_request(
+        fixture,
+        request_id="audio-request",
+        prompt=FakePromptRequest("audio-request", [1]),
+        original_prompt={"prompt": "audio-request"},
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        scheduling_metadata=RequestSchedulingMetadata(
+            request_class="text_to_audio",
+            path="audio",
+        ),
+    )
+    await _wait_for(lambda: len(stage.add_request_calls) == 1)
+
+    snapshot = fixture.orchestrator._queue_controller.snapshot()
+    assert snapshot["arrivals_by_class_total"] == {"text_to_audio": 1}
+    assert snapshot["queued_by_class"] == {}
+    assert snapshot["enqueued_total"] == 1
+
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
 async def test_runtime_admission_rejection_is_nonfatal_429_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
