@@ -218,3 +218,40 @@ def test_dependency_and_cancellation_release_all_request_leases() -> None:
     assert snapshot["active_requests"] == 0
     assert snapshot["active_by_stage"] == {}
     assert snapshot["queued_requests"] == 0
+
+
+def test_request_limits_only_queue_initial_dispatches() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            policy="edf",
+            global_wip_limit=8,
+            class_wip_limits={"audio": 7},
+        ),
+    )
+    initial = _pending("r1", stage_id=0, request_class="audio")
+    assert controller.requires_queue(initial)
+    controller.enqueue(initial)
+    assert controller.pop_ready() is not None
+
+    downstream = _pending(
+        "r1",
+        stage_id=1,
+        starts_request=False,
+        request_class="audio",
+    )
+    assert not controller.requires_queue(downstream)
+    acquired = controller.acquire_immediate(downstream)
+    assert acquired.pending is downstream
+    assert controller.snapshot()["active_by_stage"] == {"0": 1, "1": 1}
+
+    controller.configure(
+        QueueControlConfig(
+            enabled=True,
+            global_wip_limit=8,
+            stage_wip_limits={2: 1},
+        )
+    )
+    limited_stage = _pending("r1", stage_id=2, starts_request=False)
+    assert controller.requires_queue(limited_stage)

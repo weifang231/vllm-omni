@@ -316,11 +316,44 @@ class RuntimeQueueController:
     def enqueue(self, pending: PendingStageDispatch) -> None:
         if pending.stage_id < 0 or pending.stage_id >= self.num_stages:
             raise ValueError(f"stage_id {pending.stage_id} is outside [0, {self.num_stages})")
+        self._stamp_pending(pending)
+        self._pending.append(pending)
+
+    def _stamp_pending(self, pending: PendingStageDispatch) -> None:
         pending.sequence = self._next_sequence
         self._next_sequence += 1
         pending.enqueued_monotonic_s = self._clock()
-        self._pending.append(pending)
         self._enqueued_total += 1
+
+    def requires_queue(self, pending: PendingStageDispatch) -> bool:
+        """Return whether this dispatch competes for an enforced credit.
+
+        End-to-end request limits only gate the first stage submission. Later
+        stages stay on the stock dispatch path unless that stage has its own
+        optional WIP limit. This avoids serializing every pipeline edge behind
+        a class-level controller.
+        """
+        if not self.enabled:
+            return False
+        if (
+            pending.required_active_stage_id is not None
+            and (pending.request_id, pending.required_active_stage_id) not in self._active_stages
+        ):
+            return True
+        if (
+            (pending.request_id, pending.stage_id) not in self._active_stages
+            and pending.stage_id in self.config.stage_wip_limits
+        ):
+            return True
+        if pending.logical_request_id in self._active_requests:
+            return False
+        if not pending.starts_request:
+            return True
+        return (
+            self.config.global_wip_limit is not None
+            or pending.metadata.path in self.config.path_wip_limits
+            or pending.metadata.request_class in self.config.class_wip_limits
+        )
 
     def _request_counts(self) -> tuple[Counter[str], Counter[str]]:
         path_counts = Counter(metadata.path for metadata in self._active_requests.values())
@@ -382,6 +415,16 @@ class RuntimeQueueController:
             return None
 
         pending = self._pending.pop(selected_index)
+        return self._acquire(pending)
+
+    def acquire_immediate(self, pending: PendingStageDispatch) -> AcquiredStageDispatch:
+        """Record an unqueued dispatch while preserving lease telemetry."""
+        if pending.stage_id < 0 or pending.stage_id >= self.num_stages:
+            raise ValueError(f"stage_id {pending.stage_id} is outside [0, {self.num_stages})")
+        self._stamp_pending(pending)
+        return self._acquire(pending)
+
+    def _acquire(self, pending: PendingStageDispatch) -> AcquiredStageDispatch:
         acquired_request = pending.logical_request_id not in self._active_requests
         acquired_stage = (pending.request_id, pending.stage_id) not in self._active_stages
         if acquired_request:
