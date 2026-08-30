@@ -35,6 +35,7 @@ from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.engine.queue_control import scheduling_kwargs_from_headers
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
@@ -1827,6 +1828,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str | None = None,
         has_inline_ref_audio: bool | None = None,
         arrival_time: float | None = None,
+        raw_request: Request | None = None,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
@@ -1956,6 +1958,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
             arrival_time=arrival_time,
+            **scheduling_kwargs_from_headers(raw_request.headers if raw_request is not None else None),
         )
         self._track_ref_audio_artifact_warmup(
             request_id,
@@ -2025,6 +2028,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         has_inline_ref_audio: bool | None = None,
         collect: dict | None = None,
         request_arrival_ts: float | None = None,
+        raw_request: Request | None = None,
     ) -> tuple[bytes | str, str]:
         # ``usage_out`` is an opt-in output channel: when a list is passed, the
         # computed SpeechTokenUsage is appended to it. The return stays a
@@ -2037,6 +2041,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id=request_id,
             has_inline_ref_audio=has_inline_ref_audio,
             arrival_time=request_arrival_ts,
+            raw_request=raw_request,
         )
         artifact_ready = False
 
@@ -2452,6 +2457,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request,
                     request_id=request_id,
                     arrival_time=request_arrival_ts,
+                    raw_request=raw_request,
                 )
                 return _SpeechStreamingResponse(
                     self._generate_audio_chunks(
@@ -2479,6 +2485,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request,
                     request_id=request_id,
                     arrival_time=request_arrival_ts,
+                    raw_request=raw_request,
                 )
                 return _SpeechStreamingResponse(
                     self._generate_audio_sse_events(
@@ -2503,6 +2510,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     usage_out=usage_box,
                     collect=collect,
                     request_arrival_ts=request_arrival_ts,
+                    raw_request=raw_request,
                 )
             except TTSGenerationError as error:
                 # An adapter can reject otherwise completed audio. Retry only
@@ -2529,6 +2537,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     usage_out=usage_box,
                     collect=collect,
                     request_arrival_ts=request_arrival_ts,
+                    raw_request=raw_request,
                 )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(

@@ -10,6 +10,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.queue_control import RequestSchedulingMetadata
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
@@ -166,6 +167,34 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_not_called()
+
+
+def test_build_add_request_message_preserves_scheduling_metadata(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=True, final_output_type="audio", stage_type="llm")]
+    engine.supported_tasks = ("speech",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.output_processors = [mocker.Mock()]
+    metadata = RequestSchedulingMetadata(
+        request_class="interactive",
+        path="audio",
+        deadline_monotonic_s=12.5,
+    )
+
+    message = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1]},
+        sampling_params_list=[params],
+        final_stage_id=0,
+        scheduling_metadata=metadata,
+    )
+
+    assert message.scheduling_metadata == metadata
+    assert isinstance(message.prompt, OmniEngineCoreRequest)
+    assert message.prompt.scheduling_metadata == metadata
 
 
 def test_build_add_request_message_injects_global_id_before_prompt_transform(mocker: MockerFixture):

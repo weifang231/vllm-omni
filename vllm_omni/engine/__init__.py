@@ -12,6 +12,8 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+from vllm_omni.engine.queue_control import RequestSchedulingMetadata
+
 
 class PromptEmbedsPayload(msgspec.Struct):
     """Serialized prompt embeddings payload for direct transfer.
@@ -79,6 +81,9 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
+    # Coordinator-visible class, path, and first-output deadline. Stage
+    # workers preserve this metadata but do not interpret it.
+    scheduling_metadata: RequestSchedulingMetadata | None = None
 
     @classmethod
     def from_request(
@@ -88,6 +93,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -97,6 +103,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information = getattr(request, "additional_information", None)
         if model_intermediate_buffer is None:
             model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
+        if scheduling_metadata is None:
+            scheduling_metadata = getattr(request, "scheduling_metadata", None)
 
         return cls(
             request_id=request.request_id,
@@ -121,6 +129,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             abort_immediately=request.abort_immediately,
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
+            scheduling_metadata=scheduling_metadata,
         )
 
 

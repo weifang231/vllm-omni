@@ -12,6 +12,7 @@ from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.messages import EngineQueueMessage, ShutdownRequestMessage
+from vllm_omni.engine.queue_control import RequestSchedulingMetadata
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
@@ -58,6 +59,8 @@ def inject_global_id(target: Any, request_id: str) -> None:
 def upgrade_to_omni_request(
     request: EngineCoreRequest,
     raw_prompt: Any,
+    *,
+    scheduling_metadata: RequestSchedulingMetadata | None = None,
 ) -> EngineCoreRequest:
     """Restore omni-only fields omitted by the upstream input processor."""
     prompt_embeds = request.prompt_embeds
@@ -81,7 +84,12 @@ def upgrade_to_omni_request(
             log_prefix="AsyncOmniEngine",
         )
 
-    if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
+    if (
+        prompt_embeds is None
+        and additional_information is None
+        and model_intermediate_buffer is None
+        and scheduling_metadata is None
+    ):
         return request
 
     return OmniEngineCoreRequest.from_request(
@@ -89,6 +97,7 @@ def upgrade_to_omni_request(
         prompt_embeds=prompt_embeds,
         additional_information=additional_information,
         model_intermediate_buffer=model_intermediate_buffer,
+        scheduling_metadata=scheduling_metadata,
     )
 
 

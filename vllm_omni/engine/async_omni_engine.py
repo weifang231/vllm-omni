@@ -70,6 +70,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.queue_control import RequestSchedulingMetadata
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import StageClient
@@ -675,6 +676,7 @@ class AsyncOmniEngine:
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
@@ -769,7 +771,11 @@ class AsyncOmniEngine:
             _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
-            request = upgrade_to_omni_request(request, prompt)
+            request = upgrade_to_omni_request(
+                request,
+                prompt,
+                scheduling_metadata=scheduling_metadata,
+            )
 
             if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
                 processed_info = deserialize_additional_information(request.additional_information)
@@ -804,6 +810,12 @@ class AsyncOmniEngine:
         else:
             request_artifact_dirs = []
 
+        if scheduling_metadata is not None and isinstance(prompt, EngineCoreRequest):
+            prompt = OmniEngineCoreRequest.from_request(
+                prompt,
+                scheduling_metadata=scheduling_metadata,
+            )
+
         return StageSubmissionMessage(
             type=message_type,
             request_id=request_id,
@@ -817,6 +829,7 @@ class AsyncOmniEngine:
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
             request_artifact_dirs=request_artifact_dirs or None,
+            scheduling_metadata=scheduling_metadata,
         )
 
     def _build_cfg_companions(
@@ -825,6 +838,7 @@ class AsyncOmniEngine:
         original_prompt: Any,
         stage0_params: Any,
         sampling_params_list: list[Any],
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
     ) -> list[AddCompanionRequestMessage]:
         """Expand a prompt into its CFG companions, without enqueueing any.
 
@@ -868,7 +882,11 @@ class AsyncOmniEngine:
             # was just injected above, so skipping it silently undoes the
             # injection: the model sees the companion row with no id and
             # cannot match it to its conditioned partner.
-            request = upgrade_to_omni_request(request, companion_prompt)
+            request = upgrade_to_omni_request(
+                request,
+                companion_prompt,
+                scheduling_metadata=scheduling_metadata,
+            )
             request.external_req_id = cid
             # Companions are stage-0-final for ordinary downstream payloads,
             # but diffusion still needs their CFG KV caches.
@@ -885,6 +903,7 @@ class AsyncOmniEngine:
                     prompt=request,
                     companion_prompt_text=companion_prompt,
                     sampling_params_list=companion_spl,
+                    scheduling_metadata=scheduling_metadata,
                 )
             )
         return companions
@@ -1086,6 +1105,7 @@ class AsyncOmniEngine:
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
         resumable: bool = False,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
@@ -1110,6 +1130,7 @@ class AsyncOmniEngine:
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
                 reasoning_ended=reasoning_ended,
+                scheduling_metadata=scheduling_metadata,
                 resumable=resumable,
             )
         except BaseException:
@@ -1131,7 +1152,11 @@ class AsyncOmniEngine:
                 stage0_params = effective_spl[0] if effective_spl else None
                 if stage0_params is not None:
                     companions = self._build_cfg_companions(
-                        request_id, msg.original_prompt, stage0_params, effective_spl
+                        request_id,
+                        msg.original_prompt,
+                        stage0_params,
+                        effective_spl,
+                        msg.scheduling_metadata,
                     )
 
             self.request_queue.sync_q.put(msg)
@@ -1167,6 +1192,7 @@ class AsyncOmniEngine:
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
         resumable: bool = False,
     ) -> None:
         """Async add_request API."""
@@ -1184,6 +1210,7 @@ class AsyncOmniEngine:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
+            scheduling_metadata=scheduling_metadata,
             resumable=resumable,
         )
 
@@ -1198,6 +1225,7 @@ class AsyncOmniEngine:
         arrival_time: float | None = None,
         lora_request: Any = None,
         *,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
         resumable: bool = True,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
@@ -1210,6 +1238,7 @@ class AsyncOmniEngine:
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
+            scheduling_metadata=scheduling_metadata,
             resumable=resumable,
             message_type="streaming_update",
         )
@@ -1226,6 +1255,7 @@ class AsyncOmniEngine:
         arrival_time: float | None = None,
         lora_request: Any = None,
         *,
+        scheduling_metadata: RequestSchedulingMetadata | None = None,
         resumable: bool = True,
     ) -> None:
         """Async wrapper for add_streaming_update()."""
@@ -1238,6 +1268,7 @@ class AsyncOmniEngine:
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
+            scheduling_metadata=scheduling_metadata,
             resumable=resumable,
         )
 
