@@ -376,6 +376,82 @@ def test_request_limits_only_queue_initial_dispatches() -> None:
     assert controller.requires_queue(limited_stage)
 
 
+def test_class_arrivals_count_each_logical_initial_request_once() -> None:
+    controller = RuntimeQueueController(num_stages=3)
+    initial = _pending("r1", request_class="audio")
+    controller.acquire_immediate(initial)
+    controller.acquire_immediate(
+        _pending(
+            "r1",
+            stage_id=1,
+            starts_request=False,
+            request_class="audio",
+        )
+    )
+    controller.acquire_immediate(
+        _pending(
+            "r1-update",
+            stage_id=0,
+            starts_request=False,
+            request_class="audio",
+        )
+    )
+    # A duplicate initial submission in the same request lifetime must not
+    # turn one logical request into two offered arrivals.
+    controller.acquire_immediate(_pending("r1", request_class="audio"))
+
+    snapshot = controller.snapshot()
+    assert snapshot["arrivals_by_class_total"] == {"audio": 1}
+    assert snapshot["enqueued_total"] == 4
+
+    controller.cancel_request("r1")
+    controller.acquire_immediate(_pending("r1", request_class="audio"))
+    assert controller.snapshot()["arrivals_by_class_total"] == {"audio": 2}
+
+
+def test_queued_by_class_counts_only_waiting_initial_requests() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            global_wip_limit=1,
+        ),
+    )
+    controller.enqueue(_pending("running", request_class="text"))
+    assert controller.pop_ready() is not None
+    controller.enqueue(_pending("waiting", request_class="audio"))
+    controller.enqueue(
+        _pending(
+            "downstream",
+            stage_id=1,
+            starts_request=False,
+            request_class="audio",
+            required_active_stage_id=0,
+        )
+    )
+
+    snapshot = controller.snapshot()
+    assert snapshot["queued_requests"] == 2
+    assert snapshot["queued_by_stage"] == {"0": 1, "1": 1}
+    assert snapshot["queued_by_class"] == {"audio": 1}
+    assert snapshot["arrivals_by_class_total"] == {"audio": 1, "text": 1}
+
+
+def test_rejected_initial_request_is_an_offered_arrival_but_not_queued() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_admission_config(effective_k=0, mu=0.0),
+        clock=lambda: 10.0,
+    )
+    decision = controller.enqueue(_pending("rejected", request_class="interactive", deadline=20.0))
+    assert decision is not None and not decision.admitted
+
+    snapshot = controller.snapshot()
+    assert snapshot["arrivals_by_class_total"] == {"interactive": 1}
+    assert snapshot["queued_by_class"] == {}
+    assert snapshot["queued_requests"] == 0
+
+
 def test_admission_without_deadline_is_admitted_without_a_score() -> None:
     controller = RuntimeQueueController(
         num_stages=1,
