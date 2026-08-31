@@ -555,6 +555,117 @@ def test_dependency_and_cancellation_release_all_request_leases() -> None:
     assert snapshot["queued_requests"] == 0
 
 
+def test_released_upstream_still_satisfies_a_queued_downstream_dependency() -> None:
+    controller = RuntimeQueueController(
+        num_stages=2,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={1: {"speech": 0}},
+        ),
+    )
+    controller.enqueue(_pending("r1", request_class="speech"))
+    assert controller.pop_ready().pending.stage_id == 0  # type: ignore[union-attr]
+
+    controller.enqueue(
+        _pending(
+            "r1",
+            stage_id=1,
+            starts_request=False,
+            request_class="speech",
+            required_active_stage_id=0,
+        )
+    )
+    assert controller.pop_ready() is None
+    assert controller.release_stage("r1", 0)
+
+    controller.configure(
+        QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={1: {"speech": 1}},
+        )
+    )
+    assert controller.pop_ready().pending.stage_id == 1  # type: ignore[union-attr]
+
+
+def test_dependency_completion_excludes_rollback_and_is_cleared_on_cancel() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(enabled=True),
+    )
+    controller.enqueue(
+        _pending(
+            "r1",
+            stage_id=1,
+            starts_request=False,
+            required_active_stage_id=0,
+        )
+    )
+    controller.enqueue(_pending("r1"))
+    upstream = controller.pop_ready()
+    assert upstream is not None and upstream.pending.stage_id == 0
+    controller.rollback(upstream)
+    assert controller.pop_ready() is None
+
+    controller.enqueue(_pending("r1"))
+    upstream = controller.pop_ready()
+    assert upstream is not None and upstream.pending.stage_id == 0
+    assert controller.release_stage("r1", 0)
+    assert controller.pop_ready().pending.stage_id == 1  # type: ignore[union-attr]
+
+    controller.cancel_request("r1")
+    controller.acquire_immediate(_pending("r1", stage_id=2))
+    controller.enqueue(
+        _pending(
+            "r1",
+            stage_id=1,
+            starts_request=False,
+            required_active_stage_id=0,
+        )
+    )
+    assert controller.pop_ready() is None
+
+
+def test_parent_cancel_clears_completed_child_stage_after_later_rollback() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(enabled=True),
+    )
+    controller.acquire_immediate(_pending("parent"))
+    child_stage = controller.acquire_immediate(
+        _pending(
+            "child",
+            logical_request_id="parent",
+            stage_id=1,
+            starts_request=False,
+        )
+    )
+    assert child_stage.acquired_stage
+    assert controller.release_stage("child", 1)
+
+    failed_child_stage = controller.acquire_immediate(
+        _pending(
+            "child",
+            logical_request_id="parent",
+            stage_id=2,
+            starts_request=False,
+        )
+    )
+    controller.rollback(failed_child_stage)
+    controller.cancel_request("parent")
+
+    controller.acquire_immediate(_pending("new-parent"))
+    controller.enqueue(
+        _pending(
+            "child",
+            logical_request_id="new-parent",
+            stage_id=2,
+            starts_request=False,
+            required_active_stage_id=1,
+        )
+    )
+    assert controller.pop_ready() is None
+
+
 def test_request_limits_only_queue_initial_dispatches() -> None:
     controller = RuntimeQueueController(
         num_stages=3,
