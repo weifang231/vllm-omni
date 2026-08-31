@@ -692,6 +692,7 @@ class Orchestrator:
         operation: str,
         starts_request: bool = False,
         required_active_stage_id: int | None = None,
+        preserve_stage0_mm_cache_order: bool = False,
     ) -> None:
         async def guarded_dispatch() -> bool:
             return await self._dispatch_or_fail_request(
@@ -712,6 +713,7 @@ class Orchestrator:
             operation=operation,
             starts_request=starts_request,
             required_active_stage_id=required_active_stage_id,
+            preserve_stage0_mm_cache_order=preserve_stage0_mm_cache_order,
         )
         instrumentation = getattr(self, "_queue_instrumentation", None)
         if not controller.active and (
@@ -1027,6 +1029,7 @@ class Orchestrator:
             metadata=req_state.scheduling_metadata,
             operation="add_request",
             starts_request=True,
+            preserve_stage0_mm_cache_order=bool(getattr(prompt, "mm_features", None)),
         )
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
@@ -1072,6 +1075,7 @@ class Orchestrator:
             stage_id=stage_id,
             metadata=req_state.scheduling_metadata,
             operation="streaming_update",
+            preserve_stage0_mm_cache_order=bool(getattr(request, "mm_features", None)),
         )
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
@@ -1124,6 +1128,7 @@ class Orchestrator:
             stage_id=0,
             metadata=parent_state.scheduling_metadata,
             operation=f"companion {companion_id}",
+            preserve_stage0_mm_cache_order=bool(getattr(companion_prompt, "mm_features", None)),
         )
 
         if self.stage_pools[0].get_bound_replica_id(companion_id) is None:
@@ -1331,6 +1336,105 @@ class Orchestrator:
             logger.debug("[Orchestrator] _orchestration_output_handler cancelled")
             return
 
+    async def _handle_mm_cache_miss_outputs(
+        self,
+        stage_id: int,
+        raw_outputs: EngineCoreOutputs,
+    ) -> None:
+        """Fail and fully tear down requests that hit P0/P1 cache drift.
+
+        vLLM reports a receiver-cache miss as a terminal ``EngineCoreOutput``
+        carrying ``mm_cache_miss_hashes``.  It is not a normal model finish:
+        the frontend must invalidate its sender-cache shadow and the client
+        must retry.  In an async-chunk pipeline, downstream stages can already
+        be prewarmed, so allowing this marker through normal routing strands
+        their bindings and WIP leases forever.
+
+        Remove cache-miss outputs before the shared output processor sees
+        them, abort every stage of the logical request, and surface one typed
+        retryable error with the hashes needed for frontend invalidation.
+        """
+        misses: dict[str, list[str]] = {}
+        retained: list[Any] = []
+        raw_request_ids: set[str] = set()
+        pool = self.stage_pools[stage_id]
+        for eco in raw_outputs.outputs:
+            hashes = getattr(eco, "mm_cache_miss_hashes", None)
+            if not hashes:
+                retained.append(eco)
+                continue
+            engine_request_id = str(eco.request_id)
+            raw_request_ids.add(engine_request_id)
+            external_request_id = pool.resolve_external_request_id(engine_request_id)
+            logical_request_id = self._cfg_tracker.get_parent_id(external_request_id) or external_request_id
+            accumulated = misses.setdefault(logical_request_id, [])
+            accumulated.extend(mm_hash for mm_hash in hashes if mm_hash not in accumulated)
+
+        if not misses:
+            return
+
+        raw_outputs.outputs = retained
+        if raw_outputs.finished_requests:
+            raw_outputs.finished_requests = set(raw_outputs.finished_requests).difference(raw_request_ids)
+
+        for request_id, hashes in misses.items():
+            if request_id not in self.request_states:
+                logger.info(
+                    "[Orchestrator] Ignoring late multimodal cache-miss terminal for cleaned req=%s stage-%s",
+                    request_id,
+                    stage_id,
+                )
+                continue
+            logger.warning(
+                "[Orchestrator] Multimodal cache drift for req=%s stage-%s hashes=%s; "
+                "aborting all stages and requesting a client retry",
+                request_id,
+                stage_id,
+                hashes,
+            )
+            cleanup_ids = [request_id, *self._cfg_tracker.cleanup_parent(request_id)]
+            cleanup_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    await self._cleanup_request_ids(
+                        cleanup_ids,
+                        abort=True,
+                        close_duplex_sessions=True,
+                    )
+                except Exception as exc:
+                    cleanup_error = exc
+                    logger.exception(
+                        "[Orchestrator] Stage abort attempt %s failed while cleaning multimodal cache miss for req=%s",
+                        attempt + 1,
+                        request_id,
+                    )
+                else:
+                    cleanup_error = None
+                    break
+
+            cleanup_failed = cleanup_error is not None
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=request_id,
+                    stage_id=stage_id,
+                    error=(
+                        "MULTIMODAL_CACHE_MISS_RETRYABLE: the multimodal receiver cache "
+                        "lost data referenced by the frontend; retry the request"
+                        if not cleanup_failed
+                        else "MULTIMODAL_CACHE_CLEANUP_FAILED: the request could not be safely torn down"
+                    ),
+                    status_code=(
+                        HTTPStatus.SERVICE_UNAVAILABLE.value
+                        if not cleanup_failed
+                        else HTTPStatus.INTERNAL_SERVER_ERROR.value
+                    ),
+                    error_type=("MultiModalCacheMissError" if not cleanup_failed else "MultiModalCacheCleanupError"),
+                    retryable=not cleanup_failed,
+                    fatal=cleanup_failed,
+                    mm_cache_miss_hashes=hashes,
+                )
+            )
+
     async def _process_llm_stage_outputs(
         self,
         stage_id: int,
@@ -1348,6 +1452,7 @@ class Orchestrator:
         ``_finish_raw_terminal_requests`` once routing is done.
         """
         pool = self.stage_pools[stage_id]
+        await self._handle_mm_cache_miss_outputs(stage_id, raw_outputs)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
         for eco in raw_outputs.outputs:
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'

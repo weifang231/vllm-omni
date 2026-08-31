@@ -13,8 +13,60 @@ from tests.helpers.serving_chat import (
     make_text_omni_output,
     parse_sse_chunks,
 )
+from vllm_omni.errors import OmniRetryableError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+async def _retryable_mm_cache_miss():
+    raise OmniRetryableError(
+        "retry after multimodal cache drift",
+        status_code=503,
+        error_type="MultiModalCacheMissError",
+    )
+    yield  # pragma: no cover - makes this an async generator
+
+
+@pytest.mark.asyncio
+async def test_chat_full_preserves_retryable_error_metadata():
+    serving_chat = build_serving_chat()
+    response = await serving_chat.chat_completion_full_generator(
+        request=make_request(modalities=["text"], stream=False),
+        result_generator=_retryable_mm_cache_miss(),
+        request_id="test-req",
+        model_name="test-model",
+        conversation=[],
+        tokenizer=MagicMock(),
+        request_metadata=MagicMock(),
+    )
+
+    assert response.error.code == 503
+    assert response.error.type == "MultiModalCacheMissError"
+    assert response.error.message == "retry after multimodal cache drift"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_preserves_retryable_error_metadata():
+    serving_chat = build_serving_chat()
+    lines = await collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=make_request(modalities=["text"], stream=True),
+            result_generator=_retryable_mm_cache_miss(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+    chunks = parse_sse_chunks(lines)
+
+    assert chunks[-1]["error"] == {
+        "message": "retry after multimodal cache drift",
+        "type": "MultiModalCacheMissError",
+        "param": None,
+        "code": 503,
+    }
 
 
 def test_omni_chat_completion_response_metrics():

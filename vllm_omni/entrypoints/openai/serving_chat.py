@@ -896,6 +896,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
 
                 generators.append(generator)
+        except OmniClientError as e:
+            return self._create_error_response(
+                e.message,
+                err_type=e.error_type,
+                status_code=e.status_code,
+            )
         except ValueError as e:
             return self.create_error_response(e)
 
@@ -929,6 +935,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_metadata,
                 reasoning_parser,
                 mm_token_counts=mm_token_counts,
+            )
+        except OmniClientError as e:
+            return self._create_error_response(
+                e.message,
+                err_type=e.error_type,
+                status_code=e.status_code,
             )
         except ValueError as e:
             return self.create_error_response(e)
@@ -2453,6 +2465,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     server=raw_request.app.state.server,
                     engine=self.engine_client,
                 )
+        except OmniClientError as e:
+            if playback_start is not None:
+                playback_start.terminate("error")
+            record_playback_telemetry("error")
+            data = json.dumps(
+                self._create_error_response(
+                    e.message,
+                    err_type=e.error_type,
+                    status_code=e.status_code,
+                ).model_dump()
+            )
+            yield f"data: {data}\n\n"
         except Exception as e:
             if playback_start is not None:
                 playback_start.terminate("error")
@@ -2490,6 +2514,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_outputs.append(res)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        except OmniClientError as e:
+            return self._create_error_response(
+                e.message,
+                err_type=e.error_type,
+                status_code=e.status_code,
+            )
         except ValueError as e:
             return self.create_error_response(e)
 

@@ -88,10 +88,14 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
     error: str
     status_code: int | None = None
     error_type: str | None = None
+    retryable: bool = False
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None
     event_id: str | None = None  # for interactions on diffusion generation requests
+    # Populated for the retryable P0/P1 multimodal-cache drift signal.  The
+    # frontend owns P0, so it must invalidate these hashes before a retry.
+    mm_cache_miss_hashes: list[str] | None = None
 
 
 class OutputMessage(EngineQueueMessage, kw_only=True):

@@ -9,6 +9,7 @@ import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 from pytest_mock import MockerFixture
@@ -141,6 +142,32 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
     assert msg.type == "error"
     assert msg.fatal is True
     assert "crashed" in msg.error
+
+
+def test_retryable_mm_cache_miss_invalidates_frontend_shadow_before_return() -> None:
+    cache = Mock()
+    error = ErrorMessage(
+        error="retry multimodal request",
+        status_code=503,
+        error_type="MultiModalCacheMissError",
+        request_id="req-mm",
+        stage_id=0,
+        mm_cache_miss_hashes=["hash-a", "hash-b", "hash-a"],
+    )
+    raw_queue = queue.Queue()
+    raw_queue.put_nowait(error)
+    engine = object.__new__(AsyncOmniEngine)
+    engine.output_queue = SimpleNamespace(sync_q=raw_queue)
+    engine.orchestrator_thread = Mock(is_alive=Mock(return_value=True))
+    engine.input_processor = SimpleNamespace(
+        renderer=SimpleNamespace(mm_processor_cache=cache),
+    )
+
+    assert engine.try_get_output(timeout=0.01) is error
+    assert cache.invalidate.call_args_list == [
+        call("hash-a"),
+        call("hash-b"),
+    ]
 
 
 @pytest.mark.asyncio

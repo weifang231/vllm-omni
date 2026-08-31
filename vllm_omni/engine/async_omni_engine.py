@@ -1878,7 +1878,7 @@ class AsyncOmniEngine:
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
         """Read one output message from the Orchestrator output queue."""
         try:
-            return self.output_queue.sync_q.get(timeout=timeout)
+            return self._prepare_output_message(self.output_queue.sync_q.get(timeout=timeout))
         except queue.Empty:
             if not self.is_alive():
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
@@ -1887,7 +1887,7 @@ class AsyncOmniEngine:
     async def try_get_output_async(self) -> EngineQueueMessage | None:
         """Async read from the Orchestrator output queue."""
         try:
-            return self.output_queue.sync_q.get_nowait()
+            return self._prepare_output_message(self.output_queue.sync_q.get_nowait())
         except queue.Empty:
             if not self.is_alive():
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
@@ -1927,6 +1927,35 @@ class AsyncOmniEngine:
         msg = await loop.run_in_executor(executor, _drain_get)
         if msg is None and not self.is_alive():
             raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+        return self._prepare_output_message(msg)
+
+    def _prepare_output_message(self, msg: EngineQueueMessage | None) -> EngineQueueMessage | None:
+        """Apply frontend-owned recovery before exposing an output message.
+
+        The stage-0 input processor owns vLLM's P0 multimodal sender-cache
+        shadow.  A P1 cache-miss signal is detected in the orchestrator so it
+        can release pipeline state, but only this frontend can invalidate P0
+        before the caller retries the request.
+        """
+        if not isinstance(msg, ErrorMessage) or not msg.mm_cache_miss_hashes:
+            return msg
+
+        input_processor = getattr(self, "input_processor", None)
+        renderer = getattr(input_processor, "renderer", None)
+        cache = getattr(input_processor, "mm_processor_cache", None)
+        if cache is None:
+            cache = getattr(renderer, "mm_processor_cache", None)
+        if cache is None:
+            return msg
+        for mm_hash in dict.fromkeys(msg.mm_cache_miss_hashes):
+            try:
+                cache.invalidate(mm_hash)
+            except Exception:
+                logger.warning(
+                    "[AsyncOmniEngine] Failed to invalidate multimodal sender-cache hash %s",
+                    mm_hash,
+                    exc_info=True,
+                )
         return msg
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
