@@ -29,6 +29,7 @@ async def _dispatch() -> bool:
 def _pending(
     request_id: str,
     *,
+    logical_request_id: str | None = None,
     deadline: float | None = None,
     stage_id: int = 0,
     starts_request: bool = True,
@@ -39,7 +40,7 @@ def _pending(
 ) -> PendingStageDispatch:
     return PendingStageDispatch(
         request_id=request_id,
-        logical_request_id=request_id,
+        logical_request_id=logical_request_id or request_id,
         stage_id=stage_id,
         metadata=RequestSchedulingMetadata(
             request_class=request_class,
@@ -85,6 +86,10 @@ def test_queue_control_config_defaults_and_validation() -> None:
                 "policy": "EDF",
                 "global_wip_limit": 3,
                 "stage_wip_limits": {"0": 2, "1": 1},
+                "stage_class_wip_limits": {
+                    "0": {"interactive": 2},
+                    "1": {"batch": 1, "interactive": 1},
+                },
                 "path_wip_limits": {"audio": 2},
                 "class_wip_limits": {"interactive": 1},
             }
@@ -94,6 +99,10 @@ def test_queue_control_config_defaults_and_validation() -> None:
     assert config.enabled
     assert config.policy == "edf"
     assert config.stage_wip_limits == {0: 2, 1: 1}
+    assert config.stage_class_wip_limits == {
+        0: {"interactive": 2},
+        1: {"batch": 1, "interactive": 1},
+    }
 
     with pytest.raises(ValueError, match="must not be null"):
         QueueControlConfig.from_document(
@@ -103,6 +112,21 @@ def test_queue_control_config_defaults_and_validation() -> None:
     with pytest.raises(ValueError, match="unavailable stage ids"):
         QueueControlConfig.from_document(
             {"queue_control": {"stage_wip_limits": {"1": 1}}},
+            num_stages=1,
+        )
+    with pytest.raises(ValueError, match=r"stage_class_wip_limits\['0'\] must be a JSON object"):
+        QueueControlConfig.from_document(
+            {"queue_control": {"stage_class_wip_limits": {"0": 1}}},
+            num_stages=1,
+        )
+    with pytest.raises(ValueError, match="must not be null"):
+        QueueControlConfig.from_document(
+            {"queue_control": {"stage_class_wip_limits": {"0": {"interactive": None}}}},
+            num_stages=1,
+        )
+    with pytest.raises(ValueError, match="stage_class_wip_limits contains unavailable stage ids"):
+        QueueControlConfig.from_document(
+            {"queue_control": {"stage_class_wip_limits": {"1": {"interactive": 1}}}},
             num_stages=1,
         )
 
@@ -327,6 +351,140 @@ def test_stage_credit_allows_updates_but_blocks_new_wip() -> None:
     assert controller.pop_ready() is None
     assert controller.release_stage("r1", 0)
     assert controller.pop_ready().pending.request_id == "r2"  # type: ignore[union-attr]
+
+
+def test_stage_class_credit_blocks_only_matching_stage_and_class() -> None:
+    controller = RuntimeQueueController(
+        num_stages=2,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={1: {"speech": 1}},
+        ),
+    )
+    for request_id, request_class in (
+        ("speech-1", "speech"),
+        ("speech-2", "speech"),
+        ("text-1", "text"),
+    ):
+        controller.acquire_immediate(_pending(request_id, request_class=request_class))
+
+    controller.enqueue(_pending("speech-1", stage_id=1, starts_request=False, request_class="speech"))
+    assert controller.pop_ready() is not None
+    controller.enqueue(_pending("speech-2", stage_id=1, starts_request=False, request_class="speech"))
+    assert controller.pop_ready() is None
+
+    text = _pending("text-1", stage_id=1, starts_request=False, request_class="text")
+    assert not controller.requires_queue(text)
+    controller.acquire_immediate(text)
+
+    snapshot = controller.snapshot()
+    assert snapshot["active_by_stage_class"] == {
+        "0": {"speech": 2, "text": 1},
+        "1": {"speech": 1, "text": 1},
+    }
+    assert snapshot["queued_by_stage_class"] == {"1": {"speech": 1}}
+    assert snapshot["blocked_by_limit"] == {"stage_class": 1}
+
+    assert controller.release_stage("speech-1", 1)
+    assert controller.pop_ready().pending.request_id == "speech-2"  # type: ignore[union-attr]
+
+
+def test_stage_class_credit_is_inert_when_queue_control_is_disabled() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=QueueControlConfig(
+            enabled=False,
+            stage_class_wip_limits={0: {"speech": 0}},
+        ),
+    )
+    pending = _pending("stock", request_class="speech")
+    assert not controller.requires_queue(pending)
+    controller.acquire_immediate(pending)
+    assert controller.snapshot()["active_by_stage_class"] == {"0": {"speech": 1}}
+
+
+def test_stage_class_live_reconfiguration_and_reduction_are_nonpreemptive() -> None:
+    controller = RuntimeQueueController(
+        num_stages=2,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={1: {"speech": 1}},
+        ),
+    )
+    for request_id in ("r1", "r2", "r3"):
+        controller.acquire_immediate(_pending(request_id, request_class="speech"))
+
+    controller.enqueue(_pending("r1", stage_id=1, starts_request=False, request_class="speech"))
+    assert controller.pop_ready() is not None
+    controller.enqueue(_pending("r2", stage_id=1, starts_request=False, request_class="speech"))
+    assert controller.pop_ready() is None
+
+    assert controller.configure(
+        QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={1: {"speech": 2}},
+        )
+    )
+    assert controller.pop_ready().pending.request_id == "r2"  # type: ignore[union-attr]
+
+    assert controller.configure(
+        QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={1: {"speech": 1}},
+        )
+    )
+    controller.enqueue(_pending("r3", stage_id=1, starts_request=False, request_class="speech"))
+    assert controller.pop_ready() is None
+    assert controller.snapshot()["active_by_stage_class"]["1"] == {"speech": 2}
+
+    assert controller.release_stage("r1", 1)
+    assert controller.pop_ready() is None
+    assert controller.release_stage("r2", 1)
+    assert controller.pop_ready().pending.request_id == "r3"  # type: ignore[union-attr]
+
+
+def test_stage_class_accounting_uses_logical_request_class_and_parent_cleanup() -> None:
+    controller = RuntimeQueueController(
+        num_stages=2,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={1: {"speech": 1}},
+        ),
+    )
+    controller.acquire_immediate(_pending("parent", request_class="speech"))
+
+    controller.enqueue(
+        _pending(
+            "companion-1",
+            logical_request_id="parent",
+            stage_id=1,
+            starts_request=False,
+            request_class="untrusted-override",
+        )
+    )
+    assert controller.pop_ready() is not None
+    controller.enqueue(
+        _pending(
+            "companion-2",
+            logical_request_id="parent",
+            stage_id=1,
+            starts_request=False,
+            request_class="untrusted-override",
+        )
+    )
+    assert controller.pop_ready() is None
+
+    snapshot = controller.snapshot()
+    assert snapshot["active_by_stage_class"]["1"] == {"speech": 1}
+    assert snapshot["queued_by_stage_class"]["1"] == {"speech": 1}
+
+    controller.cancel_request("parent")
+    snapshot = controller.snapshot()
+    assert snapshot["active_requests"] == 0
+    assert snapshot["active_by_stage"] == {}
+    assert snapshot["active_by_stage_class"] == {}
+    assert snapshot["queued_requests"] == 0
+    assert snapshot["queued_by_stage_class"] == {}
 
 
 def test_path_and_class_credits_are_end_to_end_and_nonpreemptive() -> None:
