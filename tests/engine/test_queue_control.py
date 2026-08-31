@@ -38,6 +38,7 @@ def _pending(
     path: str = "default",
     admission_correlation_id: str | None = None,
     required_active_stage_id: int | None = None,
+    preserve_stage0_mm_cache_order: bool = False,
     dispatch: Callable[[], Awaitable[bool]] = _dispatch,
 ) -> PendingStageDispatch:
     return PendingStageDispatch(
@@ -54,6 +55,7 @@ def _pending(
         operation="test",
         starts_request=starts_request,
         required_active_stage_id=required_active_stage_id,
+        preserve_stage0_mm_cache_order=preserve_stage0_mm_cache_order,
     )
 
 
@@ -390,6 +392,97 @@ def test_edf_reorders_only_ready_requests_and_is_stable() -> None:
     assert controller.pop_ready().pending.request_id == "early-a"  # type: ignore[union-attr]
     controller.cancel_request("early-a")
     assert controller.pop_ready().pending.request_id == "early-b"  # type: ignore[union-attr]
+
+
+def test_stage0_multimodal_cache_order_fence_prevents_cross_class_bypass() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=QueueControlConfig(
+            enabled=True,
+            policy="edf",
+            stage_class_wip_limits={0: {"text": 1, "speech": 2}},
+        ),
+    )
+    controller.enqueue(
+        _pending(
+            "text-active",
+            request_class="text",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    assert controller.pop_ready().pending.request_id == "text-active"  # type: ignore[union-attr]
+
+    # P0 processed producer before consumer.  The producer is blocked by its
+    # text credit while EDF would otherwise dispatch the speech consumer first.
+    controller.enqueue(
+        _pending(
+            "producer",
+            deadline=20.0,
+            request_class="text",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    consumer = _pending(
+        "consumer",
+        deadline=10.0,
+        request_class="speech",
+        preserve_stage0_mm_cache_order=True,
+    )
+    assert controller.requires_queue(consumer)
+    controller.enqueue(consumer)
+    assert controller.pop_ready() is None
+    assert controller.snapshot()["blocked_by_limit"] == {
+        "mm_cache_order": 1,
+        "stage_class": 1,
+    }
+
+    # Text-only work does not touch the P0/P1 cache and may still use a free
+    # speech credit while the multimodal fence waits.
+    controller.enqueue(
+        _pending(
+            "text-only",
+            deadline=5.0,
+            request_class="speech",
+        )
+    )
+    assert controller.pop_ready().pending.request_id == "text-only"  # type: ignore[union-attr]
+
+    assert controller.release_stage("text-active", 0)
+    assert controller.pop_ready().pending.request_id == "producer"  # type: ignore[union-attr]
+    assert controller.pop_ready().pending.request_id == "consumer"  # type: ignore[union-attr]
+
+
+def test_stage0_multimodal_cache_order_fence_survives_live_disable() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=QueueControlConfig(
+            enabled=True,
+            policy="edf",
+            stage_class_wip_limits={0: {"text": 0}},
+        ),
+    )
+    controller.enqueue(
+        _pending(
+            "producer",
+            deadline=20.0,
+            request_class="text",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    assert controller.pop_ready() is None
+
+    controller.configure(QueueControlConfig(enabled=False, policy="edf"))
+    consumer = _pending(
+        "consumer",
+        deadline=10.0,
+        request_class="speech",
+        preserve_stage0_mm_cache_order=True,
+    )
+    assert controller.requires_queue(consumer)
+    controller.enqueue(consumer)
+
+    assert controller.pop_ready().pending.request_id == "producer"  # type: ignore[union-attr]
+    assert controller.pop_ready().pending.request_id == "consumer"  # type: ignore[union-attr]
 
 
 def test_stage_credit_allows_updates_but_blocks_new_wip() -> None:

@@ -250,11 +250,17 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
+        self.request_states: dict[str, object] = {}
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
 
     def add_request(self, *args, **kwargs) -> None:
         self.add_request_calls.append((args, kwargs))
+        request = kwargs.get("request") if kwargs else (args[0] if args else None)
+        if request is not None:
+            self.request_states[request.request_id] = SimpleNamespace(
+                external_req_id=getattr(request, "external_req_id", None) or request.request_id,
+            )
         return None
 
     def process_outputs(self, *_args, **_kwargs):
@@ -291,6 +297,13 @@ class FakeOutputProcessor:
             )
         return ids, outputs
 
+    def commit_aborted_request_state(self, request_ids, *, internal: bool = False) -> None:
+        ids = set(request_ids)
+        for internal_id, state in list(self.request_states.items()):
+            external_id = getattr(state, "external_req_id", internal_id)
+            if (internal_id if internal else external_id) in ids:
+                self.request_states.pop(internal_id, None)
+
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None
 
@@ -313,6 +326,23 @@ class RecordingOutputProcessor(FakeOutputProcessor):
     def process_outputs(self, *args, **kwargs):
         self.process_calls.append((args, kwargs))
         return super().process_outputs(*args, **kwargs)
+
+
+class InternalIdOutputProcessor(FakeOutputProcessor):
+    """Fake the real output processor's external-to-internal abort mapping."""
+
+    def abort_requests_collecting_outputs(self, request_ids, *, internal: bool = False, commit_state: bool = True):
+        del commit_state
+        ids = list(request_ids)
+        self.abort_calls.append(ids)
+        if internal:
+            return ids, []
+        internal_ids = [
+            internal_id
+            for internal_id, state in self.request_states.items()
+            if getattr(state, "external_req_id", internal_id) in ids
+        ]
+        return internal_ids, []
 
 
 class RecordingStatLogger:
@@ -338,6 +368,21 @@ def _terminal_engine_core_outputs(request_id: str) -> EngineCoreOutputs:
                 request_id=request_id,
                 new_token_ids=[],
                 finish_reason=FinishReason.STOP,
+            )
+        ],
+        timestamp=1.0,
+        finished_requests={request_id},
+    )
+
+
+def _mm_cache_miss_engine_core_outputs(request_id: str, *hashes: str) -> EngineCoreOutputs:
+    return EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                mm_cache_miss_hashes=list(hashes),
             )
         ],
         timestamp=1.0,
@@ -680,6 +725,247 @@ async def test_async_prewarm_drains_after_upstream_release_and_stage_class_incre
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-finished", 2.0))
         await _wait_for(lambda: "req-dependency" not in fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_mm_cache_miss_cleans_prewarmed_stages_and_returns_retryable_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "stage_class_wip_limits": {
+                        "0": {"speech": 2},
+                        "1": {"speech": 2},
+                        "2": {"speech": 2},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+
+    request_id = "req-mm-cache-miss"
+    engine_request_id = f"{request_id}-internal-a1b2c3d4"
+    stages = [
+        FakeStageClient(stage_type="llm", final_output=False),
+        FakeStageClient(stage_type="llm", final_output=False),
+        FakeStageClient(stage_type="llm", final_output=True),
+    ]
+    stage0_processor = RecordingOutputProcessor()
+    fixture = orchestrator_factory(
+        stages,
+        output_processors=[stage0_processor, FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    request = SimpleNamespace(
+        request_id=engine_request_id,
+        external_req_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+        mm_features=[SimpleNamespace(identifier="shared-audio")],
+    )
+
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "prewarm then cache miss"},
+            sampling_params_list=[_sampling_params(), _sampling_params(), _sampling_params()],
+            final_stage_id=2,
+            scheduling_metadata=RequestSchedulingMetadata(request_class="speech", path="speech"),
+        )
+        await _wait_for(lambda: all(len(stage.add_request_calls) == 1 for stage in stages))
+        assert fixture.orchestrator._queue_controller.snapshot()["active_by_stage"] == {
+            "0": 1,
+            "1": 1,
+            "2": 1,
+        }
+
+        stages[0].push_engine_core_outputs(
+            _mm_cache_miss_engine_core_outputs(engine_request_id, "audio-hash-a", "audio-hash-b")
+        )
+        await _wait_for(lambda: not fixture.output_sync_q.empty())
+        error = fixture.output_sync_q.get_nowait()
+
+        assert isinstance(error, ErrorMessage)
+        assert error.request_id == request_id
+        assert error.stage_id == 0
+        assert error.status_code == 503
+        assert error.error_type == "MultiModalCacheMissError"
+        assert error.retryable is True
+        assert error.mm_cache_miss_hashes == ["audio-hash-a", "audio-hash-b"]
+        assert error.error.startswith("MULTIMODAL_CACHE_MISS_RETRYABLE:")
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        snapshot = fixture.orchestrator._queue_controller.snapshot()
+        assert snapshot["active_requests"] == 0
+        assert snapshot["active_by_stage"] == {}
+        assert snapshot["queued_requests"] == 0
+        assert all(stage.abort_calls == [[request_id]] for stage in stages)
+        assert len(stage0_processor.process_calls) == 1
+        assert stage0_processor.process_calls[0][0][0] == []
+
+        # A duplicate terminal arriving after cleanup is ignored and cannot
+        # recreate state or emit a second client error.
+        stages[0].push_engine_core_outputs(_mm_cache_miss_engine_core_outputs(engine_request_id, "audio-hash-a"))
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            fixture.output_sync_q.get_nowait()
+        assert fixture.orchestrator._queue_controller.snapshot()["active_requests"] == 0
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_mm_cache_miss_filters_only_failed_member_of_mixed_raw_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        '{"queue_control":{"enabled":true,"stage_wip_limits":{"0":2}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+
+    miss_external = "req-miss"
+    miss_internal = "req-miss-internal-a1b2c3d4"
+    ok_external = "req-ok"
+    ok_internal = "req-ok-internal-d4c3b2a1"
+    stage = FakeStageClient(stage_type="llm", final_output=True)
+    processor = RecordingOutputProcessor(
+        request_outputs=[_build_request_output(ok_external, finished=True)],
+    )
+    fixture = orchestrator_factory([stage], output_processors=[processor])
+
+    try:
+        for external_id, internal_id in (
+            (miss_external, miss_internal),
+            (ok_external, ok_internal),
+        ):
+            await _enqueue_add_request(
+                fixture,
+                request_id=external_id,
+                prompt=SimpleNamespace(
+                    request_id=internal_id,
+                    external_req_id=external_id,
+                    prompt_token_ids=[1, 2],
+                    mm_features=[SimpleNamespace(identifier="shared-audio")],
+                ),
+                original_prompt={"prompt": external_id},
+                sampling_params_list=[_sampling_params()],
+                final_stage_id=0,
+            )
+        await _wait_for(lambda: len(stage.add_request_calls) == 2)
+
+        stage.push_engine_core_outputs(
+            EngineCoreOutputs(
+                outputs=[
+                    EngineCoreOutput(
+                        request_id=miss_internal,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.ERROR,
+                        mm_cache_miss_hashes=["audio-hash"],
+                    ),
+                    EngineCoreOutput(
+                        request_id=ok_internal,
+                        new_token_ids=[7],
+                        finish_reason=FinishReason.STOP,
+                    ),
+                ],
+                timestamp=1.0,
+                finished_requests={miss_internal, ok_internal},
+            )
+        )
+        await _wait_for(lambda: fixture.output_sync_q.qsize() == 2)
+        messages = [fixture.output_sync_q.get_nowait(), fixture.output_sync_q.get_nowait()]
+
+        error = next(msg for msg in messages if isinstance(msg, ErrorMessage))
+        output = next(msg for msg in messages if isinstance(msg, OutputMessage))
+        assert error.request_id == miss_external
+        assert output.request_id == ok_external
+        assert output.finished is True
+        assert len(processor.process_calls) == 1
+        processed_raw_outputs = processor.process_calls[0][0][0]
+        assert [eco.request_id for eco in processed_raw_outputs] == [ok_internal]
+        await _wait_for(lambda: fixture.orchestrator.request_states == {})
+        assert fixture.orchestrator._queue_controller.snapshot()["active_requests"] == 0
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_mm_cache_miss_retries_abort_without_losing_internal_id_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        '{"queue_control":{"enabled":true,"stage_wip_limits":{"0":1}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+
+    external_id = "req-abort-failure"
+    internal_id = "req-abort-failure-internal"
+    stage = FakeStageClient(stage_type="llm", final_output=True)
+    processor = InternalIdOutputProcessor()
+    fixture = orchestrator_factory([stage], output_processors=[processor])
+
+    abort_attempt = 0
+    original_abort = stage.abort_requests_async
+
+    async def fail_once_abort(request_ids: list[str]) -> None:
+        nonlocal abort_attempt
+        abort_attempt += 1
+        if abort_attempt > 1:
+            await original_abort(request_ids)
+            return
+        stage.abort_calls.append(list(request_ids))
+        raise RuntimeError("injected abort transport failure")
+
+    stage.abort_requests_async = fail_once_abort  # type: ignore[method-assign]
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id=external_id,
+            prompt=SimpleNamespace(
+                request_id=internal_id,
+                external_req_id=external_id,
+                prompt_token_ids=[1, 2],
+                mm_features=[SimpleNamespace(identifier="audio")],
+            ),
+            original_prompt={"prompt": "abort failure"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage.add_request_calls) == 1)
+        stage.push_engine_core_outputs(_mm_cache_miss_engine_core_outputs(internal_id, "audio-hash"))
+        await _wait_for(lambda: not fixture.output_sync_q.empty())
+        error = fixture.output_sync_q.get_nowait()
+
+        assert isinstance(error, ErrorMessage)
+        assert error.request_id == external_id
+        assert error.retryable is True
+        assert error.error_type == "MultiModalCacheMissError"
+        assert stage.abort_calls == [[internal_id], [internal_id]]
+        await _wait_for(lambda: external_id not in fixture.orchestrator.request_states)
+        snapshot = fixture.orchestrator._queue_controller.snapshot()
+        assert snapshot["active_requests"] == 0
+        assert snapshot["active_by_stage"] == {}
+        assert fixture.orchestrator.stage_pools[0].get_bound_replica_id(external_id) is None
+        assert internal_id not in processor.request_states
+        assert fixture.thread.is_alive()
     finally:
         await _shutdown_orchestrator(fixture)
 

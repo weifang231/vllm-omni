@@ -37,6 +37,17 @@ class GuardrailViolationError(OmniClientError):
     """Raised when a model guardrail rejects request content."""
 
 
+class OmniRetryableError(OmniClientError):
+    """Structured request-scoped transient failure that callers may retry.
+
+    It intentionally shares the metadata-bearing ``OmniClientError`` base so
+    existing OpenAI entrypoints preserve ``status_code`` and ``error_type``.
+    Unlike ordinary client errors, its status may be a retryable 5xx.
+    """
+
+    retryable = True
+
+
 def client_error_metadata(exc: BaseException) -> tuple[int | None, str | None]:
     if isinstance(exc, OmniClientError):
         return exc.status_code, exc.error_type

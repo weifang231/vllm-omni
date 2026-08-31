@@ -202,6 +202,22 @@ class StagePool:
     def output_processor(self) -> Any:
         return self._output_processor
 
+    def resolve_external_request_id(self, engine_request_id: str) -> str:
+        """Map an EngineCore request id back to the orchestrator id.
+
+        vLLM's input processor assigns an internal request id and stores the
+        caller-visible id on its output-processor request state.  Raw terminal
+        errors must be resolved before that state is consumed or removed.
+        """
+        processor = self._output_processor
+        request_states = getattr(processor, "request_states", None)
+        if request_states is not None:
+            request_state = request_states.get(engine_request_id)
+            external_request_id = getattr(request_state, "external_req_id", None)
+            if external_request_id:
+                return str(external_request_id)
+        return engine_request_id
+
     @property
     def is_distributed(self) -> bool:
         """True iff a hub has been attached (i.e. running in head-distributed mode)."""

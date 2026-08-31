@@ -577,6 +577,11 @@ class PendingStageDispatch:
     operation: str
     starts_request: bool = False
     required_active_stage_id: int | None = None
+    # vLLM's multimodal sender cache is populated before a stage-0 request is
+    # handed to the orchestrator.  Any scheduler that reorders those requests
+    # must preserve their relative dispatch order, otherwise a metadata-only
+    # cache hit can reach the receiver before the request carrying its data.
+    preserve_stage0_mm_cache_order: bool = False
     sequence: int = 0
     enqueued_monotonic_s: float = 0.0
 
@@ -725,6 +730,10 @@ class RuntimeQueueController:
         dependency, stage, or stage-class WIP limit requires queuing. This
         avoids serializing every pipeline edge behind a class-level controller.
         """
+        if pending.preserve_stage0_mm_cache_order and any(
+            item.preserve_stage0_mm_cache_order and item.stage_id == pending.stage_id for item in self._pending
+        ):
+            return True
         if not self.active:
             return False
         if (
@@ -946,9 +955,16 @@ class RuntimeQueueController:
         return rejected
 
     def _blocked_reasons(self, pending: PendingStageDispatch) -> tuple[str, ...]:
-        if not self.active:
-            return ()
         reasons: list[str] = []
+        if pending.preserve_stage0_mm_cache_order and any(
+            item.preserve_stage0_mm_cache_order
+            and item.stage_id == pending.stage_id
+            and item.sequence < pending.sequence
+            for item in self._pending
+        ):
+            reasons.append("mm_cache_order")
+        if not self.active:
+            return tuple(reasons)
         if not self._dependency_satisfied(pending):
             reasons.append("dependency")
         if self.enabled:
