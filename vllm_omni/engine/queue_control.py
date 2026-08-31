@@ -601,6 +601,11 @@ class RuntimeQueueController:
         self._request_to_logical: dict[str, str] = {}
         self._active_stages: set[tuple[str, int]] = set()
         self._active_stage_classes: dict[tuple[str, int], str] = {}
+        # A dependency is monotone within one logical-request lifetime: an
+        # upstream stage satisfies it while active and after successful
+        # completion. Rollback never records completion, and cancellation
+        # removes all completion history before a request id may be reused.
+        self._completed_stages: set[tuple[str, int]] = set()
         self._observed_initial_requests: set[str] = set()
         self._arrivals_by_class_total: Counter[str] = Counter()
         self._config_generation = 0
@@ -689,10 +694,7 @@ class RuntimeQueueController:
             and pending.metadata.request_class in self.config.admission.classes
         ):
             return True
-        if (
-            pending.required_active_stage_id is not None
-            and (pending.request_id, pending.required_active_stage_id) not in self._active_stages
-        ):
+        if not self._dependency_satisfied(pending):
             return True
         if pending.logical_request_id not in self._active_requests and not pending.starts_request:
             return True
@@ -724,6 +726,13 @@ class RuntimeQueueController:
     def _request_class(self, pending: PendingStageDispatch) -> str:
         metadata = self._active_requests.get(pending.logical_request_id, pending.metadata)
         return metadata.request_class
+
+    def _dependency_satisfied(self, pending: PendingStageDispatch) -> bool:
+        required_stage_id = pending.required_active_stage_id
+        if required_stage_id is None:
+            return True
+        dependency = (pending.request_id, required_stage_id)
+        return dependency in self._active_stages or dependency in self._completed_stages
 
     @staticmethod
     def _admission_order_key(pending: PendingStageDispatch) -> tuple[float, int]:
@@ -897,14 +906,7 @@ class RuntimeQueueController:
         if not self.active:
             return ()
         reasons: list[str] = []
-        if (
-            pending.required_active_stage_id is not None
-            and (
-                pending.request_id,
-                pending.required_active_stage_id,
-            )
-            not in self._active_stages
-        ):
+        if not self._dependency_satisfied(pending):
             reasons.append("dependency")
         if self.enabled:
             stage_key = (pending.request_id, pending.stage_id)
@@ -1007,7 +1009,9 @@ class RuntimeQueueController:
             self._active_stage_classes.pop(stage_key, None)
         if acquired.acquired_request:
             self._active_requests.pop(pending.logical_request_id, None)
-        if not any(request_id == pending.request_id for request_id, _ in self._active_stages):
+        if not any(request_id == pending.request_id for request_id, _ in self._active_stages) and not any(
+            request_id == pending.request_id for request_id, _ in self._completed_stages
+        ):
             self._request_to_logical.pop(pending.request_id, None)
         self._dispatch_failures_total += 1
 
@@ -1017,6 +1021,7 @@ class RuntimeQueueController:
             return False
         self._active_stages.remove(key)
         self._active_stage_classes.pop(key, None)
+        self._completed_stages.add(key)
         return True
 
     def cancel_request(self, request_id: str) -> None:
@@ -1032,6 +1037,9 @@ class RuntimeQueueController:
                 for key, request_class in self._active_stage_classes.items()
                 if self._request_to_logical.get(key[0], key[0]) != logical_id
             }
+            self._completed_stages = {
+                key for key in self._completed_stages if self._request_to_logical.get(key[0], key[0]) != logical_id
+            }
             self._active_requests.pop(logical_id, None)
             for actual_id, mapped_logical in list(self._request_to_logical.items()):
                 if mapped_logical == logical_id:
@@ -1043,6 +1051,7 @@ class RuntimeQueueController:
             self._active_stage_classes = {
                 key: request_class for key, request_class in self._active_stage_classes.items() if key[0] != request_id
             }
+            self._completed_stages = {key for key in self._completed_stages if key[0] != request_id}
             self._request_to_logical.pop(request_id, None)
         self._cancelled_total += before - len(self._pending)
 

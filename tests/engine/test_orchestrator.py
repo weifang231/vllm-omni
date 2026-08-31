@@ -612,6 +612,79 @@ async def test_runtime_queue_control_enforces_wip_and_edf_at_stage_submit(
 
 
 @pytest.mark.asyncio
+async def test_async_prewarm_drains_after_upstream_release_and_stage_class_increase(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "stage_class_wip_limits": {"1": {"speech": 0}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    monkeypatch.setenv(RUNTIME_CONTROL_INTERVAL_ENV, "0.01")
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-dependency", finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-dependency", finished=True)]),
+    ]
+    fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        async_chunk=True,
+    )
+
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="req-dependency",
+            prompt=SimpleNamespace(request_id="req-dependency", prompt_token_ids=[1, 2, 3]),
+            original_prompt={"prompt": "dependency regression"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            scheduling_metadata=RequestSchedulingMetadata(request_class="speech", path="speech"),
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        await _wait_for(lambda: fixture.orchestrator._queue_controller.snapshot()["queued_requests"] == 1)
+        assert len(stage1.add_request_calls) == 0
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-finished", 1.0))
+        await _wait_for(lambda: fixture.orchestrator._queue_controller.snapshot()["active_by_stage"].get("0", 0) == 0)
+        snapshot = fixture.orchestrator._queue_controller.snapshot()
+        assert snapshot["blocked_by_limit"] == {"stage_class": 1}
+
+        replacement = tmp_path / "queue-control-updated.json"
+        replacement.write_text(
+            json.dumps(
+                {
+                    "queue_control": {
+                        "enabled": True,
+                        "stage_class_wip_limits": {"1": {"speech": 1}},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        replacement.replace(control_path)
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-finished", 2.0))
+        await _wait_for(lambda: "req-dependency" not in fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
 async def test_runtime_queue_control_applies_only_increasing_allocator_revisions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
