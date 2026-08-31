@@ -182,6 +182,7 @@ def test_build_add_request_message_preserves_scheduling_metadata(mocker: MockerF
         request_class="interactive",
         path="audio",
         deadline_monotonic_s=12.5,
+        admission_correlation_id="client-request-7",
     )
 
     message = engine._build_add_request_message(

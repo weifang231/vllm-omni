@@ -132,6 +132,31 @@ def test_generate_forwards_lora_request_to_engine():
 
 
 @pytest.mark.cpu
+def test_generate_forwards_admission_correlation_to_scheduling_metadata():
+    async def run():
+        submitted_metadata = []
+
+        async def capture_metadata(*, scheduling_metadata=None, **kwargs):
+            del kwargs
+            submitted_metadata.append(scheduling_metadata)
+
+        omni = get_async_omni_instance(fake_add_request=capture_metadata)
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="request-7",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["audio"],
+            admission_correlation_id="client-request-7",
+        ):
+            pass
+
+        assert len(submitted_metadata) == 1
+        assert submitted_metadata[0].admission_correlation_id == "client-request-7"
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "req_ids,cancel_prefix,expected_cancel_count",
     [

@@ -859,6 +859,71 @@ async def test_runtime_admission_rejection_is_nonfatal_429_and_cleans_up(
 
 
 @pytest.mark.asyncio
+async def test_runtime_shadow_admission_records_join_id_without_rejecting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "admission-shadow-control.json"
+    control_path.write_text(
+        """{
+          "queue_control": {
+            "enabled": false,
+            "admission": {
+              "enabled": true,
+              "enforce": false,
+              "classes": {
+                "interactive": {
+                  "effective_k": 0,
+                  "mu": 0,
+                  "service_samples_s": [0.1],
+                  "gamma": 0.9
+                }
+              }
+            }
+          }
+        }""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    await _enqueue_add_request(
+        fixture,
+        request_id="shadowed",
+        prompt=FakePromptRequest("shadowed", [1]),
+        original_prompt={"prompt": "shadowed"},
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        scheduling_metadata=RequestSchedulingMetadata(
+            request_class="interactive",
+            deadline_monotonic_s=time.monotonic() + 10.0,
+            admission_correlation_id="client-request-7",
+        ),
+    )
+
+    await _wait_for(lambda: len(stage.add_request_calls) == 1)
+    assert fixture.output_sync_q.empty()
+    admission = fixture.orchestrator._queue_controller.snapshot()["admission"]
+    assert admission["actual_rejected_total"] == 0
+    assert admission["shadow_would_reject_decisions_total"] == 2
+    assert [item["phase"] for item in admission["recent_decisions"]] == ["arrival", "recheck"]
+    assert admission["recent_decisions"][-1]["admission_correlation_id"] == "client-request-7"
+    assert admission["recent_decisions"][-1]["would_admit"] is False
+
+    await _enqueue_abort_request(fixture, ["shadowed"])
+    await _wait_for(lambda: "shadowed" not in fixture.orchestrator.request_states)
+    assert (
+        fixture.orchestrator._queue_controller.snapshot()["admission"]["recent_decisions"][-1][
+            "admission_correlation_id"
+        ]
+        == "client-request-7"
+    )
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
 async def test_runtime_admission_rechecks_expiry_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

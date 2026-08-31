@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 import pytest
 
 from vllm_omni.engine.queue_control import (
+    ADMISSION_DECISION_HISTORY_LIMIT,
     AdmissionClassConfig,
     AdmissionControlConfig,
     OnlineAllocatorMetadata,
@@ -35,6 +36,7 @@ def _pending(
     starts_request: bool = True,
     request_class: str = "default",
     path: str = "default",
+    admission_correlation_id: str | None = None,
     required_active_stage_id: int | None = None,
     dispatch: Callable[[], Awaitable[bool]] = _dispatch,
 ) -> PendingStageDispatch:
@@ -46,6 +48,7 @@ def _pending(
             request_class=request_class,
             path=path,
             deadline_monotonic_s=deadline,
+            admission_correlation_id=admission_correlation_id,
         ),
         dispatch=dispatch,
         operation="test",
@@ -60,11 +63,13 @@ def _admission_config(
     mu: float = 2.0,
     service_samples_s: tuple[float, ...] = (0.0,),
     gamma: float = 0.75,
+    enforce: bool = True,
 ) -> QueueControlConfig:
     return QueueControlConfig(
         policy="edf",
         admission=AdmissionControlConfig(
             enabled=True,
+            enforce=enforce,
             classes={
                 "interactive": AdmissionClassConfig(
                     effective_k=effective_k,
@@ -211,6 +216,7 @@ def test_admission_config_parses_calibrated_class_inputs() -> None:
     )
     assert not config.enabled
     assert config.admission.enabled
+    assert config.admission.enforce
     assert config.admission.classes["interactive"] == AdmissionClassConfig(
         effective_k=4,
         mu=0.25,
@@ -254,6 +260,47 @@ def test_admission_config_parses_calibrated_class_inputs() -> None:
             }
         )
 
+    shadow = QueueControlConfig.from_document(
+        {
+            "queue_control": {
+                "admission": {
+                    "enabled": True,
+                    "enforce": False,
+                    "classes": {
+                        "interactive": {
+                            "effective_k": 1,
+                            "mu": 1.0,
+                            "service_samples_s": [0.5],
+                            "gamma": 0.9,
+                        }
+                    },
+                }
+            }
+        }
+    )
+    assert shadow.policy == "fifo"
+    assert shadow.admission.enabled
+    assert not shadow.admission.enforce
+
+    with pytest.raises(ValueError, match="admission.enforce must be boolean"):
+        QueueControlConfig.from_document(
+            {
+                "queue_control": {
+                    "admission": {
+                        "enforce": "false",
+                        "classes": {
+                            "interactive": {
+                                "effective_k": 1,
+                                "mu": 1.0,
+                                "service_samples_s": [0.5],
+                                "gamma": 0.9,
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
 
 def test_erlang_empirical_formula_matches_closed_form() -> None:
     assert erlang_wait_cdf(
@@ -285,11 +332,13 @@ def test_request_metadata_builds_absolute_deadline() -> None:
     metadata = RequestSchedulingMetadata.create(
         path="audio",
         first_output_deadline_s=0.4,
+        admission_correlation_id="client-request-7",
         now_monotonic_s=10.0,
     )
     assert metadata.request_class == "audio"
     assert metadata.path == "audio"
     assert metadata.deadline_monotonic_s == pytest.approx(10.4)
+    assert metadata.admission_correlation_id == "client-request-7"
 
     with pytest.raises(ValueError, match="non-negative"):
         RequestSchedulingMetadata.create(first_output_deadline_s=-0.1)
@@ -300,6 +349,7 @@ def test_http_headers_require_explicit_trust(monkeypatch: pytest.MonkeyPatch) ->
         "X-VLLM-OMNI-REQUEST-CLASS": "interactive",
         "x-vllm-omni-request-path": "audio",
         "x-vllm-omni-first-output-deadline-ms": "400",
+        "x-vllm-omni-admission-correlation-id": "client-request-7",
     }
     assert scheduling_kwargs_from_headers(headers) == {}
 
@@ -308,11 +358,17 @@ def test_http_headers_require_explicit_trust(monkeypatch: pytest.MonkeyPatch) ->
         "request_class": "interactive",
         "request_path": "audio",
         "first_output_deadline_s": 0.4,
+        "admission_correlation_id": "client-request-7",
     }
 
     with pytest.raises(ValueError, match="finite and non-negative"):
         scheduling_kwargs_from_headers(
             {"x-vllm-omni-first-output-deadline-ms": "-1"},
+            trusted=True,
+        )
+    with pytest.raises(ValueError, match="must be non-empty"):
+        scheduling_kwargs_from_headers(
+            {"x-vllm-omni-admission-correlation-id": "  "},
             trusted=True,
         )
 
@@ -777,6 +833,9 @@ def test_rejected_initial_request_is_an_offered_arrival_but_not_queued() -> None
     assert snapshot["arrivals_by_class_total"] == {"interactive": 1}
     assert snapshot["queued_by_class"] == {}
     assert snapshot["queued_requests"] == 0
+    assert snapshot["admission"]["actual_rejected_total"] == 1
+    assert snapshot["admission"]["would_reject_decisions_total"] == 1
+    assert snapshot["admission"]["shadow_would_reject_decisions_total"] == 0
 
 
 def test_admission_without_deadline_is_admitted_without_a_score() -> None:
@@ -790,9 +849,145 @@ def test_admission_without_deadline_is_admitted_without_a_score() -> None:
     decision = controller.enqueue(pending)
     assert decision is not None
     assert decision.admitted
+    assert decision.would_admit
+    assert decision.enforced
     assert decision.score is None
     assert decision.reason == "no_deadline"
     assert controller.pop_ready() is not None
+
+
+def test_shadow_admission_records_would_reject_and_correlation_without_rejecting() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_admission_config(effective_k=0, mu=0.0, enforce=False),
+        clock=lambda: 10.0,
+    )
+    decision = controller.enqueue(
+        _pending(
+            "shadowed",
+            request_class="interactive",
+            deadline=20.0,
+            admission_correlation_id="client-request-7",
+        )
+    )
+    assert decision is not None
+    assert decision.admitted
+    assert not decision.would_admit
+    assert not decision.enforced
+    assert controller.pop_ready().pending.request_id == "shadowed"  # type: ignore[union-attr]
+
+    controller.cancel_request("shadowed")
+    admission = controller.snapshot()["admission"]
+    assert admission["admitted_total"] == 1
+    assert admission["rejected_total"] == 0
+    assert admission["actual_rejected_total"] == 0
+    assert admission["would_reject_decisions_total"] == 1
+    assert admission["shadow_would_reject_decisions_total"] == 1
+    assert admission["decision_sequence"] == 1
+    assert admission["recent_decisions"][-1] == {
+        "decision_sequence": 1,
+        "request_id": "shadowed",
+        "admission_correlation_id": "client-request-7",
+        "request_class": "interactive",
+        "phase": "arrival",
+        "admitted": True,
+        "would_admit": False,
+        "enforced": False,
+        "score": 0.0,
+        "gamma": 0.75,
+        "reason": "zero_effective_k",
+        "effective_k": 0,
+        "mu": 0.0,
+        "active_count": 0,
+        "queue_position": 0,
+        "remaining_budget_s": 10.0,
+    }
+
+
+def test_shadow_admission_recheck_observes_failure_without_removing_waiter() -> None:
+    now = [0.0]
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=QueueControlConfig(
+            enabled=True,
+            policy="fifo",
+            global_wip_limit=1,
+            admission=_admission_config(enforce=False).admission,
+        ),
+        clock=lambda: now[0],
+    )
+    running = controller.enqueue(_pending("running", request_class="interactive", deadline=100.0))
+    assert running is not None and running.would_admit
+    assert controller.pop_ready() is not None
+    waiting = controller.enqueue(_pending("waiting", request_class="interactive", deadline=1.0))
+    assert waiting is not None and waiting.would_admit
+
+    now[0] = 2.0
+    assert controller.recheck_admission() == []
+    snapshot = controller.snapshot()
+    assert snapshot["queued_requests"] == 1
+    assert snapshot["admission"]["actual_rejected_total"] == 0
+    assert snapshot["admission"]["shadow_would_reject_decisions_total"] == 1
+    last = snapshot["admission"]["recent_decisions"][-1]
+    assert last["phase"] == "recheck"
+    assert last["admitted"] is True
+    assert last["would_admit"] is False
+
+    controller.cancel_request("running")
+    assert controller.pop_ready().pending.request_id == "waiting"  # type: ignore[union-attr]
+
+
+def test_shadow_admission_positions_reflect_observed_queue() -> None:
+    now = [0.0]
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_admission_config(mu=0.1, gamma=0.8, enforce=False),
+        clock=lambda: now[0],
+    )
+    stale = controller.enqueue(_pending("stale", request_class="interactive", deadline=1.0))
+    assert stale is not None and stale.would_admit
+
+    now[0] = 2.0
+    newcomer = controller.enqueue(_pending("new", request_class="interactive", deadline=3.0))
+    assert newcomer is not None and not newcomer.would_admit
+    assert newcomer.queue_position == 1
+
+    assert controller.recheck_admission() == []
+    decisions = controller.snapshot()["admission"]["recent_decisions"][-2:]
+    assert [(item["request_id"], item["would_admit"], item["queue_position"]) for item in decisions] == [
+        ("stale", False, 0),
+        ("new", False, 1),
+    ]
+    assert controller.snapshot()["queued_requests"] == 2
+
+
+def test_admission_decision_ring_reports_sequence_gaps_without_growing() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_admission_config(effective_k=0, mu=0.0, enforce=False),
+        clock=lambda: 0.0,
+    )
+    decision_count = ADMISSION_DECISION_HISTORY_LIMIT + 2
+    for index in range(decision_count):
+        decision = controller.enqueue(
+            _pending(
+                f"request-{index}",
+                request_class="interactive",
+                deadline=10.0,
+                admission_correlation_id=f"client-{index}",
+            )
+        )
+        assert decision is not None and decision.admitted and not decision.would_admit
+
+    admission = controller.snapshot()["admission"]
+    recent = admission["recent_decisions"]
+    assert admission["decision_sequence"] == decision_count
+    assert admission["recent_decision_capacity"] == ADMISSION_DECISION_HISTORY_LIMIT
+    assert admission["recent_decision_first_sequence"] == 3
+    assert admission["recent_decision_last_sequence"] == decision_count
+    assert admission["recent_decision_overwritten_total"] == 2
+    assert len(recent) == ADMISSION_DECISION_HISTORY_LIMIT
+    assert [item["decision_sequence"] for item in recent] == list(range(3, decision_count + 1))
 
 
 def test_admission_rejects_expired_deadline_and_zero_effective_k() -> None:
@@ -804,6 +999,8 @@ def test_admission_rejects_expired_deadline_and_zero_effective_k() -> None:
     expired_decision = expired.enqueue(_pending("expired", request_class="interactive", deadline=9.0))
     assert expired_decision is not None
     assert not expired_decision.admitted
+    assert not expired_decision.would_admit
+    assert expired_decision.enforced
     assert expired_decision.score == 0.0
     assert expired_decision.reason == "deadline_expired"
     assert expired.snapshot()["queued_requests"] == 0

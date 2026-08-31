@@ -23,6 +23,7 @@ def test_scheduling_metadata_survives_engine_request_roundtrip() -> None:
             request_class="interactive",
             path="audio",
             deadline_monotonic_s=12.5,
+            admission_correlation_id="client-request-7",
         ),
     )
 
@@ -33,4 +34,5 @@ def test_scheduling_metadata_survives_engine_request_roundtrip() -> None:
         request_class="interactive",
         path="audio",
         deadline_monotonic_s=12.5,
+        admission_correlation_id="client-request-7",
     )

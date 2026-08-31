@@ -4754,6 +4754,32 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
 
+    def test_prepare_speech_generation_forwards_trusted_admission_correlation_id(
+        self,
+        qwen3_tts_server,
+        mocker: MockerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("VLLM_OMNI_TRUST_SCHEDULING_HEADERS", "1")
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        raw_request = SimpleNamespace(
+            headers={"x-vllm-omni-admission-correlation-id": "client-request-7"},
+        )
+
+        asyncio.run(
+            qwen3_tts_server._prepare_speech_generation(
+                OpenAICreateSpeechRequest(input="hello"),
+                raw_request=raw_request,
+            )
+        )
+
+        kwargs = qwen3_tts_server.engine_client.generate.call_args.kwargs
+        assert kwargs["admission_correlation_id"] == "client-request-7"
+
     def test_prepare_speech_generation_qwen3_default_seed_sets_tts_local_seed(
         self, qwen3_tts_server, mocker: MockerFixture
     ):

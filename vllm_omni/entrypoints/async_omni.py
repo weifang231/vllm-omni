@@ -487,6 +487,7 @@ class AsyncOmni(EngineClient, OmniBase):
         request_class: str | None = None,
         request_path: str | None = None,
         first_output_deadline_s: float | None = None,
+        admission_correlation_id: str | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -516,6 +517,9 @@ class AsyncOmni(EngineClient, OmniBase):
                 requested output modalities, or the final stage id.
             first_output_deadline_s: Optional non-negative relative deadline
                 budget, measured from this ``generate`` call.
+            admission_correlation_id: Optional opaque identifier supplied by a
+                trusted ingress for joining admission telemetry to client-side
+                outcomes. It does not replace the runtime request ID.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -608,6 +612,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 path=request_path,
                 default_path=default_path,
                 first_output_deadline_s=first_output_deadline_s,
+                admission_correlation_id=admission_correlation_id,
             )
 
             metrics = OrchestratorMetrics(

@@ -81,8 +81,9 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
-    # Coordinator-visible class, path, and first-output deadline. Stage
-    # workers preserve this metadata but do not interpret it.
+    # Coordinator-visible class, path, first-output deadline, and admission
+    # correlation id. Stage workers preserve this metadata but do not
+    # interpret it.
     scheduling_metadata: RequestSchedulingMetadata | None = None
 
     @classmethod
