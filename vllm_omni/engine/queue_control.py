@@ -22,10 +22,12 @@ from typing import Any, Literal
 QueuePolicy = Literal["fifo", "edf"]
 DispatchCallable = Callable[[], Awaitable[bool]]
 AdmissionScoreMethod = Literal["erlang_empirical"]
+ADMISSION_DECISION_HISTORY_LIMIT = 128
 
 REQUEST_CLASS_HEADER = "x-vllm-omni-request-class"
 REQUEST_PATH_HEADER = "x-vllm-omni-request-path"
 FIRST_OUTPUT_DEADLINE_MS_HEADER = "x-vllm-omni-first-output-deadline-ms"
+ADMISSION_CORRELATION_ID_HEADER = "x-vllm-omni-admission-correlation-id"
 TRUST_SCHEDULING_HEADERS_ENV = "VLLM_OMNI_TRUST_SCHEDULING_HEADERS"
 
 
@@ -59,10 +61,11 @@ def scheduling_kwargs_from_headers(
 ) -> dict[str, Any]:
     """Translate trusted HTTP headers into :meth:`AsyncOmni.generate` kwargs.
 
-    Headers are ignored by default because accepting caller-selected classes or
-    deadlines at a public ingress would let clients evade class limits or gain
-    EDF priority. Operators may opt in only when a trusted proxy owns these
-    headers, or callers may pass ``trusted=True`` at an internal boundary.
+    Headers are ignored by default because accepting caller-selected classes,
+    deadlines, or telemetry identifiers at a public ingress would let clients
+    alter scheduling or pollute audit joins. Operators may opt in only when a
+    trusted proxy owns these headers, or callers may pass ``trusted=True`` at
+    an internal boundary.
     """
     if not scheduling_headers_trusted(trusted=trusted) or headers is None:
         return {}
@@ -91,6 +94,12 @@ def scheduling_kwargs_from_headers(
         if not math.isfinite(deadline_ms) or deadline_ms < 0:
             raise ValueError(f"{FIRST_OUTPUT_DEADLINE_MS_HEADER} must be finite and non-negative")
         kwargs["first_output_deadline_s"] = deadline_ms / 1000.0
+    if ADMISSION_CORRELATION_ID_HEADER in normalized_headers:
+        kwargs["admission_correlation_id"] = _label(
+            normalized_headers[ADMISSION_CORRELATION_ID_HEADER],
+            default="",
+            field_name=ADMISSION_CORRELATION_ID_HEADER,
+        )
     return kwargs
 
 
@@ -210,11 +219,16 @@ class AdmissionClassConfig:
 
 @dataclass(frozen=True, slots=True)
 class AdmissionControlConfig:
-    """Opt-in ingress admission settings nested under ``queue_control``."""
+    """Opt-in ingress admission settings nested under ``queue_control``.
+
+    ``enforce=False`` evaluates and records every configured-class decision
+    without rejecting requests or applying the admission concurrency gate.
+    """
 
     enabled: bool = False
     score_method: AdmissionScoreMethod = "erlang_empirical"
     classes: dict[str, AdmissionClassConfig] = field(default_factory=dict)
+    enforce: bool = True
 
     @classmethod
     def from_mapping(cls, raw: Any) -> AdmissionControlConfig:
@@ -225,6 +239,9 @@ class AdmissionControlConfig:
         enabled = raw.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError("queue_control.admission.enabled must be boolean")
+        enforce = raw.get("enforce", True)
+        if not isinstance(enforce, bool):
+            raise ValueError("queue_control.admission.enforce must be boolean")
         score_method = str(raw.get("score_method", "erlang_empirical")).strip().lower()
         if score_method != "erlang_empirical":
             raise ValueError("queue_control.admission.score_method must be 'erlang_empirical'")
@@ -248,6 +265,7 @@ class AdmissionControlConfig:
             raise ValueError("queue_control.admission.classes must not be empty when admission is enabled")
         return cls(
             enabled=enabled,
+            enforce=enforce,
             score_method=score_method,  # type: ignore[arg-type]
             classes=classes,
         )
@@ -322,11 +340,14 @@ class RequestSchedulingMetadata:
 
     ``deadline_monotonic_s`` is process-local and absolute on
     :func:`time.monotonic`'s clock. It is never interpreted as wall time.
+    ``admission_correlation_id`` is an opaque, trusted-ingress identifier used
+    only to join admission decisions to external request outcomes.
     """
 
     request_class: str = "default"
     path: str = "default"
     deadline_monotonic_s: float | None = None
+    admission_correlation_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -344,6 +365,16 @@ class RequestSchedulingMetadata:
             if not math.isfinite(deadline):
                 raise ValueError("deadline_monotonic_s must be finite")
             object.__setattr__(self, "deadline_monotonic_s", deadline)
+        if self.admission_correlation_id is not None:
+            object.__setattr__(
+                self,
+                "admission_correlation_id",
+                _label(
+                    self.admission_correlation_id,
+                    default="",
+                    field_name="admission_correlation_id",
+                ),
+            )
 
     @classmethod
     def create(
@@ -353,6 +384,7 @@ class RequestSchedulingMetadata:
         path: str | None = None,
         default_path: str = "default",
         first_output_deadline_s: float | None = None,
+        admission_correlation_id: str | None = None,
         now_monotonic_s: float | None = None,
     ) -> RequestSchedulingMetadata:
         normalized_path = _label(path, default=default_path, field_name="path")
@@ -372,6 +404,7 @@ class RequestSchedulingMetadata:
             request_class=normalized_class,
             path=normalized_path,
             deadline_monotonic_s=deadline,
+            admission_correlation_id=admission_correlation_id,
         )
 
 
@@ -469,8 +502,8 @@ class QueueControlConfig:
     online_allocator: OnlineAllocatorMetadata | None = None
 
     def __post_init__(self) -> None:
-        if self.admission.enabled and self.policy != "edf":
-            raise ValueError("queue_control.policy must be 'edf' when admission is enabled")
+        if self.admission.enabled and self.admission.enforce and self.policy != "edf":
+            raise ValueError("queue_control.policy must be 'edf' when admission enforcement is enabled")
 
     @classmethod
     def from_document(
@@ -561,7 +594,10 @@ class AdmissionDecision:
     """One calibrated ingress-admission evaluation."""
 
     admitted: bool
+    would_admit: bool
+    enforced: bool
     request_id: str
+    admission_correlation_id: str | None
     request_class: str
     phase: Literal["arrival", "recheck"]
     score: float | None
@@ -618,8 +654,12 @@ class RuntimeQueueController:
         self._admission_admitted_total = 0
         self._admission_rejected_total = 0
         self._admission_recheck_passed_total = 0
+        self._admission_would_admit_decisions_total = 0
+        self._admission_would_reject_decisions_total = 0
+        self._admission_shadow_would_reject_decisions_total = 0
+        self._admission_decision_sequence = 0
         self._admission_reason_counts: Counter[str] = Counter()
-        self._recent_admission_decisions: deque[dict[str, Any]] = deque(maxlen=128)
+        self._recent_admission_decisions: deque[dict[str, Any]] = deque(maxlen=ADMISSION_DECISION_HISTORY_LIMIT)
 
     @property
     def enabled(self) -> bool:
@@ -772,30 +812,19 @@ class RuntimeQueueController:
         if class_config.effective_k == 0:
             score = 0.0
             reason = "zero_effective_k"
-            admitted = False
+            would_admit = False
         elif active_count > class_config.effective_k:
             score = 0.0
             reason = "active_above_effective_k"
-            admitted = False
+            would_admit = False
         elif deadline is None:
-            return AdmissionDecision(
-                admitted=True,
-                request_id=pending.logical_request_id,
-                request_class=pending.metadata.request_class,
-                phase=phase,
-                score=None,
-                gamma=class_config.gamma,
-                reason="no_deadline",
-                effective_k=class_config.effective_k,
-                mu=class_config.mu,
-                active_count=active_count,
-                queue_position=queue_position,
-                remaining_budget_s=None,
-            )
+            score = None
+            reason = "no_deadline"
+            would_admit = True
         elif remaining_budget_s is not None and remaining_budget_s < 0:
             score = 0.0
             reason = "deadline_expired"
-            admitted = False
+            would_admit = False
         else:
             assert remaining_budget_s is not None
             score = erlang_empirical_admission_score(
@@ -806,11 +835,14 @@ class RuntimeQueueController:
                 queue_position=queue_position,
                 service_samples_s=class_config.service_samples_s,
             )
-            admitted = score >= class_config.gamma
-            reason = "score_pass" if admitted else "score_below_gamma"
+            would_admit = score >= class_config.gamma
+            reason = "score_pass" if would_admit else "score_below_gamma"
         return AdmissionDecision(
-            admitted=admitted,
+            admitted=would_admit or not admission.enforce,
+            would_admit=would_admit,
+            enforced=admission.enforce,
             request_id=pending.logical_request_id,
+            admission_correlation_id=pending.metadata.admission_correlation_id,
             request_class=pending.metadata.request_class,
             phase=phase,
             score=score,
@@ -844,13 +876,24 @@ class RuntimeQueueController:
         raise AssertionError("arrival candidate disappeared from its tentative class queue")
 
     def _record_admission_decision(self, decision: AdmissionDecision) -> None:
+        self._admission_decision_sequence += 1
+        if decision.would_admit:
+            self._admission_would_admit_decisions_total += 1
+        else:
+            self._admission_would_reject_decisions_total += 1
+            if not decision.enforced:
+                self._admission_shadow_would_reject_decisions_total += 1
         self._admission_reason_counts[decision.reason] += 1
         self._recent_admission_decisions.append(
             {
+                "decision_sequence": self._admission_decision_sequence,
                 "request_id": decision.request_id,
+                "admission_correlation_id": decision.admission_correlation_id,
                 "request_class": decision.request_class,
                 "phase": decision.phase,
                 "admitted": decision.admitted,
+                "would_admit": decision.would_admit,
+                "enforced": decision.enforced,
                 "score": decision.score,
                 "gamma": decision.gamma,
                 "reason": decision.reason,
@@ -944,6 +987,7 @@ class RuntimeQueueController:
             admission_class = self.config.admission.classes.get(pending.metadata.request_class)
             if (
                 self.config.admission.enabled
+                and self.config.admission.enforce
                 and pending.starts_request
                 and pending.stage_id == 0
                 and admission_class is not None
@@ -1069,6 +1113,7 @@ class RuntimeQueueController:
             if item.starts_request and item.stage_id == 0 and item.logical_request_id not in self._active_requests
         )
         blocked = Counter(reason for pending in self._pending for reason in self._blocked_reasons(pending))
+        recent_admission_decisions = list(self._recent_admission_decisions)
         now = self._clock()
         return {
             "enabled": self.enabled,
@@ -1087,6 +1132,7 @@ class RuntimeQueueController:
             ),
             "admission": {
                 "enabled": self.config.admission.enabled,
+                "enforce": self.config.admission.enforce,
                 "score_method": self.config.admission.score_method,
                 "classes": {
                     request_class: {
@@ -1099,9 +1145,25 @@ class RuntimeQueueController:
                 },
                 "admitted_total": self._admission_admitted_total,
                 "rejected_total": self._admission_rejected_total,
+                "actual_rejected_total": self._admission_rejected_total,
                 "recheck_passed_total": self._admission_recheck_passed_total,
+                "would_admit_decisions_total": self._admission_would_admit_decisions_total,
+                "would_reject_decisions_total": self._admission_would_reject_decisions_total,
+                "shadow_would_reject_decisions_total": self._admission_shadow_would_reject_decisions_total,
                 "decision_reason_counts": dict(sorted(self._admission_reason_counts.items())),
-                "recent_decisions": list(self._recent_admission_decisions),
+                "decision_sequence": self._admission_decision_sequence,
+                "recent_decision_capacity": ADMISSION_DECISION_HISTORY_LIMIT,
+                "recent_decision_first_sequence": (
+                    recent_admission_decisions[0]["decision_sequence"] if recent_admission_decisions else None
+                ),
+                "recent_decision_last_sequence": (
+                    recent_admission_decisions[-1]["decision_sequence"] if recent_admission_decisions else None
+                ),
+                "recent_decision_overwritten_total": max(
+                    self._admission_decision_sequence - len(recent_admission_decisions),
+                    0,
+                ),
+                "recent_decisions": recent_admission_decisions,
             },
             "active_requests": len(self._active_requests),
             "active_by_stage": {str(key): value for key, value in sorted(stage_counts.items())},
