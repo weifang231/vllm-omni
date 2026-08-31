@@ -5,7 +5,8 @@
 
 This module is intentionally independent of CUDA and vLLM scheduler internals.
 The orchestrator owns one instance and admits work to stage engines only after
-the corresponding pipeline, path, class, and stage credits are available.
+the corresponding pipeline, path, class, stage, and stage-class credits are
+available.
 """
 
 from __future__ import annotations
@@ -135,6 +136,22 @@ def _stage_key(value: Any) -> int:
 
 def _string_key(value: Any) -> str:
     return _label(str(value), default="default", field_name="limit key")
+
+
+def _stage_class_limit_map(value: Any, *, field_name: str) -> dict[int, dict[str, int]]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a JSON object")
+    parsed: dict[int, dict[str, int]] = {}
+    for raw_stage_id, raw_class_limits in value.items():
+        stage_id = _stage_key(raw_stage_id)
+        parsed[stage_id] = _limit_map(
+            raw_class_limits,
+            field_name=f"{field_name}[{raw_stage_id!r}]",
+            key_parser=_string_key,
+        )
+    return parsed
 
 
 def _finite_float(value: Any, *, field_name: str, minimum: float | None = None) -> float:
@@ -445,6 +462,7 @@ class QueueControlConfig:
     policy: QueuePolicy = "fifo"
     global_wip_limit: int | None = None
     stage_wip_limits: dict[int, int] = field(default_factory=dict)
+    stage_class_wip_limits: dict[int, dict[str, int]] = field(default_factory=dict)
     path_wip_limits: dict[str, int] = field(default_factory=dict)
     class_wip_limits: dict[str, int] = field(default_factory=dict)
     admission: AdmissionControlConfig = field(default_factory=AdmissionControlConfig)
@@ -479,10 +497,17 @@ class QueueControlConfig:
             field_name="queue_control.stage_wip_limits",
             key_parser=_stage_key,
         )
+        stage_class_limits = _stage_class_limit_map(
+            raw.get("stage_class_wip_limits"),
+            field_name="queue_control.stage_class_wip_limits",
+        )
         if num_stages is not None:
             invalid = sorted(stage_id for stage_id in stage_limits if stage_id >= num_stages)
             if invalid:
                 raise ValueError(f"stage_wip_limits contains unavailable stage ids: {invalid}")
+            invalid = sorted(stage_id for stage_id in stage_class_limits if stage_id >= num_stages)
+            if invalid:
+                raise ValueError(f"stage_class_wip_limits contains unavailable stage ids: {invalid}")
 
         admission = AdmissionControlConfig.from_mapping(raw.get("admission"))
         return cls(
@@ -493,6 +518,7 @@ class QueueControlConfig:
                 field_name="queue_control.global_wip_limit",
             ),
             stage_wip_limits=stage_limits,
+            stage_class_wip_limits=stage_class_limits,
             path_wip_limits=_limit_map(
                 raw.get("path_wip_limits"),
                 field_name="queue_control.path_wip_limits",
@@ -574,6 +600,7 @@ class RuntimeQueueController:
         self._active_requests: dict[str, RequestSchedulingMetadata] = {}
         self._request_to_logical: dict[str, str] = {}
         self._active_stages: set[tuple[str, int]] = set()
+        self._active_stage_classes: dict[tuple[str, int], str] = {}
         self._observed_initial_requests: set[str] = set()
         self._arrivals_by_class_total: Counter[str] = Counter()
         self._config_generation = 0
@@ -650,8 +677,8 @@ class RuntimeQueueController:
 
         End-to-end request limits and admission only gate the first stage
         submission. Later stages stay on the immediate dispatch path unless a
-        dependency or stage WIP limit requires queuing. This avoids serializing
-        every pipeline edge behind a class-level controller.
+        dependency, stage, or stage-class WIP limit requires queuing. This
+        avoids serializing every pipeline edge behind a class-level controller.
         """
         if not self.active:
             return False
@@ -671,11 +698,13 @@ class RuntimeQueueController:
             return True
         if not self.enabled:
             return False
-        if (
-            pending.request_id,
-            pending.stage_id,
-        ) not in self._active_stages and pending.stage_id in self.config.stage_wip_limits:
-            return True
+        stage_key = (pending.request_id, pending.stage_id)
+        if stage_key not in self._active_stages:
+            if pending.stage_id in self.config.stage_wip_limits:
+                return True
+            stage_class_limits = self.config.stage_class_wip_limits.get(pending.stage_id, {})
+            if self._request_class(pending) in stage_class_limits:
+                return True
         if pending.logical_request_id in self._active_requests:
             return False
         return (
@@ -691,6 +720,10 @@ class RuntimeQueueController:
 
     def _active_class_count(self, request_class: str) -> int:
         return sum(metadata.request_class == request_class for metadata in self._active_requests.values())
+
+    def _request_class(self, pending: PendingStageDispatch) -> str:
+        metadata = self._active_requests.get(pending.logical_request_id, pending.metadata)
+        return metadata.request_class
 
     @staticmethod
     def _admission_order_key(pending: PendingStageDispatch) -> tuple[float, int]:
@@ -881,6 +914,15 @@ class RuntimeQueueController:
                     active = sum(stage_id == pending.stage_id for _, stage_id in self._active_stages)
                     if active >= stage_limit:
                         reasons.append("stage")
+                request_class = self._request_class(pending)
+                stage_class_limit = self.config.stage_class_wip_limits.get(pending.stage_id, {}).get(request_class)
+                if stage_class_limit is not None:
+                    active = sum(
+                        stage_id == pending.stage_id and active_class == request_class
+                        for (_, stage_id), active_class in self._active_stage_classes.items()
+                    )
+                    if active >= stage_class_limit:
+                        reasons.append("stage_class")
 
         if pending.logical_request_id not in self._active_requests:
             if not pending.starts_request:
@@ -942,7 +984,9 @@ class RuntimeQueueController:
             self._active_requests[pending.logical_request_id] = pending.metadata
         self._request_to_logical[pending.request_id] = pending.logical_request_id
         if acquired_stage:
-            self._active_stages.add((pending.request_id, pending.stage_id))
+            stage_key = (pending.request_id, pending.stage_id)
+            self._active_stages.add(stage_key)
+            self._active_stage_classes[stage_key] = self._request_class(pending)
 
         queue_wait_s = max(self._clock() - pending.enqueued_monotonic_s, 0.0)
         self._dispatch_attempts_total += 1
@@ -958,7 +1002,9 @@ class RuntimeQueueController:
     def rollback(self, acquired: AcquiredStageDispatch) -> None:
         pending = acquired.pending
         if acquired.acquired_stage:
-            self._active_stages.discard((pending.request_id, pending.stage_id))
+            stage_key = (pending.request_id, pending.stage_id)
+            self._active_stages.discard(stage_key)
+            self._active_stage_classes.pop(stage_key, None)
         if acquired.acquired_request:
             self._active_requests.pop(pending.logical_request_id, None)
         if not any(request_id == pending.request_id for request_id, _ in self._active_stages):
@@ -970,6 +1016,7 @@ class RuntimeQueueController:
         if key not in self._active_stages:
             return False
         self._active_stages.remove(key)
+        self._active_stage_classes.pop(key, None)
         return True
 
     def cancel_request(self, request_id: str) -> None:
@@ -980,6 +1027,11 @@ class RuntimeQueueController:
             self._active_stages = {
                 key for key in self._active_stages if self._request_to_logical.get(key[0], key[0]) != logical_id
             }
+            self._active_stage_classes = {
+                key: request_class
+                for key, request_class in self._active_stage_classes.items()
+                if self._request_to_logical.get(key[0], key[0]) != logical_id
+            }
             self._active_requests.pop(logical_id, None)
             for actual_id, mapped_logical in list(self._request_to_logical.items()):
                 if mapped_logical == logical_id:
@@ -988,13 +1040,20 @@ class RuntimeQueueController:
         else:
             self._pending = [item for item in self._pending if item.request_id != request_id]
             self._active_stages = {key for key in self._active_stages if key[0] != request_id}
+            self._active_stage_classes = {
+                key: request_class for key, request_class in self._active_stage_classes.items() if key[0] != request_id
+            }
             self._request_to_logical.pop(request_id, None)
         self._cancelled_total += before - len(self._pending)
 
     def snapshot(self) -> dict[str, Any]:
         path_counts, class_counts = self._request_counts()
         stage_counts = Counter(stage_id for _, stage_id in self._active_stages)
+        stage_class_counts = Counter(
+            (stage_id, request_class) for (_, stage_id), request_class in self._active_stage_classes.items()
+        )
         queued_stage_counts = Counter(item.stage_id for item in self._pending)
+        queued_stage_class_counts = Counter((item.stage_id, self._request_class(item)) for item in self._pending)
         queued_class_counts = Counter(
             item.metadata.request_class
             for item in self._pending
@@ -1008,6 +1067,10 @@ class RuntimeQueueController:
             "config_generation": self._config_generation,
             "global_wip_limit": self.config.global_wip_limit,
             "stage_wip_limits": {str(key): value for key, value in sorted(self.config.stage_wip_limits.items())},
+            "stage_class_wip_limits": {
+                str(stage_id): dict(sorted(class_limits.items()))
+                for stage_id, class_limits in sorted(self.config.stage_class_wip_limits.items())
+            },
             "path_wip_limits": dict(sorted(self.config.path_wip_limits.items())),
             "class_wip_limits": dict(sorted(self.config.class_wip_limits.items())),
             "online_allocator": (
@@ -1033,10 +1096,24 @@ class RuntimeQueueController:
             },
             "active_requests": len(self._active_requests),
             "active_by_stage": {str(key): value for key, value in sorted(stage_counts.items())},
+            "active_by_stage_class": {
+                str(stage_id): {
+                    request_class: stage_class_counts[stage_id, request_class]
+                    for _, request_class in sorted(key for key in stage_class_counts if key[0] == stage_id)
+                }
+                for stage_id in sorted({stage_id for stage_id, _ in stage_class_counts})
+            },
             "active_by_path": dict(sorted(path_counts.items())),
             "active_by_class": dict(sorted(class_counts.items())),
             "queued_requests": len(self._pending),
             "queued_by_stage": {str(key): value for key, value in sorted(queued_stage_counts.items())},
+            "queued_by_stage_class": {
+                str(stage_id): {
+                    request_class: queued_stage_class_counts[stage_id, request_class]
+                    for _, request_class in sorted(key for key in queued_stage_class_counts if key[0] == stage_id)
+                }
+                for stage_id in sorted({stage_id for stage_id, _ in queued_stage_class_counts})
+            },
             "queued_by_class": dict(sorted(queued_class_counts.items())),
             "arrivals_by_class_total": dict(sorted(self._arrivals_by_class_total.items())),
             "blocked_by_limit": dict(sorted(blocked.items())),
