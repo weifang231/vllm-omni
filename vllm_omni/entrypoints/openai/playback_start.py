@@ -101,7 +101,7 @@ class PlaybackStartBuffer:
     """Hold ordered delivery items until the request's playback gate opens."""
 
     config: PlaybackStartConfig
-    clock: Callable[[], float] = time.perf_counter
+    clock: Callable[[], float] = time.monotonic
     _pending: list[Any] = field(default_factory=list)
     _buffered_audio_ms: float = 0.0
     _first_audio_ready_s: float | None = None
