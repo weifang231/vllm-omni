@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponseStreamChoice
@@ -93,6 +93,58 @@ def _raw_request(headers: dict[str, str] | None = None):
 def _payload(line: str) -> dict:
     assert line.startswith("data: ")
     return json.loads(line.removeprefix("data: ").strip())
+
+
+@pytest.mark.asyncio
+async def test_chat_admission_and_playback_share_ingress_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_omni.entrypoints.openai.serving_chat as serving_chat_module
+
+    monkeypatch.setenv("VLLM_OMNI_TRUST_SCHEDULING_HEADERS", "1")
+    monkeypatch.setattr(
+        serving_chat_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: 10.0, time=time.time),
+    )
+    engine_client = MagicMock()
+    engine_client.errored = False
+    engine_client.output_modalities = ["text", "audio"]
+    engine_client.stage_configs = []
+    engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object())
+    engine_client.generate = MagicMock(return_value=object())
+    serving_chat = build_serving_chat(
+        engine_client=engine_client,
+        models=SimpleNamespace(model_name=lambda _adapter: "test-model"),
+        online_renderer=SimpleNamespace(validate_chat_template=lambda **_kwargs: None),
+    )
+    serving_chat.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_omni_moe"))
+    serving_chat._check_model = AsyncMock(return_value=None)
+    serving_chat._maybe_get_adapters = MagicMock(return_value=None)
+    serving_chat._effective_chat_template_kwargs = MagicMock(return_value={})
+    serving_chat._preprocess_chat = AsyncMock(return_value=([], [{"prompt": "processed"}]))
+    serving_chat._base_request_id = MagicMock(return_value="test")
+    serving_chat._build_sampling_params_list_from_request = MagicMock(return_value=[MagicMock()])
+    serving_chat._log_inputs = MagicMock()
+    serving_chat.chat_completion_stream_generator = MagicMock(return_value="done")
+    raw_request = SimpleNamespace(
+        headers={
+            "x-vllm-omni-playback-buffer-ms": "300",
+            "x-vllm-omni-first-output-deadline-ms": "900",
+        },
+        state=SimpleNamespace(request_timestamp=time.time()),
+    )
+
+    result = await serving_chat._create_chat_completion(
+        make_request(modalities=["text", "audio"]),
+        raw_request,
+    )
+
+    assert result == "done"
+    scheduling_deadline = engine_client.generate.call_args.kwargs["first_output_deadline_monotonic_s"]
+    playback_config = serving_chat.chat_completion_stream_generator.call_args.kwargs["playback_start_config"]
+    assert scheduling_deadline == 10.9
+    assert playback_config.deadline_monotonic_s == scheduling_deadline
 
 
 def _stream(serving_chat, request, result_generator, raw_request, config):
@@ -256,7 +308,7 @@ async def test_chat_deadline_flushes_audio_without_cancelling_engine_pull() -> N
         raw_request,
         PlaybackStartConfig(
             target_ms=500.0,
-            deadline_monotonic_s=time.perf_counter() + 0.01,
+            deadline_monotonic_s=time.monotonic() + 0.01,
         ),
     )
     first_audio = _payload(await asyncio.wait_for(anext(stream), timeout=1.0))
@@ -352,7 +404,7 @@ async def test_chat_cancellation_discards_held_audio_and_closes_engine() -> None
         raw_request,
         PlaybackStartConfig(
             target_ms=500.0,
-            deadline_monotonic_s=time.perf_counter() + 60.0,
+            deadline_monotonic_s=time.monotonic() + 60.0,
         ),
     )
     delivery = asyncio.create_task(anext(stream))

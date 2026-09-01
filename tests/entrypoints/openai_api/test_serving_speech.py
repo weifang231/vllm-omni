@@ -3019,8 +3019,13 @@ class TestStreamingResponse:
         finalized_tts_params = {"_qwen3_tts_effective_max_tokens": [192]}
         captured: dict = {}
 
-        async def prepare(_request, request_id=None, raw_request=None):
-            del raw_request
+        async def prepare(
+            _request,
+            request_id=None,
+            raw_request=None,
+            deadline_anchor_monotonic_s=None,
+        ):
+            del raw_request, deadline_anchor_monotonic_s
             return request_id, object(), finalized_tts_params
 
         async def generate_chunks(
@@ -4754,7 +4759,7 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
 
-    def test_prepare_speech_generation_forwards_trusted_admission_correlation_id(
+    def test_prepare_speech_generation_forwards_trusted_scheduling_metadata(
         self,
         qwen3_tts_server,
         mocker: MockerFixture,
@@ -4767,18 +4772,24 @@ class TestTTSAsyncOffloading:
         )
         qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
         raw_request = SimpleNamespace(
-            headers={"x-vllm-omni-admission-correlation-id": "client-request-7"},
+            headers={
+                "x-vllm-omni-admission-correlation-id": "client-request-7",
+                "x-vllm-omni-first-output-deadline-ms": "900",
+            },
         )
 
         asyncio.run(
             qwen3_tts_server._prepare_speech_generation(
                 OpenAICreateSpeechRequest(input="hello"),
                 raw_request=raw_request,
+                deadline_anchor_monotonic_s=10.0,
             )
         )
 
         kwargs = qwen3_tts_server.engine_client.generate.call_args.kwargs
         assert kwargs["admission_correlation_id"] == "client-request-7"
+        assert kwargs["first_output_deadline_monotonic_s"] == 10.9
+        assert "first_output_deadline_s" not in kwargs
 
     def test_prepare_speech_generation_qwen3_default_seed_sets_tts_local_seed(
         self, qwen3_tts_server, mocker: MockerFixture
@@ -5268,7 +5279,7 @@ class TestTTSAsyncOffloading:
             raw_request=raw_request,
             playback_start_config=PlaybackStartConfig(
                 target_ms=500.0,
-                deadline_monotonic_s=time.perf_counter() + 0.01,
+                deadline_monotonic_s=time.monotonic() + 0.01,
             ),
         )
         first_chunk = await asyncio.wait_for(anext(stream), timeout=1.0)
@@ -5329,7 +5340,7 @@ class TestTTSAsyncOffloading:
             raw_request=raw_request,
             playback_start_config=PlaybackStartConfig(
                 target_ms=500.0,
-                deadline_monotonic_s=time.perf_counter() + 60.0,
+                deadline_monotonic_s=time.monotonic() + 60.0,
             ),
         )
         delivery = asyncio.create_task(anext(stream))
@@ -5386,6 +5397,8 @@ class TestTTSAsyncOffloading:
         assert config is not None
         assert config.target_ms == 300.0
         assert config.deadline_monotonic_s is not None
+        prepare_kwargs = qwen3_tts_server._prepare_speech_generation.await_args.kwargs
+        assert config.deadline_monotonic_s == pytest.approx(prepare_kwargs["deadline_anchor_monotonic_s"] + 0.9)
 
     @pytest.mark.asyncio
     async def test_create_speech_rejects_invalid_trusted_playback_target_before_dispatch(

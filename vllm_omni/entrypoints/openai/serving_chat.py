@@ -540,7 +540,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
-        request_start_s = time.perf_counter()
+        request_start_s = time.monotonic()
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
@@ -892,7 +892,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     output_modalities=output_modalities,
                     arrival_time=request_timestamp,
                     lora_request=lora_request,
-                    **scheduling_kwargs_from_headers(raw_request.headers if raw_request is not None else None),
+                    **scheduling_kwargs_from_headers(
+                        raw_request.headers if raw_request is not None else None,
+                        deadline_anchor_monotonic_s=request_start_s,
+                    ),
                 )
 
                 generators.append(generator)

@@ -3093,6 +3093,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str | None = None,
         has_inline_ref_audio: bool | None = None,
         raw_request: Request | None = None,
+        deadline_anchor_monotonic_s: float | None = None,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
@@ -3229,7 +3230,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id=request_id,
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
-            **scheduling_kwargs_from_headers(raw_request.headers if raw_request is not None else None),
+            **scheduling_kwargs_from_headers(
+                raw_request.headers if raw_request is not None else None,
+                deadline_anchor_monotonic_s=deadline_anchor_monotonic_s,
+            ),
         )
         self._track_ref_audio_artifact_warmup(
             request_id,
@@ -3282,6 +3286,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         has_inline_ref_audio: bool | None = None,
         collect: dict | None = None,
         raw_request: Request | None = None,
+        deadline_anchor_monotonic_s: float | None = None,
     ) -> tuple[bytes | str, str]:
         # ``usage_out`` is an opt-in output channel: when a list is passed, the
         # computed SpeechTokenUsage is appended to it. The return stays a
@@ -3293,6 +3298,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id=request_id,
             has_inline_ref_audio=has_inline_ref_audio,
             raw_request=raw_request,
+            deadline_anchor_monotonic_s=deadline_anchor_monotonic_s,
         )
         artifact_ready = False
 
@@ -3641,6 +3647,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         A trusted ingress may opt Qwen3-TTS into playback-start buffering; in that
         case the header and PCM remain server-side until the configured gate opens.
         """
+        request_start_s = time.perf_counter()
+        deadline_anchor_monotonic_s = time.monotonic()
         if request.voice is not None:
             if _is_default_voice(request.voice.lower(), self._get_available_speakers()):
                 request.voice = None
@@ -3654,7 +3662,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return error_check_ret
 
         request_id = f"speech-{random_uuid()}"
-        request_start_s = time.perf_counter()
         if raw_request:
             raw_request.state.request_metadata = RequestResponseMetadata(
                 request_id=request_id,
@@ -3682,7 +3689,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ):
                 playback_start_config = playback_start_config_from_headers(
                     raw_request.headers if raw_request is not None else None,
-                    request_start_s=request_start_s,
+                    request_start_s=deadline_anchor_monotonic_s,
                 )
 
             if request.is_raw_audio_stream():
@@ -3698,6 +3705,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request,
                     request_id=request_id,
                     raw_request=raw_request,
+                    deadline_anchor_monotonic_s=deadline_anchor_monotonic_s,
                 )
                 return StreamingResponse(
                     self._generate_audio_chunks(
@@ -3724,6 +3732,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request,
                     request_id=request_id,
                     raw_request=raw_request,
+                    deadline_anchor_monotonic_s=deadline_anchor_monotonic_s,
                 )
                 return StreamingResponse(
                     self._generate_audio_sse_events(
@@ -3748,6 +3757,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     usage_out=usage_box,
                     collect=collect,
                     raw_request=raw_request,
+                    deadline_anchor_monotonic_s=deadline_anchor_monotonic_s,
                 )
             except TTSGenerationError as error:
                 # An adapter can reject otherwise completed audio. Retry only
@@ -3774,6 +3784,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     usage_out=usage_box,
                     collect=collect,
                     raw_request=raw_request,
+                    deadline_anchor_monotonic_s=deadline_anchor_monotonic_s,
                 )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(

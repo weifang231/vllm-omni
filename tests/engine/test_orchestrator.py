@@ -1219,8 +1219,11 @@ async def test_runtime_admission_rechecks_expiry_before_dispatch(
     control_path.write_text(
         """{
           "queue_control": {
-            "enabled": false,
+            "enabled": true,
             "policy": "edf",
+            "stage_class_wip_limits": {
+              "0": {"interactive": 1}
+            },
             "admission": {
               "enabled": true,
               "classes": {

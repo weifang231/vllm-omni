@@ -58,6 +58,7 @@ def scheduling_kwargs_from_headers(
     headers: Mapping[str, str] | None,
     *,
     trusted: bool | None = None,
+    deadline_anchor_monotonic_s: float | None = None,
 ) -> dict[str, Any]:
     """Translate trusted HTTP headers into :meth:`AsyncOmni.generate` kwargs.
 
@@ -93,7 +94,13 @@ def scheduling_kwargs_from_headers(
             raise ValueError(f"{FIRST_OUTPUT_DEADLINE_MS_HEADER} must be a number") from exc
         if not math.isfinite(deadline_ms) or deadline_ms < 0:
             raise ValueError(f"{FIRST_OUTPUT_DEADLINE_MS_HEADER} must be finite and non-negative")
-        kwargs["first_output_deadline_s"] = deadline_ms / 1000.0
+        if deadline_anchor_monotonic_s is None:
+            kwargs["first_output_deadline_s"] = deadline_ms / 1000.0
+        else:
+            anchor = float(deadline_anchor_monotonic_s)
+            if not math.isfinite(anchor):
+                raise ValueError("deadline_anchor_monotonic_s must be finite")
+            kwargs["first_output_deadline_monotonic_s"] = anchor + deadline_ms / 1000.0
     if ADMISSION_CORRELATION_ID_HEADER in normalized_headers:
         kwargs["admission_correlation_id"] = _label(
             normalized_headers[ADMISSION_CORRELATION_ID_HEADER],
@@ -180,8 +187,8 @@ def _finite_float(value: Any, *, field_name: str, minimum: float | None = None) 
 class AdmissionClassConfig:
     """Calibrated Proposition-2 inputs for one request class.
 
-    ``effective_k`` is the active class concurrency limit, ``mu`` is the
-    fitted per-occupied-slot service rate at that limit, and
+    ``effective_k`` is the fitted shared-stage class concurrency, ``mu`` is
+    the fitted per-occupied-slot service rate at that concurrency, and
     ``service_samples_s`` are execution-start-to-valid-first-output samples.
     These are empirical model inputs, not a formal latency guarantee.
     """
@@ -222,7 +229,7 @@ class AdmissionControlConfig:
     """Opt-in ingress admission settings nested under ``queue_control``.
 
     ``enforce=False`` evaluates and records every configured-class decision
-    without rejecting requests or applying the admission concurrency gate.
+    without rejecting requests.
     """
 
     enabled: bool = False
@@ -384,6 +391,7 @@ class RequestSchedulingMetadata:
         path: str | None = None,
         default_path: str = "default",
         first_output_deadline_s: float | None = None,
+        first_output_deadline_monotonic_s: float | None = None,
         admission_correlation_id: str | None = None,
         now_monotonic_s: float | None = None,
     ) -> RequestSchedulingMetadata:
@@ -393,8 +401,14 @@ class RequestSchedulingMetadata:
             default=normalized_path,
             field_name="request_class",
         )
+        if first_output_deadline_s is not None and first_output_deadline_monotonic_s is not None:
+            raise ValueError("first_output_deadline_s and first_output_deadline_monotonic_s are mutually exclusive")
         deadline = None
-        if first_output_deadline_s is not None:
+        if first_output_deadline_monotonic_s is not None:
+            deadline = float(first_output_deadline_monotonic_s)
+            if not math.isfinite(deadline):
+                raise ValueError("first_output_deadline_monotonic_s must be finite")
+        elif first_output_deadline_s is not None:
             budget = float(first_output_deadline_s)
             if not math.isfinite(budget) or budget < 0:
                 raise ValueError("first_output_deadline_s must be finite and non-negative")
@@ -769,8 +783,11 @@ class RuntimeQueueController:
         class_counts = Counter(metadata.request_class for metadata in self._active_requests.values())
         return path_counts, class_counts
 
-    def _active_class_count(self, request_class: str) -> int:
-        return sum(metadata.request_class == request_class for metadata in self._active_requests.values())
+    def _active_stage_class_count(self, stage_id: int, request_class: str) -> int:
+        return sum(
+            active_stage_id == stage_id and active_class == request_class
+            for (_, active_stage_id), active_class in self._active_stage_classes.items()
+        )
 
     def _request_class(self, pending: PendingStageDispatch) -> str:
         metadata = self._active_requests.get(pending.logical_request_id, pending.metadata)
@@ -815,7 +832,14 @@ class RuntimeQueueController:
         if class_config is None:
             return None
 
-        active_count = self._active_class_count(pending.metadata.request_class)
+        # The admission surrogate models the shared-stage queue, so its active
+        # occupancy must use stage-0 leases rather than end-to-end live
+        # requests.  A request can remain active in downstream speech stages
+        # long after it releases the shared stage.
+        active_count = self._active_stage_class_count(
+            0,
+            pending.metadata.request_class,
+        )
         deadline = pending.metadata.deadline_monotonic_s
         remaining_budget_s = None if deadline is None else deadline - self._clock()
         if class_config.effective_k == 0:
@@ -1000,16 +1024,6 @@ class RuntimeQueueController:
                 class_limit = self.config.class_wip_limits.get(pending.metadata.request_class)
                 if class_limit is not None and class_counts[pending.metadata.request_class] >= class_limit:
                     reasons.append("class")
-            admission_class = self.config.admission.classes.get(pending.metadata.request_class)
-            if (
-                self.config.admission.enabled
-                and self.config.admission.enforce
-                and pending.starts_request
-                and pending.stage_id == 0
-                and admission_class is not None
-                and class_counts[pending.metadata.request_class] >= admission_class.effective_k
-            ):
-                reasons.append("admission_class")
         return tuple(reasons)
 
     def _order_key(self, pending: PendingStageDispatch) -> tuple[float, int]:

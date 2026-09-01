@@ -7,6 +7,10 @@ import asyncio
 
 import pytest
 
+from vllm_omni.engine.queue_control import (
+    RequestSchedulingMetadata,
+    scheduling_kwargs_from_headers,
+)
 from vllm_omni.entrypoints.openai.playback_start import (
     MAX_PLAYBACK_BUFFER_MS,
     PLAYBACK_DEADLINE_EVENT,
@@ -40,6 +44,31 @@ def test_deadline_without_target_does_not_enable_playback_buffer() -> None:
         trusted=True,
     )
     assert config is None
+
+
+def test_admission_and_playback_share_ingress_deadline_after_preprocessing() -> None:
+    headers = {
+        "x-vllm-omni-playback-buffer-ms": "300",
+        "x-vllm-omni-first-output-deadline-ms": "900",
+    }
+    playback = playback_start_config_from_headers(
+        headers,
+        request_start_s=10.0,
+        trusted=True,
+    )
+    scheduling = scheduling_kwargs_from_headers(
+        headers,
+        trusted=True,
+        deadline_anchor_monotonic_s=10.0,
+    )
+    metadata = RequestSchedulingMetadata.create(
+        **scheduling,
+        now_monotonic_s=10.6,
+    )
+
+    assert playback is not None
+    assert playback.deadline_monotonic_s == 10.9
+    assert metadata.deadline_monotonic_s == playback.deadline_monotonic_s
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", str(MAX_PLAYBACK_BUFFER_MS + 1)])

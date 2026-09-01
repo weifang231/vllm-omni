@@ -342,8 +342,19 @@ def test_request_metadata_builds_absolute_deadline() -> None:
     assert metadata.deadline_monotonic_s == pytest.approx(10.4)
     assert metadata.admission_correlation_id == "client-request-7"
 
+    anchored = RequestSchedulingMetadata.create(
+        first_output_deadline_monotonic_s=10.4,
+        now_monotonic_s=99.0,
+    )
+    assert anchored.deadline_monotonic_s == 10.4
+
     with pytest.raises(ValueError, match="non-negative"):
         RequestSchedulingMetadata.create(first_output_deadline_s=-0.1)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        RequestSchedulingMetadata.create(
+            first_output_deadline_s=0.4,
+            first_output_deadline_monotonic_s=10.4,
+        )
 
 
 def test_http_headers_require_explicit_trust(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,6 +371,15 @@ def test_http_headers_require_explicit_trust(monkeypatch: pytest.MonkeyPatch) ->
         "request_class": "interactive",
         "request_path": "audio",
         "first_output_deadline_s": 0.4,
+        "admission_correlation_id": "client-request-7",
+    }
+    assert scheduling_kwargs_from_headers(
+        headers,
+        deadline_anchor_monotonic_s=10.0,
+    ) == {
+        "request_class": "interactive",
+        "request_path": "audio",
+        "first_output_deadline_monotonic_s": 10.4,
         "admission_correlation_id": "client-request-7",
     }
 
@@ -1140,10 +1160,15 @@ def test_admission_rechecks_deadline_position_after_queue_change() -> None:
     assert snapshot["admission"]["decision_reason_counts"]["score_below_gamma"] == 1
 
 
-def test_admission_only_mode_does_not_dispatch_update_before_initial() -> None:
+def test_stage_zero_limit_does_not_dispatch_update_before_initial() -> None:
     controller = RuntimeQueueController(
         num_stages=1,
-        config=_admission_config(gamma=0.1),
+        config=QueueControlConfig(
+            enabled=True,
+            policy="edf",
+            stage_class_wip_limits={0: {"interactive": 1}},
+            admission=_admission_config(gamma=0.1).admission,
+        ),
         clock=lambda: 0.0,
     )
     controller.enqueue(_pending("running", request_class="interactive", deadline=100.0))
@@ -1163,6 +1188,80 @@ def test_admission_only_mode_does_not_dispatch_update_before_initial() -> None:
     controller.cancel_request("running")
     assert controller.pop_ready().pending.starts_request is True  # type: ignore[union-attr]
     assert controller.pop_ready().pending.starts_request is False  # type: ignore[union-attr]
+
+
+def test_admission_uses_shared_stage_occupancy_not_end_to_end_requests() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=_admission_config(
+            effective_k=1,
+            mu=1.0,
+            service_samples_s=(0.0,),
+            gamma=0.75,
+        ),
+        clock=lambda: 0.0,
+    )
+
+    first = controller.enqueue(_pending("first", request_class="interactive", deadline=100.0))
+    assert first is not None and first.admitted
+    assert controller.pop_ready() is not None
+    controller.acquire_immediate(
+        _pending(
+            "first",
+            stage_id=1,
+            starts_request=False,
+            request_class="interactive",
+            required_active_stage_id=0,
+        )
+    )
+    assert controller.release_stage("first", 0)
+    assert controller.snapshot()["active_requests"] == 1
+    assert controller.snapshot()["active_by_stage_class"] == {"1": {"interactive": 1}}
+
+    decision = controller.enqueue(_pending("second", request_class="interactive", deadline=0.1))
+    assert decision is not None
+    assert decision.admitted
+    assert decision.active_count == 0
+    assert decision.score == 1.0
+
+
+def test_admission_does_not_add_end_to_end_cap_beyond_stage_zero_credit() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            policy="edf",
+            stage_class_wip_limits={0: {"interactive": 1}},
+            admission=_admission_config(effective_k=1, gamma=0.1).admission,
+        ),
+        clock=lambda: 0.0,
+    )
+
+    controller.enqueue(_pending("first", request_class="interactive"))
+    assert controller.pop_ready().pending.request_id == "first"  # type: ignore[union-attr]
+    controller.acquire_immediate(
+        _pending(
+            "first",
+            stage_id=1,
+            starts_request=False,
+            request_class="interactive",
+            required_active_stage_id=0,
+        )
+    )
+    assert controller.release_stage("first", 0)
+
+    second = controller.enqueue(_pending("second", request_class="interactive"))
+    assert second is not None and second.admitted and second.active_count == 0
+    assert controller.pop_ready().pending.request_id == "second"  # type: ignore[union-attr]
+    assert controller.snapshot()["active_requests"] == 2
+
+    third = controller.enqueue(_pending("third", request_class="interactive"))
+    assert third is not None and third.admitted and third.active_count == 1
+    assert controller.pop_ready() is None
+    assert controller.snapshot()["blocked_by_limit"] == {"stage_class": 1}
+
+    assert controller.release_stage("second", 0)
+    assert controller.pop_ready().pending.request_id == "third"  # type: ignore[union-attr]
 
 
 def test_arrival_position_excludes_waiters_that_now_fail_recheck() -> None:
