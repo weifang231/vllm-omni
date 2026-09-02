@@ -22,6 +22,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.engine import orchestrator as orchestrator_module
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -3649,6 +3650,48 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
 
     assert pool.calls == [[output]]
     assert routed == [built_metrics]
+
+
+@pytest.mark.asyncio
+async def test_unknown_output_logging_is_bounded_and_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.request_states = {f"known-{index}": object() for index in range(20)}
+    orchestrator.stage_pools = [SimpleNamespace()]
+
+    warning_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def record_warning(message: str, *args: Any) -> None:
+        warning_calls.append((message, args))
+
+    monkeypatch.setattr(orchestrator_module.logger, "warning", record_warning)
+
+    await orchestrator._handle_processed_outputs(
+        0,
+        0,
+        [SimpleNamespace(request_id="unknown-0"), SimpleNamespace(request_id="unknown-1")],
+    )
+    assert orchestrator._unknown_request_last_log_at is not None
+    orchestrator._unknown_request_last_log_at -= orchestrator_module._UNKNOWN_REQUEST_LOG_INTERVAL_S
+    await orchestrator._handle_processed_outputs(0, 0, [SimpleNamespace(request_id="unknown-2")])
+
+    assert len(warning_calls) == 2
+    first_message, first_args = warning_calls[0]
+    assert "known req count" in first_message
+    assert "suppressed repeats" in first_message
+    assert first_args == (
+        "unknown-0",
+        0,
+        20,
+        ["known-0", "known-1", "known-2", "known-3", "known-4"],
+        0,
+    )
+    assert warning_calls[1][1] == (
+        "unknown-2",
+        0,
+        20,
+        ["known-0", "known-1", "known-2", "known-3", "known-4"],
+        1,
+    )
 
 
 def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:

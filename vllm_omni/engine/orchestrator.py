@@ -21,6 +21,7 @@ import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 import janus
@@ -92,6 +93,11 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 # How often the event-driven loop reconciles its reader-task set against
 # `available_replica_ids()` (elastic membership, replica eviction) while idle.
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
+
+# Unknown outputs can arrive in bursts after a request is aborted. Keep the
+# anomaly visible without logging the full active-request set for every output.
+_UNKNOWN_REQUEST_LOG_INTERVAL_S = 60.0
+_UNKNOWN_REQUEST_LOG_SAMPLE_SIZE = 5
 
 
 def _event_driven_orch_enabled() -> bool:
@@ -442,6 +448,8 @@ class Orchestrator:
     _queue_controller: RuntimeQueueController | None = None
     _queue_instrumentation: RuntimeInstrumentation | None = None
     _queue_control_draining = False
+    _unknown_request_last_log_at: float | None = None
+    _unknown_request_log_suppressed = 0
     duplex_control_plane: DuplexControlPlanePort | None = None
 
     def __init__(
@@ -520,6 +528,8 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._unknown_request_last_log_at = None
+        self._unknown_request_log_suppressed = 0
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -1887,18 +1897,34 @@ class Orchestrator:
                 cleanup.append(pending_get)
             await asyncio.gather(*cleanup, return_exceptions=True)
 
+    def _log_unknown_request_output(self, request_id: str, stage_id: int) -> None:
+        now = _time.monotonic()
+        last_log_at = self._unknown_request_last_log_at
+        if last_log_at is not None and now - last_log_at < _UNKNOWN_REQUEST_LOG_INTERVAL_S:
+            self._unknown_request_log_suppressed += 1
+            return
+
+        suppressed = self._unknown_request_log_suppressed
+        self._unknown_request_last_log_at = now
+        self._unknown_request_log_suppressed = 0
+        known_request_sample = list(islice(self.request_states, _UNKNOWN_REQUEST_LOG_SAMPLE_SIZE))
+        logger.warning(
+            "[Orchestrator] Dropping output for unknown req %s at stage-%s "
+            "(known req count: %d, sample: %s, suppressed repeats since last report: %d)",
+            request_id,
+            stage_id,
+            len(self.request_states),
+            known_request_sample,
+            suppressed,
+        )
+
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
         pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
             if req_state is None:
-                logger.warning(
-                    "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
-                    output.request_id,
-                    stage_id,
-                    list(self.request_states.keys()),
-                )
+                self._log_unknown_request_output(output.request_id, stage_id)
                 continue
 
             if getattr(output, "error", None) is not None:
