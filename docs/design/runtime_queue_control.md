@@ -119,11 +119,30 @@ type. A raw-audio stream cannot change its HTTP status after headers have been
 sent and therefore terminates with the exception instead. Admission requires
 `policy: "edf"`; operators should also use mutually consistent class/global
 limits so runtime ordering and available capacity match the fitted model.
-The runtime evaluates the empirical convolution with the vectorized regularized
-incomplete-gamma form of the Erlang CDF. A successful arrival scores only the
-new request at its conservative EDF insertion rank; a provisional rejection
-falls back to an exact sweep so expired predecessors cannot cause a false
-rejection. Full queue rechecks remain authoritative after queue/config changes.
+`score_method: "erlang_empirical"` evaluates the empirical convolution with
+the vectorized regularized incomplete-gamma form of the Erlang CDF. Production
+deployments can instead select `score_method: "erlang_empirical_threshold"`.
+That mode requires every class entry to carry `max_required_returns`, a complete
+`compiled_thresholds_s` array, `threshold_profile_fingerprint`, and
+`threshold_table_digest`. The runtime validates the artifact at configuration
+installation, including every threshold and its preceding floating-point value,
+then performs only a deadline-threshold lookup on the request path; it never
+falls back to empirical scoring. A required-return count outside the artifact
+is rejected as `threshold_table_exhausted`. The offline compiler uses a
+conservative numerical tie guard, so the lookup cannot newly admit a request
+inside the legacy scorer's scalar tie-break region. The fingerprints validate
+artifact integrity and bind it to the class/profile inputs. The trusted offline
+generation pipeline remains responsible for trace replay before publishing the
+control file.
+
+Both modes retain the same queue behavior. A successful arrival evaluates only
+the new request at its conservative EDF insertion rank; a provisional rejection
+triggers an authoritative EDF prefix sweep so expired predecessors cannot cause
+a false rejection. Full queue rechecks remain authoritative after queue/config
+changes.
+The lookup itself is constant time. The surrounding arrival path still scans
+the existing pending list to determine EDF rank, and rejection/recheck paths
+still perform their existing queue sweeps.
 
 `VLLM_OMNI_RUNTIME_METRICS_DIR` enables an atomic, bounded-cardinality JSON
 snapshot containing queue lengths, active leases, blocked reasons, dispatch

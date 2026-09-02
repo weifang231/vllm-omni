@@ -19,6 +19,8 @@ import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
+from types import MappingProxyType
 from typing import Any, Literal
 
 import numpy as np
@@ -26,10 +28,12 @@ from scipy.special import gammainc
 
 QueuePolicy = Literal["fifo", "edf"]
 DispatchCallable = Callable[[], Awaitable[bool]]
-AdmissionScoreMethod = Literal["erlang_empirical"]
+AdmissionScoreMethod = Literal["erlang_empirical", "erlang_empirical_threshold"]
 ADMISSION_DECISION_HISTORY_LIMIT = 128
 RECENT_STAGE_COMPLETION_HISTORY_LIMIT = 512
 ADMISSION_SCORE_REFERENCE_TOLERANCE = 1e-12
+ADMISSION_THRESHOLD_TABLE_SCHEMA_VERSION = 1
+DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS = 2048
 
 REQUEST_CLASS_HEADER = "x-vllm-omni-request-class"
 REQUEST_PATH_HEADER = "x-vllm-omni-request-path"
@@ -221,12 +225,73 @@ class AdmissionClassConfig:
     mu: float
     service_samples_s: tuple[float, ...]
     gamma: float
+    max_required_returns: int = DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS
+    compiled_thresholds_s: tuple[float, ...] | None = field(default=None, repr=False, compare=False)
+    threshold_profile_fingerprint: str | None = field(default=None, repr=False)
+    threshold_table_digest: str | None = field(default=None, repr=False)
     _service_samples_array: np.ndarray = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        samples = np.asarray(self.service_samples_s, dtype=np.float64)
+        if isinstance(self.effective_k, bool) or not isinstance(self.effective_k, int) or self.effective_k < 0:
+            raise ValueError("effective_k must be a non-negative integer")
+        normalized_mu = float(self.mu)
+        normalized_gamma = float(self.gamma)
+        if not math.isfinite(normalized_mu) or normalized_mu < 0.0:
+            raise ValueError("mu must be finite and non-negative")
+        if self.effective_k > 0 and normalized_mu <= 0.0:
+            raise ValueError("mu must be positive when effective_k is positive")
+        if not math.isfinite(normalized_gamma) or not 0.0 <= normalized_gamma <= 1.0:
+            raise ValueError("gamma must be finite and between 0 and 1")
+        object.__setattr__(self, "mu", normalized_mu)
+        object.__setattr__(self, "gamma", normalized_gamma)
+        if (
+            isinstance(self.max_required_returns, bool)
+            or not isinstance(self.max_required_returns, int)
+            or self.max_required_returns < 0
+        ):
+            raise ValueError("max_required_returns must be a non-negative integer")
+        normalized_samples = tuple(float(sample) for sample in self.service_samples_s)
+        if not normalized_samples or any(not math.isfinite(sample) or sample < 0.0 for sample in normalized_samples):
+            raise ValueError("service_samples_s must contain finite non-negative values")
+        object.__setattr__(self, "service_samples_s", normalized_samples)
+        samples = np.asarray(normalized_samples, dtype=np.float64)
         samples.setflags(write=False)
         object.__setattr__(self, "_service_samples_array", samples)
+        threshold_artifacts = (
+            self.compiled_thresholds_s,
+            self.threshold_profile_fingerprint,
+            self.threshold_table_digest,
+        )
+        if any(value is None for value in threshold_artifacts) and any(
+            value is not None for value in threshold_artifacts
+        ):
+            raise ValueError(
+                "compiled_thresholds_s, threshold_profile_fingerprint, and "
+                "threshold_table_digest must be provided together"
+            )
+        if self.compiled_thresholds_s is not None:
+            normalized_thresholds = tuple(float(threshold) for threshold in self.compiled_thresholds_s)
+            object.__setattr__(self, "compiled_thresholds_s", normalized_thresholds)
+            expected_entries = self.max_required_returns + 1
+            if len(normalized_thresholds) != expected_entries:
+                raise ValueError(f"compiled_thresholds_s must contain {expected_entries} entries")
+            previous = -math.inf
+            for index, parsed in enumerate(normalized_thresholds):
+                if not math.isfinite(parsed) or parsed < 0:
+                    raise ValueError(f"compiled_thresholds_s[{index}] must be finite and non-negative")
+                if parsed < previous:
+                    raise ValueError("compiled_thresholds_s must be non-decreasing")
+                previous = parsed
+            assert self.threshold_profile_fingerprint is not None
+            _validated_sha256(
+                self.threshold_profile_fingerprint,
+                field_name="threshold_profile_fingerprint",
+            )
+            assert self.threshold_table_digest is not None
+            _validated_sha256(
+                self.threshold_table_digest,
+                field_name="threshold_table_digest",
+            )
 
     @property
     def service_samples_array(self) -> np.ndarray:
@@ -252,12 +317,83 @@ class AdmissionClassConfig:
         gamma = _finite_float(raw.get("gamma"), field_name=f"{field_name}.gamma", minimum=0.0)
         if gamma > 1.0:
             raise ValueError(f"{field_name}.gamma must be at most 1")
+        max_required_returns = _optional_limit(
+            raw.get("max_required_returns", DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS),
+            field_name=f"{field_name}.max_required_returns",
+        )
+        assert max_required_returns is not None
+        raw_thresholds = raw.get("compiled_thresholds_s")
+        raw_threshold_fingerprint = raw.get("threshold_profile_fingerprint")
+        raw_threshold_table_digest = raw.get("threshold_table_digest")
+        threshold_artifacts = (
+            raw_thresholds,
+            raw_threshold_fingerprint,
+            raw_threshold_table_digest,
+        )
+        if any(value is None for value in threshold_artifacts) and any(
+            value is not None for value in threshold_artifacts
+        ):
+            raise ValueError(
+                f"{field_name}.compiled_thresholds_s, "
+                f"{field_name}.threshold_profile_fingerprint, and "
+                f"{field_name}.threshold_table_digest must be provided together"
+            )
+        compiled_thresholds_s = None
+        threshold_profile_fingerprint = None
+        threshold_table_digest = None
+        if raw_thresholds is not None:
+            if not isinstance(raw_thresholds, (list, tuple)):
+                raise ValueError(f"{field_name}.compiled_thresholds_s must be a JSON array")
+            compiled_thresholds_s = tuple(
+                _finite_float(
+                    threshold,
+                    field_name=f"{field_name}.compiled_thresholds_s[{index}]",
+                    minimum=0.0,
+                )
+                for index, threshold in enumerate(raw_thresholds)
+            )
+            threshold_profile_fingerprint = _validated_sha256(
+                raw_threshold_fingerprint,
+                field_name=f"{field_name}.threshold_profile_fingerprint",
+            )
+            threshold_table_digest = _validated_sha256(
+                raw_threshold_table_digest,
+                field_name=f"{field_name}.threshold_table_digest",
+            )
         return cls(
             effective_k=effective_k,
             mu=mu,
             service_samples_s=samples,
             gamma=gamma,
+            max_required_returns=max_required_returns,
+            compiled_thresholds_s=compiled_thresholds_s,
+            threshold_profile_fingerprint=threshold_profile_fingerprint,
+            threshold_table_digest=threshold_table_digest,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionThresholdTable:
+    """One immutable deadline-threshold table installed for a request class."""
+
+    request_class: str
+    profile_fingerprint: str
+    table_digest: str
+    thresholds_s: tuple[float, ...]
+
+    @property
+    def max_required_returns(self) -> int:
+        return len(self.thresholds_s) - 1
+
+    def to_config_fields(self) -> dict[str, Any]:
+        """Return fields to merge into one admission-class control object."""
+
+        return {
+            "max_required_returns": self.max_required_returns,
+            "compiled_thresholds_s": list(self.thresholds_s),
+            "threshold_profile_fingerprint": self.profile_fingerprint,
+            "threshold_table_digest": self.table_digest,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +408,73 @@ class AdmissionControlConfig:
     score_method: AdmissionScoreMethod = "erlang_empirical"
     classes: dict[str, AdmissionClassConfig] = field(default_factory=dict)
     enforce: bool = True
+    _threshold_tables: Mapping[str, AdmissionThresholdTable] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.score_method not in {"erlang_empirical", "erlang_empirical_threshold"}:
+            raise ValueError("score_method must be 'erlang_empirical' or 'erlang_empirical_threshold'")
+        if self.enabled and not self.classes:
+            raise ValueError("admission classes must not be empty when admission is enabled")
+        tables: dict[str, AdmissionThresholdTable] = {}
+        if self.score_method == "erlang_empirical_threshold":
+            for request_class, class_config in self.classes.items():
+                if class_config.gamma + ADMISSION_SCORE_REFERENCE_TOLERANCE >= 1.0:
+                    raise ValueError(
+                        "gamma plus the numerical tie guard must be less than 1 for "
+                        "score_method='erlang_empirical_threshold'"
+                    )
+                if class_config.compiled_thresholds_s is None:
+                    raise ValueError("compiled_thresholds_s is required for score_method='erlang_empirical_threshold'")
+                profile_fingerprint = admission_threshold_profile_fingerprint(
+                    request_class,
+                    effective_k=class_config.effective_k,
+                    mu=class_config.mu,
+                    service_samples_s=class_config.service_samples_s,
+                    gamma=class_config.gamma,
+                    max_required_returns=class_config.max_required_returns,
+                )
+                if class_config.threshold_profile_fingerprint != profile_fingerprint:
+                    raise ValueError(
+                        f"compiled admission threshold profile fingerprint does not match class {request_class!r}"
+                    )
+                thresholds_s = class_config.compiled_thresholds_s
+                table_digest = admission_threshold_table_digest(
+                    profile_fingerprint=profile_fingerprint,
+                    thresholds_s=thresholds_s,
+                )
+                if class_config.threshold_table_digest != table_digest:
+                    raise ValueError(
+                        f"compiled admission threshold table digest does not match class {request_class!r}"
+                    )
+                validate_erlang_empirical_admission_threshold_table(
+                    request_class=request_class,
+                    effective_k=class_config.effective_k,
+                    mu=class_config.mu,
+                    service_samples_s=class_config.service_samples_s,
+                    gamma=class_config.gamma,
+                    profile_fingerprint=profile_fingerprint,
+                    table_digest=table_digest,
+                    thresholds_s=thresholds_s,
+                )
+                tables[request_class] = AdmissionThresholdTable(
+                    request_class=request_class,
+                    profile_fingerprint=profile_fingerprint,
+                    table_digest=table_digest,
+                    thresholds_s=thresholds_s,
+                )
+        elif any(class_config.compiled_thresholds_s is not None for class_config in self.classes.values()):
+            raise ValueError("compiled admission thresholds require score_method='erlang_empirical_threshold'")
+        object.__setattr__(self, "_threshold_tables", MappingProxyType(tables))
+
+    @property
+    def threshold_tables(self) -> Mapping[str, AdmissionThresholdTable]:
+        """Return the validated class-keyed tables used by the hot path."""
+
+        return self._threshold_tables
 
     @classmethod
     def from_mapping(cls, raw: Any) -> AdmissionControlConfig:
@@ -286,8 +489,10 @@ class AdmissionControlConfig:
         if not isinstance(enforce, bool):
             raise ValueError("queue_control.admission.enforce must be boolean")
         score_method = str(raw.get("score_method", "erlang_empirical")).strip().lower()
-        if score_method != "erlang_empirical":
-            raise ValueError("queue_control.admission.score_method must be 'erlang_empirical'")
+        if score_method not in {"erlang_empirical", "erlang_empirical_threshold"}:
+            raise ValueError(
+                "queue_control.admission.score_method must be 'erlang_empirical' or 'erlang_empirical_threshold'"
+            )
         raw_classes = raw.get("classes", {})
         if not isinstance(raw_classes, Mapping):
             raise ValueError("queue_control.admission.classes must be a JSON object")
@@ -401,12 +606,69 @@ def erlang_empirical_admission_score(
     if samples.size == 0:
         raise ValueError("service_samples_s must not be empty")
     required_returns = max(active_count + queue_position - effective_k + 1, 0)
-    if required_returns <= 0:
-        # Even with no queue wait, the sampled service time must fit inside the
-        # remaining first-output budget.  This matches erlang_wait_cdf's
-        # intentional negative-budget check before its zero-return shortcut.
-        return float(np.mean(samples <= remaining_budget_s))
+    return _erlang_empirical_score_for_required_returns(
+        remaining_budget_s,
+        effective_k=effective_k,
+        mu=mu,
+        required_returns=required_returns,
+        samples=samples,
+    )
 
+
+def admission_threshold_profile_fingerprint(
+    request_class: str,
+    *,
+    effective_k: int,
+    mu: float,
+    service_samples_s: tuple[float, ...] | np.ndarray,
+    gamma: float,
+    max_required_returns: int,
+) -> str:
+    """Fingerprint every input that determines one class threshold table."""
+
+    return _sha256_fingerprint(
+        {
+            "schema_version": ADMISSION_THRESHOLD_TABLE_SCHEMA_VERSION,
+            "request_class": request_class,
+            "score_method": "erlang_empirical_threshold",
+            "effective_k": int(effective_k),
+            "mu": float(mu),
+            "service_samples_s": [float(sample) for sample in service_samples_s],
+            "gamma": float(gamma),
+            "max_required_returns": int(max_required_returns),
+            "numerical_tie_guard": ADMISSION_SCORE_REFERENCE_TOLERANCE,
+        }
+    )
+
+
+def admission_threshold_table_digest(
+    *,
+    profile_fingerprint: str,
+    thresholds_s: tuple[float, ...] | list[float] | np.ndarray,
+) -> str:
+    """Digest a compiled table without embedding it in runtime snapshots."""
+
+    return _sha256_fingerprint(
+        {
+            "schema_version": ADMISSION_THRESHOLD_TABLE_SCHEMA_VERSION,
+            "profile_fingerprint": profile_fingerprint,
+            # Hexadecimal strings make the digest independent of JSON float
+            # formatting while preserving every binary64 threshold bit.
+            "thresholds_hex": [float(threshold).hex() for threshold in thresholds_s],
+        }
+    )
+
+
+def _erlang_empirical_score_for_required_returns(
+    remaining_budget_s: float,
+    *,
+    effective_k: int,
+    mu: float,
+    required_returns: int,
+    samples: np.ndarray,
+) -> float:
+    if required_returns <= 0:
+        return float(np.mean(samples <= remaining_budget_s))
     wait_budgets = remaining_budget_s - samples
     positive = wait_budgets > 0.0
     if not np.any(positive):
@@ -417,6 +679,259 @@ def erlang_empirical_admission_score(
         effective_k * mu * wait_budgets[positive],
     )
     return float(np.mean(probabilities))
+
+
+@lru_cache(maxsize=128)
+def _compile_erlang_empirical_admission_thresholds_cached(
+    effective_k: int,
+    mu: float,
+    service_samples_s: tuple[float, ...],
+    gamma: float,
+    max_required_returns: int,
+) -> tuple[float, ...]:
+    if max_required_returns < 0:
+        raise ValueError("max_required_returns must be non-negative")
+    if not (0.0 <= gamma and gamma + ADMISSION_SCORE_REFERENCE_TOLERANCE < 1.0):
+        raise ValueError("gamma must be non-negative and gamma plus the numerical tie guard must be less than 1")
+    samples = np.asarray(service_samples_s, dtype=np.float64)
+    if samples.size == 0:
+        raise ValueError("service_samples_s must not be empty")
+    if np.any(~np.isfinite(samples)) or np.any(samples < 0.0):
+        raise ValueError("service_samples_s must contain finite non-negative values")
+
+    # A zero-capacity class is rejected before lookup.  The finite placeholder
+    # table keeps its artifact JSON portable and is never consulted online.
+    if effective_k <= 0 or mu <= 0.0:
+        return (0.0,) * (max_required_returns + 1)
+    if gamma == 0.0:
+        return (0.0,) * (max_required_returns + 1)
+
+    sorted_samples = np.sort(samples)
+    required_sample_count = 1
+    while required_sample_count / len(sorted_samples) < gamma:
+        required_sample_count += 1
+    thresholds = [float(sorted_samples[required_sample_count - 1])]
+    rate = effective_k * mu
+    maximum_sample = float(sorted_samples[-1])
+    guarded_gamma = gamma + ADMISSION_SCORE_REFERENCE_TOLERANCE
+    for required_returns in range(1, max_required_returns + 1):
+        low = 0.0
+        high = max(maximum_sample + required_returns / rate + 1.0, 1.0)
+        if not math.isfinite(high):
+            raise ValueError(
+                f"admission profile has no representable finite threshold at required_returns={required_returns}"
+            )
+        while (
+            _erlang_empirical_score_for_required_returns(
+                high,
+                effective_k=effective_k,
+                mu=mu,
+                required_returns=required_returns,
+                samples=samples,
+            )
+            <= guarded_gamma
+        ):
+            high *= 2.0
+            if not math.isfinite(high):
+                raise ValueError("could not find a finite admission threshold")
+
+        # Maintain score(low) <= guarded_gamma < score(high). Stop only when no
+        # representable float lies between the endpoints, making high a
+        # conservative lookup boundary outside the legacy scalar tie band.
+        while True:
+            midpoint = low + (high - low) / 2.0
+            if midpoint == low or midpoint == high:
+                break
+            score = _erlang_empirical_score_for_required_returns(
+                midpoint,
+                effective_k=effective_k,
+                mu=mu,
+                required_returns=required_returns,
+                samples=samples,
+            )
+            if score > guarded_gamma:
+                high = midpoint
+            else:
+                low = midpoint
+        thresholds.append(high)
+    return tuple(thresholds)
+
+
+def compile_erlang_empirical_admission_thresholds(
+    *,
+    effective_k: int,
+    mu: float,
+    service_samples_s: tuple[float, ...] | np.ndarray,
+    gamma: float,
+    max_required_returns: int = DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS,
+) -> tuple[float, ...]:
+    """Compile the empirical-Erlang predicate into deadline thresholds.
+
+    Entry ``m`` is the minimum representable remaining budget accepted by the
+    vectorized mathematical score for ``m`` required shared-stage returns.
+    The scalar implementation remains an independent offline replay oracle for
+    numerical-boundary validation; it is never called by threshold mode.
+    """
+
+    if isinstance(effective_k, bool) or not isinstance(effective_k, int) or effective_k < 0:
+        raise ValueError("effective_k must be a non-negative integer")
+    parsed_mu = _finite_float(mu, field_name="mu", minimum=0.0)
+    if effective_k > 0 and parsed_mu <= 0.0:
+        raise ValueError("mu must be positive when effective_k is positive")
+    parsed_gamma = _finite_float(gamma, field_name="gamma", minimum=0.0)
+    if parsed_gamma + ADMISSION_SCORE_REFERENCE_TOLERANCE >= 1.0:
+        raise ValueError("gamma plus the numerical tie guard must be less than 1")
+    if isinstance(max_required_returns, bool) or not isinstance(max_required_returns, int) or max_required_returns < 0:
+        raise ValueError("max_required_returns must be a non-negative integer")
+    return _compile_erlang_empirical_admission_thresholds_cached(
+        effective_k,
+        parsed_mu,
+        tuple(float(sample) for sample in service_samples_s),
+        parsed_gamma,
+        max_required_returns,
+    )
+
+
+def compile_erlang_empirical_admission_threshold_table(
+    request_class: str,
+    *,
+    effective_k: int,
+    mu: float,
+    service_samples_s: tuple[float, ...] | np.ndarray,
+    gamma: float,
+    max_required_returns: int = DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS,
+) -> AdmissionThresholdTable:
+    """Build a complete, self-identifying artifact for offline control generation."""
+
+    normalized_class = _label(
+        request_class,
+        default="default",
+        field_name="request_class",
+    )
+    normalized_samples = tuple(float(sample) for sample in service_samples_s)
+    normalized_mu = _finite_float(mu, field_name="mu", minimum=0.0)
+    normalized_gamma = _finite_float(gamma, field_name="gamma", minimum=0.0)
+    profile_fingerprint = admission_threshold_profile_fingerprint(
+        normalized_class,
+        effective_k=effective_k,
+        mu=normalized_mu,
+        service_samples_s=normalized_samples,
+        gamma=normalized_gamma,
+        max_required_returns=max_required_returns,
+    )
+    thresholds_s = compile_erlang_empirical_admission_thresholds(
+        effective_k=effective_k,
+        mu=normalized_mu,
+        service_samples_s=normalized_samples,
+        gamma=normalized_gamma,
+        max_required_returns=max_required_returns,
+    )
+    return AdmissionThresholdTable(
+        request_class=normalized_class,
+        profile_fingerprint=profile_fingerprint,
+        table_digest=admission_threshold_table_digest(
+            profile_fingerprint=profile_fingerprint,
+            thresholds_s=thresholds_s,
+        ),
+        thresholds_s=thresholds_s,
+    )
+
+
+@lru_cache(maxsize=128)
+def _validate_erlang_empirical_admission_threshold_table_cached(
+    request_class: str,
+    effective_k: int,
+    mu: float,
+    service_samples_s: tuple[float, ...],
+    gamma: float,
+    profile_fingerprint: str,
+    table_digest: str,
+    thresholds_s: tuple[float, ...],
+) -> None:
+    del request_class, profile_fingerprint, table_digest
+    if effective_k <= 0 or mu <= 0.0:
+        if any(threshold != 0.0 for threshold in thresholds_s):
+            raise ValueError("zero-capacity admission threshold table must contain only zero placeholders")
+        return
+    if gamma == 0.0:
+        if any(threshold != 0.0 for threshold in thresholds_s):
+            raise ValueError("zero-gamma admission threshold table must contain only zero thresholds")
+        return
+
+    samples = np.asarray(service_samples_s, dtype=np.float64)
+    guarded_gamma = gamma + ADMISSION_SCORE_REFERENCE_TOLERANCE
+    for required_returns, threshold in enumerate(thresholds_s):
+        score_at_threshold = _erlang_empirical_score_for_required_returns(
+            threshold,
+            effective_k=effective_k,
+            mu=mu,
+            required_returns=required_returns,
+            samples=samples,
+        )
+        target = gamma if required_returns == 0 else guarded_gamma
+        passes = score_at_threshold >= target if required_returns == 0 else score_at_threshold > target
+        if not passes:
+            raise ValueError(
+                f"compiled admission threshold does not pass its predicate at required_returns={required_returns}"
+            )
+        if threshold == 0.0:
+            continue
+        score_before_threshold = _erlang_empirical_score_for_required_returns(
+            math.nextafter(threshold, -math.inf),
+            effective_k=effective_k,
+            mu=mu,
+            required_returns=required_returns,
+            samples=samples,
+        )
+        previous_passes = score_before_threshold >= target if required_returns == 0 else score_before_threshold > target
+        if previous_passes:
+            raise ValueError(
+                "compiled admission threshold is not the minimum representable boundary "
+                f"at required_returns={required_returns}"
+            )
+
+
+def validate_erlang_empirical_admission_threshold_table(
+    *,
+    request_class: str,
+    effective_k: int,
+    mu: float,
+    service_samples_s: tuple[float, ...] | np.ndarray,
+    gamma: float,
+    profile_fingerprint: str,
+    table_digest: str,
+    thresholds_s: tuple[float, ...] | list[float] | np.ndarray,
+) -> None:
+    """Validate every compiled threshold boundary before runtime installation."""
+
+    normalized_samples = tuple(float(sample) for sample in service_samples_s)
+    normalized_thresholds = tuple(float(threshold) for threshold in thresholds_s)
+    expected_profile_fingerprint = admission_threshold_profile_fingerprint(
+        request_class,
+        effective_k=effective_k,
+        mu=mu,
+        service_samples_s=normalized_samples,
+        gamma=gamma,
+        max_required_returns=len(normalized_thresholds) - 1,
+    )
+    if profile_fingerprint != expected_profile_fingerprint:
+        raise ValueError("compiled admission threshold profile fingerprint does not match inputs")
+    expected_table_digest = admission_threshold_table_digest(
+        profile_fingerprint=profile_fingerprint,
+        thresholds_s=normalized_thresholds,
+    )
+    if table_digest != expected_table_digest:
+        raise ValueError("compiled admission threshold table digest does not match payload")
+    _validate_erlang_empirical_admission_threshold_table_cached(
+        request_class,
+        effective_k,
+        mu,
+        normalized_samples,
+        gamma,
+        profile_fingerprint,
+        table_digest,
+        normalized_thresholds,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,6 +1145,17 @@ class QueueControlConfig:
                         "mu": class_config.mu,
                         "service_samples_s": list(class_config.service_samples_s),
                         "gamma": class_config.gamma,
+                        **(
+                            {
+                                "max_required_returns": class_config.max_required_returns,
+                                "threshold_profile_fingerprint": self.admission.threshold_tables[
+                                    request_class
+                                ].profile_fingerprint,
+                                "threshold_table_digest": self.admission.threshold_tables[request_class].table_digest,
+                            }
+                            if self.admission.score_method == "erlang_empirical_threshold"
+                            else {}
+                        ),
                     }
                     for request_class, class_config in sorted(self.admission.classes.items())
                 },
@@ -768,6 +1294,11 @@ class AdmissionDecision:
     active_count: int
     queue_position: int
     remaining_budget_s: float | None
+    required_returns: int | None = None
+    threshold_s: float | None = None
+    threshold_slack_s: float | None = None
+    score_method: AdmissionScoreMethod | None = None
+    threshold_table_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1015,6 +1546,14 @@ class RuntimeQueueController:
         deadline = pending.metadata.deadline_monotonic_s
         now = self._clock() if now_monotonic_s is None else now_monotonic_s
         remaining_budget_s = None if deadline is None else deadline - now
+        required_returns = None
+        threshold_s = None
+        threshold_slack_s = None
+        threshold_table_digest = (
+            admission.threshold_tables[pending.metadata.request_class].table_digest
+            if admission.score_method == "erlang_empirical_threshold"
+            else None
+        )
         if class_config.effective_k == 0:
             score = 0.0
             reason = "zero_effective_k"
@@ -1033,29 +1572,54 @@ class RuntimeQueueController:
             would_admit = False
         else:
             assert remaining_budget_s is not None
-            score = erlang_empirical_admission_score(
-                remaining_budget_s,
-                effective_k=class_config.effective_k,
-                mu=class_config.mu,
-                active_count=active_count,
-                queue_position=queue_position,
-                service_samples_s=class_config.service_samples_array,
+            required_returns = max(
+                active_count + queue_position - class_config.effective_k + 1,
+                0,
             )
-            # The vectorized and scalar forms are mathematically identical but
-            # can differ by a few ulps.  Resolve only threshold-near cases with
-            # the slow scalar oracle so admission never flips due to numerical
-            # implementation details.
-            if abs(score - class_config.gamma) <= ADMISSION_SCORE_REFERENCE_TOLERANCE:
-                score = erlang_empirical_admission_score_reference(
+            if admission.score_method == "erlang_empirical":
+                score = erlang_empirical_admission_score(
                     remaining_budget_s,
                     effective_k=class_config.effective_k,
                     mu=class_config.mu,
                     active_count=active_count,
                     queue_position=queue_position,
-                    service_samples_s=class_config.service_samples_s,
+                    service_samples_s=class_config.service_samples_array,
                 )
-            would_admit = score >= class_config.gamma
-            reason = "score_pass" if would_admit else "score_below_gamma"
+                # Preserve the b773 predicate exactly in legacy mode.  The
+                # compiled-threshold mode performs no online score fallback.
+                if abs(score - class_config.gamma) <= ADMISSION_SCORE_REFERENCE_TOLERANCE:
+                    score = erlang_empirical_admission_score_reference(
+                        remaining_budget_s,
+                        effective_k=class_config.effective_k,
+                        mu=class_config.mu,
+                        active_count=active_count,
+                        queue_position=queue_position,
+                        service_samples_s=class_config.service_samples_s,
+                    )
+                would_admit = score >= class_config.gamma
+                reason = "score_pass" if would_admit else "score_below_gamma"
+            else:
+                threshold_table = admission.threshold_tables[pending.metadata.request_class]
+                score = None
+                if class_config.gamma == 0.0:
+                    # The authoritative score is always at least zero, so the
+                    # zero-threshold policy admits every non-expired request
+                    # regardless of queue depth.
+                    threshold_s = 0.0
+                    threshold_slack_s = remaining_budget_s
+                    would_admit = True
+                    reason = "score_pass"
+                elif required_returns > threshold_table.max_required_returns:
+                    # The installed table defines the maximum modeled queue
+                    # depth. Exceeding it is an explicit fail-closed queue-full
+                    # condition; the hot path never invokes the legacy scorer.
+                    would_admit = False
+                    reason = "threshold_table_exhausted"
+                else:
+                    threshold_s = threshold_table.thresholds_s[required_returns]
+                    would_admit = remaining_budget_s >= threshold_s
+                    threshold_slack_s = remaining_budget_s - threshold_s
+                    reason = "score_pass" if would_admit else "score_below_gamma"
         return AdmissionDecision(
             admitted=would_admit or not admission.enforce,
             would_admit=would_admit,
@@ -1072,6 +1636,11 @@ class RuntimeQueueController:
             active_count=active_count,
             queue_position=queue_position,
             remaining_budget_s=remaining_budget_s,
+            required_returns=required_returns,
+            threshold_s=threshold_s,
+            threshold_slack_s=threshold_slack_s,
+            score_method=admission.score_method,
+            threshold_table_digest=threshold_table_digest,
         )
 
     def _evaluate_arrival_admission(self, pending: PendingStageDispatch) -> AdmissionDecision | None:
@@ -1161,6 +1730,11 @@ class RuntimeQueueController:
                 "active_count": decision.active_count,
                 "queue_position": decision.queue_position,
                 "remaining_budget_s": decision.remaining_budget_s,
+                "required_returns": decision.required_returns,
+                "threshold_s": decision.threshold_s,
+                "threshold_slack_s": decision.threshold_slack_s,
+                "score_method": decision.score_method,
+                "threshold_table_digest": decision.threshold_table_digest,
             }
         )
 
@@ -1514,6 +2088,22 @@ class RuntimeQueueController:
                         "mu": class_config.mu,
                         "gamma": class_config.gamma,
                         "service_sample_count": len(class_config.service_samples_s),
+                        **(
+                            {
+                                "max_required_returns": class_config.max_required_returns,
+                                "threshold_entry_count": len(
+                                    self.config.admission.threshold_tables[request_class].thresholds_s
+                                ),
+                                "threshold_profile_fingerprint": self.config.admission.threshold_tables[
+                                    request_class
+                                ].profile_fingerprint,
+                                "threshold_table_digest": self.config.admission.threshold_tables[
+                                    request_class
+                                ].table_digest,
+                            }
+                            if self.config.admission.score_method == "erlang_empirical_threshold"
+                            else {}
+                        ),
                     }
                     for request_class, class_config in sorted(self.config.admission.classes.items())
                 },

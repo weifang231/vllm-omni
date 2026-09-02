@@ -40,7 +40,13 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.queue_control import PendingStageDispatch, QueueControlConfig, RequestSchedulingMetadata
+from vllm_omni.engine.queue_control import (
+    PendingStageDispatch,
+    QueueControlConfig,
+    RequestSchedulingMetadata,
+    admission_threshold_table_digest,
+    compile_erlang_empirical_admission_threshold_table,
+)
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
@@ -979,6 +985,111 @@ async def test_mm_cache_miss_retries_abort_without_losing_internal_id_mapping(
         assert fixture.thread.is_alive()
     finally:
         await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_runtime_queue_control_reuses_parsed_unchanged_document(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps({"queue_control": {"enabled": True, "global_wip_limit": 4}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    fixture = orchestrator_factory([FakeStageClient(final_output=True)])
+
+    calls = 0
+    original = QueueControlConfig.from_document.__func__
+
+    def counted_from_document(cls, document, *, num_stages=None):
+        nonlocal calls
+        calls += 1
+        return original(cls, document, num_stages=num_stages)
+
+    monkeypatch.setattr(
+        QueueControlConfig,
+        "from_document",
+        classmethod(counted_from_document),
+    )
+    assert not fixture.orchestrator._refresh_queue_control()
+    assert not fixture.orchestrator._refresh_queue_control()
+    assert calls == 0
+
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(
+        json.dumps({"queue_control": {"enabled": True, "global_wip_limit": 3}}),
+        encoding="utf-8",
+    )
+    replacement.replace(control_path)
+    assert fixture.orchestrator._refresh_queue_control()
+    assert calls == 1
+
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_runtime_queue_control_retains_valid_threshold_config_after_invalid_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    table = compile_erlang_empirical_admission_threshold_table(
+        "interactive",
+        effective_k=1,
+        mu=1.0,
+        service_samples_s=(0.1, 0.2),
+        gamma=0.8,
+        max_required_returns=2,
+    )
+
+    def document(thresholds, digest):
+        return {
+            "queue_control": {
+                "policy": "edf",
+                "admission": {
+                    "enabled": True,
+                    "score_method": "erlang_empirical_threshold",
+                    "classes": {
+                        "interactive": {
+                            "effective_k": 1,
+                            "mu": 1.0,
+                            "service_samples_s": [0.1, 0.2],
+                            "gamma": 0.8,
+                            "max_required_returns": 2,
+                            "compiled_thresholds_s": list(thresholds),
+                            "threshold_profile_fingerprint": table.profile_fingerprint,
+                            "threshold_table_digest": digest,
+                        }
+                    },
+                },
+            }
+        }
+
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(json.dumps(document(table.thresholds_s, table.table_digest)), encoding="utf-8")
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    fixture = orchestrator_factory([FakeStageClient(final_output=True)])
+    controller = fixture.orchestrator._queue_controller
+    assert controller is not None
+    initial_fingerprint = controller.config.fingerprint()
+
+    forged_thresholds = (0.0, 0.0, 0.0)
+    forged_digest = admission_threshold_table_digest(
+        profile_fingerprint=table.profile_fingerprint,
+        thresholds_s=forged_thresholds,
+    )
+    replacement = tmp_path / "invalid-thresholds.json"
+    replacement.write_text(json.dumps(document(forged_thresholds, forged_digest)), encoding="utf-8")
+    replacement.replace(control_path)
+    assert not fixture.orchestrator._refresh_queue_control()
+    assert controller.config.fingerprint() == initial_fingerprint
+    assert controller.config_generation == 0
+    assert not fixture.orchestrator._refresh_queue_control()
+
+    await _shutdown_orchestrator(fixture)
 
 
 @pytest.mark.asyncio

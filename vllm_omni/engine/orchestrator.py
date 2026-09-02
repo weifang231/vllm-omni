@@ -476,9 +476,11 @@ class Orchestrator:
             component="queue-controller",
             stage_id="pipeline",
         )
+        initial_queue_document = self._queue_instrumentation.read_control()
+        initial_queue_config_valid = True
         try:
             initial_queue_config = QueueControlConfig.from_document(
-                self._queue_instrumentation.read_control(),
+                initial_queue_document,
                 num_stages=self.num_stages,
             )
             if initial_queue_config.online_allocator is not None:
@@ -489,6 +491,9 @@ class Orchestrator:
         except ValueError as exc:
             logger.warning("[Orchestrator] Ignoring invalid initial queue-control config: %s", exc)
             initial_queue_config = QueueControlConfig()
+            initial_queue_config_valid = False
+        self._queue_control_document = initial_queue_document
+        self._queue_control_parsed_config = initial_queue_config if initial_queue_config_valid else None
         self._queue_controller = RuntimeQueueController(
             num_stages=self.num_stages,
             config=initial_queue_config,
@@ -645,11 +650,27 @@ class Orchestrator:
         instrumentation = getattr(self, "_queue_instrumentation", None)
         if instrumentation is None or not instrumentation.control_enabled:
             return False
+        document = instrumentation.read_control()
+        cached_document = getattr(self, "_queue_control_document", None)
+        cached_config = getattr(self, "_queue_control_parsed_config", None)
+        if document is cached_document:
+            if cached_config is None:
+                return False
+            config = cached_config
+        else:
+            try:
+                config = QueueControlConfig.from_document(
+                    document,
+                    num_stages=self.num_stages,
+                )
+            except ValueError as exc:
+                self._queue_control_document = document
+                self._queue_control_parsed_config = None
+                logger.warning("[Orchestrator] Ignoring invalid queue-control config: %s", exc)
+                return False
+            self._queue_control_document = document
+            self._queue_control_parsed_config = config
         try:
-            config = QueueControlConfig.from_document(
-                instrumentation.read_control(),
-                num_stages=self.num_stages,
-            )
             controller = self._ensure_queue_controller()
             if config == controller.config:
                 return False
@@ -803,11 +824,15 @@ class Orchestrator:
     ) -> None:
         score = "none" if decision.score is None else f"{decision.score:.6f}"
         gamma = "none" if decision.gamma is None else f"{decision.gamma:.6f}"
+        threshold = "none" if decision.threshold_s is None else f"{decision.threshold_s:.6f}"
+        threshold_slack = "none" if decision.threshold_slack_s is None else f"{decision.threshold_slack_s:.6f}"
         error = (
             "OMNI_ADMISSION_REJECTED: "
             f"class={decision.request_class!r} reason={decision.reason} "
             f"score={score} gamma={gamma} k={decision.effective_k} "
-            f"active={decision.active_count} q={decision.queue_position}"
+            f"active={decision.active_count} q={decision.queue_position} "
+            f"m={decision.required_returns} threshold_s={threshold} "
+            f"threshold_slack_s={threshold_slack}"
         )
         logger.info("[Orchestrator] req=%s %s", request_id, error)
         await self.output_async_queue.put(
