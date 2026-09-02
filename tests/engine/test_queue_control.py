@@ -3041,10 +3041,34 @@ def test_stage_cancellation_ring_excludes_downstream_and_companion_leases() -> N
     )
     controller.cancel_request("parent")
 
-    cancellations = controller.snapshot()["recent_stage_cancellations"]
+    snapshot = controller.snapshot()
+    assert snapshot["cancelled_active_by_stage_class_total"] == {
+        "0": {"speech": 1},
+        "1": {"speech": 1},
+    }
+    cancellations = snapshot["recent_stage_cancellations"]
     assert len(cancellations) == 1
     assert cancellations[0]["stage_id"] == 0
     assert cancellations[0]["request_id"] == cancellations[0]["logical_request_id"]
+
+
+def test_stage0_companion_cancellation_does_not_duplicate_identity_ring() -> None:
+    controller = RuntimeQueueController(num_stages=1)
+    controller.acquire_immediate(_pending("parent", request_class="speech", admission_correlation_id="client"))
+    controller.acquire_immediate(
+        _pending(
+            "companion",
+            logical_request_id="parent",
+            starts_request=False,
+            request_class="speech",
+            admission_correlation_id="client",
+        )
+    )
+    controller.cancel_request("parent")
+
+    snapshot = controller.snapshot()
+    assert snapshot["cancelled_active_by_stage_class_total"] == {"0": {"speech": 2}}
+    assert [row["request_id"] for row in snapshot["recent_stage_cancellations"]] == ["parent"]
 
 
 def test_repeated_stage_update_does_not_reset_service_timer_or_double_retire() -> None:
