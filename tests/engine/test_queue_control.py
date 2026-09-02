@@ -1352,7 +1352,7 @@ def test_soft_stage_class_reservation_prioritizes_an_underfilled_class() -> None
     }
 
 
-def test_soft_stage_class_reservation_does_not_create_cache_order_hol() -> None:
+def test_soft_stage_class_reservation_tracks_cache_blocked_demand_and_advances_head() -> None:
     controller = RuntimeQueueController(
         num_stages=1,
         config=_soft_stage0_config(policy="edf"),
@@ -1368,8 +1368,9 @@ def test_soft_stage_class_reservation_does_not_create_cache_order_hol() -> None:
     assert controller.pop_ready().pending.request_id == "text-active"  # type: ignore[union-attr]
 
     # The later speech request has an earlier deadline and an unused reserved
-    # share. It cannot bypass the multimodal cache head. Because it is not yet
-    # runnable, it also cannot prevent the head from borrowing the free slot.
+    # share. It cannot bypass the multimodal cache head, but its latent demand
+    # prevents unrelated borrowers from consuming the reservation. The head is
+    # exempt so that the cache-ordered sequence can still advance.
     controller.enqueue(
         _pending(
             "cache-head",
@@ -1388,11 +1389,93 @@ def test_soft_stage_class_reservation_does_not_create_cache_order_hol() -> None:
     )
     snapshot = controller.snapshot()
     assert snapshot["blocked_by_limit"] == {"mm_cache_order": 1}
-    assert snapshot["soft_reservation_state"]["0"]["demand_classes"] == []
+    assert snapshot["soft_reservation_state"]["0"]["demand_classes"] == ["speech"]
     assert controller.pop_ready().pending.request_id == "cache-head"  # type: ignore[union-attr]
 
     assert controller.release_stage("text-active", 0)
     assert controller.pop_ready().pending.request_id == "cache-follower"  # type: ignore[union-attr]
+
+
+def test_soft_stage_class_reservation_blocks_arbitrary_borrower_behind_cache_head() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_soft_stage0_config(policy="edf"),
+    )
+    controller.enqueue(_pending("speech-active", request_class="speech"))
+    assert controller.pop_ready().pending.request_id == "speech-active"  # type: ignore[union-attr]
+
+    controller.enqueue(
+        _pending(
+            "cache-head",
+            deadline=30.0,
+            request_class="speech",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(
+        _pending(
+            "cache-follower",
+            deadline=10.0,
+            request_class="text",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(_pending("arbitrary-borrower", deadline=5.0, request_class="speech"))
+
+    snapshot = controller.snapshot()
+    assert snapshot["soft_reservation_state"]["0"]["demand_classes"] == ["text"]
+    assert snapshot["blocked_by_limit"] == {
+        "mm_cache_order": 1,
+        "stage_class_reservation": 1,
+    }
+    assert controller.pop_ready().pending.request_id == "cache-head"  # type: ignore[union-attr]
+    assert controller.snapshot()["soft_reservation_state"]["0"]["active_total"] == 2
+
+    assert controller.release_stage("speech-active", 0)
+    assert controller.pop_ready().pending.request_id == "cache-follower"  # type: ignore[union-attr]
+    snapshot = controller.snapshot()
+    assert snapshot["soft_reservation_state"]["0"]["active_total"] == 2
+    assert snapshot["soft_reservation_state"]["0"]["active_by_class"] == {
+        "speech": 1,
+        "text": 1,
+    }
+    assert snapshot["queued_by_stage_class"] == {"0": {"speech": 1}}
+
+
+def test_soft_stage_class_reservation_does_not_promote_multiply_blocked_cache_demand() -> None:
+    controller = RuntimeQueueController(
+        num_stages=2,
+        config=_soft_stage0_config(policy="edf"),
+    )
+    controller.enqueue(_pending("text-active", request_class="text"))
+    assert controller.pop_ready().pending.request_id == "text-active"  # type: ignore[union-attr]
+
+    controller.enqueue(
+        _pending(
+            "cache-head",
+            deadline=20.0,
+            request_class="text",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(
+        _pending(
+            "cache-follower",
+            deadline=10.0,
+            request_class="speech",
+            required_active_stage_id=1,
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+
+    snapshot = controller.snapshot()
+    assert snapshot["soft_reservation_state"]["0"]["demand_classes"] == []
+    assert snapshot["blocked_by_limit"] == {
+        "dependency": 1,
+        "mm_cache_order": 1,
+    }
+    assert controller.pop_ready().pending.request_id == "cache-head"  # type: ignore[union-attr]
+    assert controller.snapshot()["soft_reservation_state"]["0"]["active_total"] == 2
 
 
 def test_soft_stage_class_reservation_can_be_enabled_by_live_config() -> None:
