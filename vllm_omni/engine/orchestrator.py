@@ -481,6 +481,11 @@ class Orchestrator:
                 self._queue_instrumentation.read_control(),
                 num_stages=self.num_stages,
             )
+            if initial_queue_config.online_allocator is not None:
+                raise ValueError(
+                    "queue_control.online_allocator cannot be applied before "
+                    "this runtime has published a source snapshot"
+                )
         except ValueError as exc:
             logger.warning("[Orchestrator] Ignoring invalid initial queue-control config: %s", exc)
             initial_queue_config = QueueControlConfig()
@@ -645,7 +650,29 @@ class Orchestrator:
                 instrumentation.read_control(),
                 num_stages=self.num_stages,
             )
-            return self._ensure_queue_controller().configure(config)
+            controller = self._ensure_queue_controller()
+            if config == controller.config:
+                return False
+            allocator = config.online_allocator
+            if allocator is not None:
+                if allocator.source_runtime_id != instrumentation.runtime_id:
+                    raise ValueError("queue_control.online_allocator.source_runtime_id does not match this runtime")
+                if allocator.source_snapshot_sequence > instrumentation.snapshot_sequence:
+                    raise ValueError(
+                        "queue_control.online_allocator.source_snapshot_sequence is newer than "
+                        "the latest published runtime snapshot"
+                    )
+                if allocator.source_config_generation != controller.config_generation:
+                    raise ValueError(
+                        "queue_control.online_allocator.source_config_generation does not match "
+                        "the current runtime configuration"
+                    )
+                if allocator.source_config_fingerprint != controller.config.fingerprint():
+                    raise ValueError(
+                        "queue_control.online_allocator.source_config_fingerprint does not match "
+                        "the current runtime configuration"
+                    )
+            return controller.configure(config)
         except ValueError as exc:
             logger.warning("[Orchestrator] Ignoring invalid queue-control config: %s", exc)
             return False
@@ -701,6 +728,7 @@ class Orchestrator:
                 stage_id=stage_id,
                 operation=operation,
                 dispatch_req_id=request_id,
+                rollback_acquired_stage=pending.acquired_stage_for_dispatch,
             )
 
         controller = self._ensure_queue_controller()
@@ -2026,6 +2054,7 @@ class Orchestrator:
         stage_id: int,
         operation: str,
         dispatch_req_id: str | None = None,
+        rollback_acquired_stage: bool = False,
     ) -> bool:
         """Run a dispatch action, converting stage unavailability into a
         single-request failure.
@@ -2047,7 +2076,9 @@ class Orchestrator:
         ``req_id`` is the request the failure is attributed to; ``dispatch_req_id``
         is the id actually being dispatched when it differs (e.g. a CFG companion
         submitted under its parent's attribution) and is used to locate the
-        replica that died.
+        replica that died. ``rollback_acquired_stage`` distinguishes a newly
+        granted lease from an update to an already-active stage, so failure
+        cleanup records the former as rollback and the latter as cancellation.
         """
         try:
             await dispatch()
@@ -2062,6 +2093,8 @@ class Orchestrator:
                 stage_id,
                 e,
             )
+            if rollback_acquired_stage:
+                self._ensure_queue_controller().fail_stage_dispatch(dispatch_req_id or req_id, stage_id)
             await self._fail_request_dead_stage(req_id, stage_id)
             return False
         except EngineDeadError as e:
@@ -2080,6 +2113,8 @@ class Orchestrator:
                 dead_replica,
                 e,
             )
+            if rollback_acquired_stage:
+                self._ensure_queue_controller().fail_stage_dispatch(dispatch_req_id or req_id, stage_id)
             await self._fail_request_dead_stage(req_id, stage_id)
             if dead_replica is not None and dead_replica in pool.live_replica_ids():
                 await self._handle_dead_replica(stage_id, dead_replica, e)
@@ -2096,6 +2131,8 @@ class Orchestrator:
                 stage_id,
                 e,
             )
+            if rollback_acquired_stage:
+                self._ensure_queue_controller().fail_stage_dispatch(dispatch_req_id or req_id, stage_id)
             await self._fail_request_client_error(
                 req_id,
                 stage_id,
@@ -2207,9 +2244,12 @@ class Orchestrator:
         ``is_segment_finished=False``, but vLLM's output processor may remove the
         request state before that EngineCoreOutput is processed.
 
-        Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
-        in ``_route_output`` so downstream async-chunk stages can still deliver
-        outputs after stage-0 session end.
+        Final-output bookkeeping is updated here, but request cleanup stays in
+        ``_route_output``/``_finish_raw_terminal_requests`` so downstream
+        async-chunk stages can still deliver outputs after an upstream session
+        ends.  Returning every raw terminal lets the post-processing step
+        release a non-final stage lease even when its output processor emits no
+        processed terminal.
         """
         if getattr(eco, "finish_reason", None) is None:
             return False
@@ -2217,9 +2257,8 @@ class Orchestrator:
             return False
 
         final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-        if stage_id not in final_output_stage_ids:
-            return False
-        req_state.finished_final_output_stage_ids.add(stage_id)
+        if stage_id in final_output_stage_ids:
+            req_state.finished_final_output_stage_ids.add(stage_id)
         return True
 
     async def _finish_raw_terminal_requests(
@@ -2230,12 +2269,18 @@ class Orchestrator:
     ) -> None:
         """Finish streaming requests whose raw terminal had no processed output."""
         pool = self.stage_pools[stage_id]
-        if not pool.final_output:
-            return
 
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
             if req_state is None or self._is_duplex_session_request(req_state):
+                continue
+
+            # The stage itself is complete regardless of whether all output
+            # branches are complete.  Release its lease before the request-wide
+            # terminal check so an earlier raw-only final branch is not later
+            # misclassified as cancelled during aggregate cleanup.
+            await self._release_stage_credit(request_id, stage_id)
+            if not pool.final_output:
                 continue
 
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}

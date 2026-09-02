@@ -36,11 +36,12 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    StreamingInputState,
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.queue_control import RequestSchedulingMetadata
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.queue_control import PendingStageDispatch, QueueControlConfig, RequestSchedulingMetadata
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexInputMode,
@@ -213,6 +214,16 @@ class FakeStageClient:
 
     def push_diffusion_output(self, output) -> None:
         self._diffusion_outputs.put_nowait(output)
+
+
+class FailingDispatchStageClient(FakeStageClient):
+    def __init__(self, error: BaseException, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.error = error
+
+    async def add_request_async(self, *args, **kwargs) -> None:
+        self.add_request_calls.append(args)
+        raise self.error
 
 
 def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
@@ -977,8 +988,23 @@ async def test_runtime_queue_control_applies_only_increasing_allocator_revisions
     orchestrator_factory,
 ) -> None:
     control_path = tmp_path / "queue-control.json"
+    metrics_dir = tmp_path / "metrics"
 
-    def document(revision: int, limit: int) -> dict[str, Any]:
+    def document(
+        revision: int,
+        limit: int,
+        *,
+        runtime_id: str,
+        snapshot_sequence: int,
+        config_generation: int,
+        source_config_fingerprint: str,
+    ) -> dict[str, Any]:
+        target = QueueControlConfig(
+            enabled=True,
+            policy="fifo",
+            global_wip_limit=4,
+            class_wip_limits={"audio": limit},
+        )
         return {
             "queue_control": {
                 "enabled": True,
@@ -986,37 +1012,156 @@ async def test_runtime_queue_control_applies_only_increasing_allocator_revisions
                 "global_wip_limit": 4,
                 "class_wip_limits": {"audio": limit},
                 "online_allocator": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "revision": revision,
-                    "source_runtime_id": "runtime-a",
-                    "source_snapshot_sequence": revision,
-                    "source_config_generation": revision - 1,
+                    "source_runtime_id": runtime_id,
+                    "source_snapshot_sequence": snapshot_sequence,
+                    "source_config_generation": config_generation,
+                    "source_config_fingerprint": source_config_fingerprint,
+                    "target_config_fingerprint": target.fingerprint(),
                     "profile_fingerprint": "a" * 64,
                 },
             }
         }
 
-    control_path.write_text(json.dumps(document(2, 2)), encoding="utf-8")
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "policy": "fifo",
+                    "global_wip_limit": 4,
+                    "class_wip_limits": {"audio": 2},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
     monkeypatch.setenv(RUNTIME_CONTROL_INTERVAL_ENV, "3600")
+    monkeypatch.setenv(RUNTIME_METRICS_DIR_ENV, str(metrics_dir))
     fixture = orchestrator_factory([FakeStageClient(final_output=True)])
     controller = fixture.orchestrator._queue_controller
     assert controller is not None
-    assert controller.snapshot()["online_allocator"]["revision"] == 2
+    assert controller.snapshot()["online_allocator"] is None
+    fixture.orchestrator._write_queue_control_snapshot(force=True)
+    instrumentation = fixture.orchestrator._queue_instrumentation
+    assert instrumentation is not None
+
+    first_path = tmp_path / "first.json"
+    first_path.write_text(
+        json.dumps(
+            document(
+                1,
+                2,
+                runtime_id=instrumentation.runtime_id,
+                snapshot_sequence=instrumentation.snapshot_sequence,
+                config_generation=controller.config_generation,
+                source_config_fingerprint=controller.config.fingerprint(),
+            )
+        ),
+        encoding="utf-8",
+    )
+    first_path.replace(control_path)
+    assert fixture.orchestrator._refresh_queue_control()
+    assert controller.snapshot()["online_allocator"]["revision"] == 1
+    fixture.orchestrator._write_queue_control_snapshot(force=True)
 
     stale_path = tmp_path / "stale.json"
-    stale_path.write_text(json.dumps(document(1, 1)), encoding="utf-8")
+    stale_path.write_text(
+        json.dumps(
+            document(
+                1,
+                1,
+                runtime_id=instrumentation.runtime_id,
+                snapshot_sequence=instrumentation.snapshot_sequence,
+                config_generation=controller.config_generation,
+                source_config_fingerprint=controller.config.fingerprint(),
+            )
+        ),
+        encoding="utf-8",
+    )
     stale_path.replace(control_path)
     assert not fixture.orchestrator._refresh_queue_control()
     assert controller.snapshot()["class_wip_limits"] == {"audio": 2}
-    assert controller.snapshot()["online_allocator"]["revision"] == 2
+    assert controller.snapshot()["online_allocator"]["revision"] == 1
 
     fresh_path = tmp_path / "fresh.json"
-    fresh_path.write_text(json.dumps(document(3, 1)), encoding="utf-8")
+    fresh_path.write_text(
+        json.dumps(
+            document(
+                2,
+                1,
+                runtime_id=instrumentation.runtime_id,
+                snapshot_sequence=instrumentation.snapshot_sequence,
+                config_generation=controller.config_generation,
+                source_config_fingerprint=controller.config.fingerprint(),
+            )
+        ),
+        encoding="utf-8",
+    )
     fresh_path.replace(control_path)
     assert fixture.orchestrator._refresh_queue_control()
     assert controller.snapshot()["class_wip_limits"] == {"audio": 1}
-    assert controller.snapshot()["online_allocator"]["revision"] == 3
+    assert controller.snapshot()["online_allocator"]["revision"] == 2
+
+    await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_runtime_queue_control_rejects_noncausal_allocator_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    metrics_dir = tmp_path / "metrics"
+    control_path.write_text('{"queue_control":{"enabled":true}}', encoding="utf-8")
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    monkeypatch.setenv(RUNTIME_METRICS_DIR_ENV, str(metrics_dir))
+    fixture = orchestrator_factory([FakeStageClient(final_output=True)])
+    instrumentation = fixture.orchestrator._queue_instrumentation
+    controller = fixture.orchestrator._queue_controller
+    assert instrumentation is not None and controller is not None
+    fixture.orchestrator._write_queue_control_snapshot(force=True)
+
+    base = {
+        "schema_version": 2,
+        "revision": 1,
+        "source_runtime_id": instrumentation.runtime_id,
+        "source_snapshot_sequence": instrumentation.snapshot_sequence,
+        "source_config_generation": controller.config_generation,
+        "source_config_fingerprint": controller.config.fingerprint(),
+        "target_config_fingerprint": QueueControlConfig(
+            enabled=True,
+            class_wip_limits={"audio": 1},
+        ).fingerprint(),
+        "profile_fingerprint": "b" * 64,
+    }
+    for field, invalid in (
+        ("source_runtime_id", "another-runtime"),
+        ("source_snapshot_sequence", instrumentation.snapshot_sequence + 1),
+        ("source_config_generation", controller.config_generation + 1),
+        ("source_config_fingerprint", "c" * 64),
+        ("target_config_fingerprint", "c" * 64),
+    ):
+        metadata = {**base, field: invalid}
+        replacement = tmp_path / f"invalid-{field}.json"
+        replacement.write_text(
+            json.dumps(
+                {
+                    "queue_control": {
+                        "enabled": True,
+                        "class_wip_limits": {"audio": 1},
+                        "online_allocator": metadata,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        replacement.replace(control_path)
+        assert not fixture.orchestrator._refresh_queue_control()
+        assert controller.snapshot()["online_allocator"] is None
 
     await _shutdown_orchestrator(fixture)
 
@@ -1080,6 +1225,65 @@ async def test_metrics_only_mode_counts_logical_arrivals_by_class_once(
     assert snapshot["enqueued_total"] == 1
 
     await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.parametrize(
+    "dispatch_error",
+    [
+        StageUnavailableError("stage unavailable"),
+        EngineDeadError("engine died during submit"),
+        OverflowError("request value is too large"),
+    ],
+    ids=["stage-unavailable", "engine-dead", "overflow"],
+)
+@pytest.mark.asyncio
+async def test_dispatch_failure_is_counted_as_rollback_before_cleanup(
+    dispatch_error: BaseException,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "stage_class_wip_limits": {"0": {"text": 1}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    stage = FailingDispatchStageClient(dispatch_error, final_output=True)
+    fixture = orchestrator_factory([stage])
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="dispatch-failure",
+            prompt=FakePromptRequest("dispatch-failure", [1]),
+            original_prompt={"prompt": "dispatch failure"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            scheduling_metadata=RequestSchedulingMetadata(
+                request_class="text",
+                path="text",
+            ),
+        )
+        await _wait_for(lambda: not fixture.output_sync_q.empty())
+        message = fixture.output_sync_q.get_nowait()
+        assert isinstance(message, ErrorMessage)
+        await _wait_for(lambda: "dispatch-failure" not in fixture.orchestrator.request_states)
+
+        snapshot = fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert snapshot["completed_by_stage_class_total"]["0"]["text"] == 0
+        assert snapshot["service_time_s_by_stage_class_total"]["0"]["text"] == 0
+        assert snapshot["rollbacks_by_stage_class_total"]["0"]["text"] == 1
+        assert snapshot["cancelled_active_by_stage_class_total"]["0"]["text"] == 0
+        assert fixture.thread.is_alive()
+    finally:
+        await _shutdown_orchestrator(fixture)
 
 
 @pytest.mark.asyncio
@@ -1552,7 +1756,27 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_chunk_raw_terminal_without_processed_output_finishes_request(orchestrator_factory) -> None:
+async def test_async_chunk_raw_terminal_without_processed_output_finishes_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "stage_class_wip_limits": {
+                        "0": {"speech": 1},
+                        "1": {"speech": 1},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
     orchestrator_fixture = orchestrator_factory(
@@ -1573,6 +1797,10 @@ async def test_async_chunk_raw_terminal_without_processed_output_finishes_reques
             original_prompt={"prompt": "stream audio"},
             sampling_params_list=[_sampling_params(), _sampling_params()],
             final_stage_id=1,
+            scheduling_metadata=RequestSchedulingMetadata(
+                request_class="speech",
+                path="audio",
+            ),
         )
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
@@ -1586,8 +1814,234 @@ async def test_async_chunk_raw_terminal_without_processed_output_finishes_reques
         assert output_msg.engine_outputs.finished is True
         assert output_msg.engine_outputs.outputs[0].multimodal_output["audio"].numel() == 0
         await _wait_for(lambda: request.request_id not in orchestrator_fixture.orchestrator.request_states)
+        snapshot = orchestrator_fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert snapshot["completed_by_stage_class_total"]["1"]["speech"] == 1
+        assert snapshot["cancelled_active_by_stage_class_total"]["1"]["speech"] == 0
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_nonfinal_raw_terminal_does_not_finish_request_or_double_release(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    request_id = "req-nonfinal-raw-terminal"
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "stage_class_wip_limits": {
+                        "0": {"speech": 1},
+                        "1": {"speech": 1},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    stage0_output = _build_request_output(request_id, token_ids=[7], finished=True)
+    fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[
+            FakeOutputProcessor(request_outputs=[stage0_output]),
+            FakeOutputProcessor(),
+        ],
+        async_chunk=True,
+    )
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=FakePromptRequest(request_id, [1, 2]),
+            original_prompt={"prompt": "stream"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            scheduling_metadata=RequestSchedulingMetadata(
+                request_class="speech",
+                path="audio",
+            ),
+        )
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
+        await _wait_for(
+            lambda: (
+                fixture.orchestrator._ensure_queue_controller().snapshot()["completed_by_stage_class_total"]["0"][
+                    "speech"
+                ]
+                == 1
+            )
+        )
+        assert request_id in fixture.orchestrator.request_states
+        snapshot = fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert snapshot["completed_by_stage_class_total"]["0"]["speech"] == 1
+        assert (
+            len(
+                [
+                    row
+                    for row in snapshot["recent_stage_completions"]
+                    if row["request_id"] == request_id and row["stage_id"] == 0
+                ]
+            )
+            == 1
+        )
+
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
+        await _get_output_message(fixture)
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        final_snapshot = fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert final_snapshot["completed_by_stage_class_total"]["0"]["speech"] == 1
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_nonfinal_raw_terminal_without_processed_output_releases_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    request_id = "req-nonfinal-raw-only"
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "stage_class_wip_limits": {
+                        "0": {"speech": 1},
+                        "1": {"speech": 1},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=FakePromptRequest(request_id, [1, 2]),
+            original_prompt={"prompt": "stream"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            scheduling_metadata=RequestSchedulingMetadata(
+                request_class="speech",
+                path="audio",
+            ),
+        )
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
+        await _wait_for(
+            lambda: (
+                fixture.orchestrator._ensure_queue_controller().snapshot()["completed_by_stage_class_total"]["0"][
+                    "speech"
+                ]
+                == 1
+            )
+        )
+        assert request_id in fixture.orchestrator.request_states
+        snapshot = fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert snapshot["active_by_stage_class"] == {"1": {"speech": 1}}
+        assert snapshot["cancelled_active_by_stage_class_total"]["0"]["speech"] == 0
+
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
+        await _get_output_message(fixture)
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        final_snapshot = fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert final_snapshot["completed_by_stage_class_total"] == {
+            "0": {"speech": 1},
+            "1": {"speech": 1},
+        }
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_raw_only_multi_final_stage_releases_before_other_branch_finishes(
+    orchestrator_factory,
+) -> None:
+    request_id = "req-two-final-raw-only"
+    stages = [
+        FakeStageClient(stage_type="llm", final_output=True),
+        FakeStageClient(stage_type="llm", final_output=True),
+    ]
+    fixture = orchestrator_factory(stages, async_chunk=True)
+    controller = fixture.orchestrator._ensure_queue_controller()
+    metadata = RequestSchedulingMetadata(request_class="speech", path="audio")
+    fixture.orchestrator.request_states[request_id] = OrchestratorRequestState(
+        request_id=request_id,
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+        streaming=StreamingInputState(enabled=True),
+        scheduling_metadata=metadata,
+    )
+    controller.acquire_immediate(
+        PendingStageDispatch(
+            request_id=request_id,
+            logical_request_id=request_id,
+            stage_id=0,
+            metadata=metadata,
+            dispatch=lambda: asyncio.sleep(0, result=True),
+            operation="test",
+            starts_request=True,
+        )
+    )
+    controller.acquire_immediate(
+        PendingStageDispatch(
+            request_id=request_id,
+            logical_request_id=request_id,
+            stage_id=1,
+            metadata=metadata,
+            dispatch=lambda: asyncio.sleep(0, result=True),
+            operation="test",
+            starts_request=False,
+        )
+    )
+    try:
+        state = fixture.orchestrator.request_states[request_id]
+        stage0_terminal = _terminal_engine_core_outputs(request_id).outputs[0]
+        assert await fixture.orchestrator._apply_raw_terminal_stage_finish(0, stage0_terminal, state)
+        await fixture.orchestrator._finish_raw_terminal_requests(0, 0, {request_id})
+
+        snapshot = controller.snapshot()
+        assert request_id in fixture.orchestrator.request_states
+        assert snapshot["completed_by_stage_class_total"] == {
+            "0": {"speech": 1},
+            "1": {"speech": 0},
+        }
+        assert snapshot["active_by_stage_class"] == {"1": {"speech": 1}}
+
+        stage1_terminal = _terminal_engine_core_outputs(request_id).outputs[0]
+        assert await fixture.orchestrator._apply_raw_terminal_stage_finish(1, stage1_terminal, state)
+        await fixture.orchestrator._finish_raw_terminal_requests(1, 0, {request_id})
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+
+        final_snapshot = controller.snapshot()
+        assert final_snapshot["completed_by_stage_class_total"] == {
+            "0": {"speech": 1},
+            "1": {"speech": 1},
+        }
+        assert final_snapshot["cancelled_active_by_stage_class_total"] == {
+            "0": {"speech": 0},
+            "1": {"speech": 0},
+        }
+    finally:
+        await _shutdown_orchestrator(fixture)
 
 
 @pytest.mark.asyncio
@@ -1645,8 +2099,28 @@ async def test_async_chunk_data_then_raw_terminal_finishes_once(orchestrator_fac
 
 
 @pytest.mark.asyncio
-async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orchestrator_factory) -> None:
+async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
     request_id = "req-stream-processed-terminal"
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "queue_control": {
+                    "enabled": True,
+                    "stage_class_wip_limits": {
+                        "0": {"speech": 1},
+                        "1": {"speech": 1},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
     processed_terminal = _build_request_output(
@@ -1676,6 +2150,10 @@ async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orc
             original_prompt={"prompt": "stream audio"},
             sampling_params_list=[_sampling_params(), _sampling_params()],
             final_stage_id=1,
+            scheduling_metadata=RequestSchedulingMetadata(
+                request_class="speech",
+                path="audio",
+            ),
         )
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
@@ -1689,6 +2167,10 @@ async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orc
         await asyncio.sleep(0.05)
         with pytest.raises(queue.Empty):
             orchestrator_fixture.output_sync_q.get_nowait()
+        snapshot = orchestrator_fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert snapshot["completed_by_stage_class_total"]["1"]["speech"] == 1
+        assert snapshot["service_time_s_by_stage_class_total"]["1"]["speech"] > 0
+        assert snapshot["cancelled_active_by_stage_class_total"]["1"]["speech"] == 0
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
@@ -2745,6 +3227,47 @@ async def test_multi_replica_abort_broadcasts_to_all_replicas(orchestrator_facto
 
 
 @pytest.mark.asyncio
+async def test_cancel_then_late_terminal_does_not_count_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        '{"queue_control":{"enabled":true,"stage_class_wip_limits":{"0":{"text":1}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="cancel-late-terminal",
+            prompt=FakePromptRequest("cancel-late-terminal", [1]),
+            original_prompt={"prompt": "cancel"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            scheduling_metadata=RequestSchedulingMetadata(
+                request_class="text",
+                path="text",
+            ),
+        )
+        await _wait_for(lambda: len(stage.add_request_calls) == 1)
+        await _enqueue_abort_request(fixture, ["cancel-late-terminal"])
+        await _wait_for(lambda: "cancel-late-terminal" not in fixture.orchestrator.request_states)
+        stage.push_engine_core_outputs(_terminal_engine_core_outputs("cancel-late-terminal"))
+        await asyncio.sleep(0.05)
+
+        snapshot = fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert snapshot["completed_by_stage_class_total"]["0"]["text"] == 0
+        assert snapshot["service_time_s_by_stage_class_total"]["0"]["text"] == 0
+        assert snapshot["cancelled_active_by_stage_class_total"]["0"]["text"] == 1
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
 async def test_multi_replica_shutdown_all_replicas(orchestrator_factory) -> None:
     """Shutdown must shut down every replica across all stages."""
     stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
@@ -3239,6 +3762,66 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_cfg_parent_cleanup_retires_parent_and_child_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    orchestrator_factory,
+) -> None:
+    control_path = tmp_path / "queue-control.json"
+    control_path.write_text(
+        '{"queue_control":{"enabled":true,"stage_class_wip_limits":{"0":{"image":2}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(RUNTIME_CONTROL_FILE_ENV, str(control_path))
+    stage = FakeStageClient(stage_type="llm", final_output=True)
+    fixture = orchestrator_factory([stage])
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="cfg-parent",
+            prompt=FakePromptRequest("cfg-parent", [1]),
+            original_prompt={"prompt": "parent"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            scheduling_metadata=RequestSchedulingMetadata(
+                request_class="image",
+                path="image",
+            ),
+        )
+        await _wait_for(lambda: len(stage.add_request_calls) == 1)
+        fixture.request_sync_q.put_nowait(
+            AddCompanionRequestMessage(
+                companion_id="cfg-child",
+                parent_id="cfg-parent",
+                role="negative",
+                prompt=FakePromptRequest("cfg-child", [2]),
+                companion_prompt_text={"prompt": "negative"},
+                sampling_params_list=[_sampling_params()],
+            )
+        )
+        await _wait_for(lambda: len(stage.add_request_calls) == 2)
+        await _enqueue_abort_request(fixture, ["cfg-parent"])
+        await _wait_for(
+            lambda: (
+                "cfg-parent" not in fixture.orchestrator.request_states
+                and "cfg-child" not in fixture.orchestrator.request_states
+            )
+        )
+
+        # Late engine terminals after parent cleanup must not resurrect either
+        # lease or increment completion/service counters.
+        stage.push_engine_core_outputs(_terminal_engine_core_outputs("cfg-parent"))
+        stage.push_engine_core_outputs(_terminal_engine_core_outputs("cfg-child"))
+        await asyncio.sleep(0.05)
+        snapshot = fixture.orchestrator._ensure_queue_controller().snapshot()
+        assert snapshot["completed_by_stage_class_total"]["0"]["image"] == 0
+        assert snapshot["service_time_s_by_stage_class_total"]["0"]["image"] == 0
+        assert snapshot["cancelled_active_by_stage_class_total"]["0"]["image"] == 2
+    finally:
+        await _shutdown_orchestrator(fixture)
 
 
 @pytest.mark.asyncio
