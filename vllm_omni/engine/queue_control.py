@@ -31,7 +31,10 @@ DispatchCallable = Callable[[], Awaitable[bool]]
 AdmissionScoreMethod = Literal["erlang_empirical", "erlang_empirical_threshold"]
 ADMISSION_DECISION_HISTORY_LIMIT = 128
 RECENT_STAGE_COMPLETION_HISTORY_LIMIT = 512
-RECENT_STAGE_CANCELLATION_HISTORY_LIMIT = 512
+# One entry per logical stage-0 arrival is enough to join client failures to
+# runtime terminal state. Keeping downstream physical-stage cancellations out
+# prevents fan-out from consuming this identity ring.
+RECENT_STAGE_CANCELLATION_HISTORY_LIMIT = 4096
 ADMISSION_SCORE_REFERENCE_TOLERANCE = 1e-12
 ADMISSION_THRESHOLD_TABLE_SCHEMA_VERSION = 1
 DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS = 2048
@@ -2295,6 +2298,8 @@ class RuntimeQueueController:
         acquired_monotonic_s: float | None,
         cancelled_monotonic_s: float,
     ) -> None:
+        if stage_id != 0 or request_id != logical_request_id:
+            return
         self._stage_cancellation_sequence += 1
         if len(self._recent_stage_cancellations) == RECENT_STAGE_CANCELLATION_HISTORY_LIMIT:
             self._recent_stage_cancellations_overwritten_total += 1
