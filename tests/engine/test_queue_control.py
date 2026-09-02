@@ -3026,6 +3026,27 @@ def test_stage_cancellation_ring_identifies_active_and_pending_terminals() -> No
     ]
 
 
+def test_stage_cancellation_ring_excludes_downstream_and_companion_leases() -> None:
+    controller = RuntimeQueueController(num_stages=2)
+    controller.acquire_immediate(_pending("parent", request_class="speech", admission_correlation_id="client"))
+    controller.acquire_immediate(
+        _pending(
+            "child",
+            logical_request_id="parent",
+            stage_id=1,
+            starts_request=False,
+            request_class="speech",
+            admission_correlation_id="client",
+        )
+    )
+    controller.cancel_request("parent")
+
+    cancellations = controller.snapshot()["recent_stage_cancellations"]
+    assert len(cancellations) == 1
+    assert cancellations[0]["stage_id"] == 0
+    assert cancellations[0]["request_id"] == cancellations[0]["logical_request_id"]
+
+
 def test_repeated_stage_update_does_not_reset_service_timer_or_double_retire() -> None:
     now = [1.0]
     controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
