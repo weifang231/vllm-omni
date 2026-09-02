@@ -1593,6 +1593,8 @@ class RuntimeQueueController:
         self._recent_admission_decisions: deque[dict[str, Any]] = deque(maxlen=ADMISSION_DECISION_HISTORY_LIMIT)
         self._soft_reservation_reserved_dispatch_total: Counter[int] = Counter()
         self._soft_reservation_borrowed_dispatch_total: Counter[int] = Counter()
+        self._soft_reservation_contended_borrowed_dispatch_total: Counter[int] = Counter()
+        self._soft_reservation_cache_head_exempt_dispatch_total: Counter[int] = Counter()
         self._soft_reservation_global_cap_blocked_total: Counter[int] = Counter()
 
     @property
@@ -1746,9 +1748,10 @@ class RuntimeQueueController:
     def _with_soft_reservation_demand(self, block_state: _QueueBlockState) -> _QueueBlockState:
         """Record ready or cache-fenced demand for underfilled classes.
 
-        A request blocked only by multimodal cache order is latent demand. The
-        cache head remains exempt from reservation blocking, so this protects
-        the reserved share without stopping ordered progress.
+        A request blocked only by the stage cap, multimodal cache order, or
+        both is latent demand. The cache head remains exempt from reservation
+        blocking, so this protects the reserved share without stopping ordered
+        progress.
         """
         demand_by_stage: dict[int, set[str]] = {}
         if not self.enabled or not self.config.stage_class_wip_modes:
@@ -1769,7 +1772,10 @@ class RuntimeQueueController:
                 block_state=block_state,
                 enforce_soft_reservations=False,
             )
-            if blocked_reasons not in ((), ("mm_cache_order",)):
+            if any(
+                reason not in {"mm_cache_order", "stage"}
+                for reason in blocked_reasons
+            ):
                 continue
             demand_by_stage.setdefault(stage_id, set()).add(request_class)
         return replace(
@@ -1795,6 +1801,25 @@ class RuntimeQueueController:
         active = block_state.active_stage_class_counts.get((stage_id, request_class), 0)
         if active >= reservation:
             self._soft_reservation_borrowed_dispatch_total[stage_id] += 1
+            contended = any(
+                reserved_class != request_class
+                for reserved_class in block_state.soft_reservation_demand_by_stage.get(
+                    stage_id, ()
+                )
+            )
+            if contended:
+                self._soft_reservation_contended_borrowed_dispatch_total[stage_id] += 1
+                mm_cache_head_sequence = (
+                    block_state.mm_cache_head_sequence_by_stage.get(stage_id)
+                )
+                if (
+                    pending.preserve_stage0_mm_cache_order
+                    and mm_cache_head_sequence is not None
+                    and pending.sequence == mm_cache_head_sequence
+                ):
+                    self._soft_reservation_cache_head_exempt_dispatch_total[
+                        stage_id
+                    ] += 1
             return
         if request_class not in block_state.soft_reservation_demand_by_stage.get(stage_id, ()):
             return
@@ -2632,6 +2657,12 @@ class RuntimeQueueController:
                 "demand_classes": sorted(block_state.soft_reservation_demand_by_stage.get(stage_id, ())),
                 "reservation_priority_dispatch_total": self._soft_reservation_reserved_dispatch_total[stage_id],
                 "borrowed_dispatch_total": self._soft_reservation_borrowed_dispatch_total[stage_id],
+                "contended_borrowed_dispatch_total": (
+                    self._soft_reservation_contended_borrowed_dispatch_total[stage_id]
+                ),
+                "cache_order_head_exempt_dispatch_total": (
+                    self._soft_reservation_cache_head_exempt_dispatch_total[stage_id]
+                ),
                 "global_cap_block_events_total": self._soft_reservation_global_cap_blocked_total[stage_id],
                 "global_cap_blocked_pending": sum(
                     pending.stage_id == stage_id

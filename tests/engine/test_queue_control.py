@@ -1325,6 +1325,8 @@ def test_soft_stage_class_reservation_borrows_idle_share_up_to_stage_cap() -> No
         "demand_classes": [],
         "reservation_priority_dispatch_total": 0,
         "borrowed_dispatch_total": 1,
+        "contended_borrowed_dispatch_total": 0,
+        "cache_order_head_exempt_dispatch_total": 0,
         "global_cap_block_events_total": 1,
         "global_cap_blocked_pending": 1,
     }
@@ -1429,7 +1431,9 @@ def test_soft_stage_class_reservation_blocks_arbitrary_borrower_behind_cache_hea
         "stage_class_reservation": 1,
     }
     assert controller.pop_ready().pending.request_id == "cache-head"  # type: ignore[union-attr]
-    assert controller.snapshot()["soft_reservation_state"]["0"]["active_total"] == 2
+    snapshot = controller.snapshot()
+    assert snapshot["soft_reservation_state"]["0"]["active_total"] == 2
+    assert snapshot["soft_reservation_state"]["0"]["demand_classes"] == ["text"]
 
     assert controller.release_stage("speech-active", 0)
     assert controller.pop_ready().pending.request_id == "cache-follower"  # type: ignore[union-attr]
@@ -1439,6 +1443,19 @@ def test_soft_stage_class_reservation_blocks_arbitrary_borrower_behind_cache_hea
         "speech": 1,
         "text": 1,
     }
+    assert snapshot["soft_reservation_state"]["0"]["borrowed_dispatch_total"] == 1
+    assert (
+        snapshot["soft_reservation_state"]["0"][
+            "contended_borrowed_dispatch_total"
+        ]
+        == 1
+    )
+    assert (
+        snapshot["soft_reservation_state"]["0"][
+            "cache_order_head_exempt_dispatch_total"
+        ]
+        == 1
+    )
     assert snapshot["queued_by_stage_class"] == {"0": {"speech": 1}}
 
 
