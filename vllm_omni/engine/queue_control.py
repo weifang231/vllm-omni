@@ -1744,10 +1744,11 @@ class RuntimeQueueController:
         return self.config.stage_class_wip_modes.get(stage_id, "hard_limit")
 
     def _with_soft_reservation_demand(self, block_state: _QueueBlockState) -> _QueueBlockState:
-        """Record underfilled classes that can run without reservation priority.
+        """Record ready or cache-fenced demand for underfilled classes.
 
-        A request behind a multimodal cache-order head is not ready demand.
-        This prevents a later reserved request from blocking the head itself.
+        A request blocked only by multimodal cache order is latent demand. The
+        cache head remains exempt from reservation blocking, so this protects
+        the reserved share without stopping ordered progress.
         """
         demand_by_stage: dict[int, set[str]] = {}
         if not self.enabled or not self.config.stage_class_wip_modes:
@@ -1763,11 +1764,12 @@ class RuntimeQueueController:
             active = block_state.active_stage_class_counts.get((stage_id, request_class), 0)
             if active >= reservation:
                 continue
-            if self._blocked_reasons(
+            blocked_reasons = self._blocked_reasons(
                 pending,
                 block_state=block_state,
                 enforce_soft_reservations=False,
-            ):
+            )
+            if blocked_reasons not in ((), ("mm_cache_order",)):
                 continue
             demand_by_stage.setdefault(stage_id, set()).add(request_class)
         return replace(
@@ -2183,6 +2185,11 @@ class RuntimeQueueController:
     ) -> tuple[str, ...]:
         reasons: list[str] = []
         mm_cache_head_sequence = block_state.mm_cache_head_sequence_by_stage.get(pending.stage_id)
+        is_mm_cache_order_head = bool(
+            pending.preserve_stage0_mm_cache_order
+            and mm_cache_head_sequence is not None
+            and pending.sequence == mm_cache_head_sequence
+        )
         if (
             pending.preserve_stage0_mm_cache_order
             and mm_cache_head_sequence is not None
@@ -2225,6 +2232,7 @@ class RuntimeQueueController:
                         reasons.append("stage_class")
                 elif (
                     enforce_soft_reservations
+                    and not is_mm_cache_order_head
                     and active >= (stage_class_limit or 0)
                     and any(
                         reserved_class != request_class
