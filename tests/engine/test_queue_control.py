@@ -22,6 +22,7 @@ from vllm_omni.engine.queue_control import (
     QueueControlConfig,
     RequestSchedulingMetadata,
     RuntimeQueueController,
+    StageBackpressureConfig,
     admission_threshold_profile_fingerprint,
     admission_threshold_table_digest,
     compile_erlang_empirical_admission_threshold_table,
@@ -67,6 +68,33 @@ def _pending(
         required_active_stage_id=required_active_stage_id,
         preserve_stage0_mm_cache_order=preserve_stage0_mm_cache_order,
     )
+
+
+def _stage_backpressure(
+    *,
+    enabled: bool = True,
+    upstream_stage_id: int = 0,
+    downstream_stage_ids: tuple[int, ...] = (1, 2),
+    request_class: str = "speech",
+) -> StageBackpressureConfig:
+    return StageBackpressureConfig(
+        enabled=enabled,
+        upstream_stage_id=upstream_stage_id,
+        downstream_stage_ids=downstream_stage_ids,
+        request_class=request_class,
+    )
+
+
+def _stage_backpressure_mapping(**overrides: object) -> dict[str, object]:
+    mapping: dict[str, object] = {
+        "schema_version": 1,
+        "enabled": True,
+        "upstream_stage_id": 0,
+        "downstream_stage_ids": [1, 2],
+        "request_class": "speech",
+    }
+    mapping.update(overrides)
+    return mapping
 
 
 def _admission_config(
@@ -185,6 +213,161 @@ def test_queue_control_config_defaults_and_validation() -> None:
             {"queue_control": {"stage_class_wip_limits": {"1": {"interactive": 1}}}},
             num_stages=1,
         )
+
+
+def test_stage_backpressure_config_is_normalized_and_snapshot_ready() -> None:
+    config = QueueControlConfig.from_document(
+        {
+            "queue_control": {
+                "enabled": True,
+                "stage_class_wip_limits": {"0": {"speech": 2}},
+                "stage_backpressure": _stage_backpressure_mapping(downstream_stage_ids=[2, 1]),
+            }
+        },
+        num_stages=3,
+    )
+
+    assert config.stage_backpressure == _stage_backpressure()
+    assert config.semantic_mapping()["stage_backpressure"] == _stage_backpressure_mapping()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"schema_version": True}, "schema_version must be 1"),
+        ({"schema_version": 2}, "schema_version must be 1"),
+        ({"enabled": 1}, "enabled must be boolean"),
+        ({"upstream_stage_id": True}, "upstream_stage_id must be a non-negative integer"),
+        ({"upstream_stage_id": "0"}, "upstream_stage_id must be a non-negative integer"),
+        ({"upstream_stage_id": 0.0}, "upstream_stage_id must be a non-negative integer"),
+        ({"upstream_stage_id": -1}, "upstream_stage_id must be a non-negative integer"),
+        ({"upstream_stage_id": 1, "downstream_stage_ids": [2]}, "upstream_stage_id must be 0"),
+        ({"downstream_stage_ids": (1, 2)}, "downstream_stage_ids must be a JSON array"),
+        ({"downstream_stage_ids": []}, "downstream_stage_ids must not be empty"),
+        ({"downstream_stage_ids": [1, 1]}, "downstream_stage_ids must not contain duplicates"),
+        ({"downstream_stage_ids": [0, 1]}, "must contain only stage ids greater than upstream_stage_id"),
+        ({"downstream_stage_ids": [1, True]}, r"downstream_stage_ids\[1\] must be a non-negative integer"),
+        ({"downstream_stage_ids": [1, "2"]}, r"downstream_stage_ids\[1\] must be a non-negative integer"),
+        ({"downstream_stage_ids": [1, -1]}, r"downstream_stage_ids\[1\] must be a non-negative integer"),
+        ({"request_class": 1}, "request_class must be a string"),
+        ({"request_class": ""}, "request_class must be non-empty"),
+    ],
+)
+def test_stage_backpressure_config_rejects_invalid_types_and_topology(
+    overrides: dict[str, object],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        QueueControlConfig.from_document(
+            {
+                "queue_control": {
+                    "stage_backpressure": _stage_backpressure_mapping(**overrides),
+                }
+            },
+            num_stages=3,
+        )
+
+
+def test_stage_backpressure_config_rejects_missing_unknown_and_unavailable_fields() -> None:
+    missing = _stage_backpressure_mapping()
+    missing.pop("request_class")
+    with pytest.raises(ValueError, match="missing required fields"):
+        QueueControlConfig.from_document({"queue_control": {"stage_backpressure": missing}}, num_stages=3)
+
+    unknown = _stage_backpressure_mapping(extra=True)
+    with pytest.raises(ValueError, match="contains unknown fields"):
+        QueueControlConfig.from_document({"queue_control": {"stage_backpressure": unknown}}, num_stages=3)
+
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        QueueControlConfig.from_document({"queue_control": {"stage_backpressure": None}}, num_stages=3)
+
+    for unavailable in (_stage_backpressure_mapping(downstream_stage_ids=[1, 3]),):
+        with pytest.raises(ValueError, match="stage_backpressure contains unavailable stage ids"):
+            QueueControlConfig.from_document(
+                {"queue_control": {"stage_backpressure": unavailable}},
+                num_stages=3,
+            )
+
+    invalid_runtime_config = QueueControlConfig(
+        enabled=True,
+        stage_class_wip_limits={0: {"speech": 1}},
+        stage_backpressure=_stage_backpressure(downstream_stage_ids=(1, 3)),
+    )
+    with pytest.raises(ValueError, match="stage_backpressure contains unavailable stage ids"):
+        RuntimeQueueController(num_stages=3, config=invalid_runtime_config)
+
+    controller = RuntimeQueueController(num_stages=3)
+    with pytest.raises(ValueError, match="stage_backpressure contains unavailable stage ids"):
+        controller.configure(invalid_runtime_config)
+
+
+def test_enabled_stage_backpressure_requires_matching_upstream_stage_class_limit() -> None:
+    with pytest.raises(ValueError, match="requires queue_control.enabled to be true"):
+        QueueControlConfig(
+            stage_class_wip_limits={0: {"speech": 1}},
+            stage_backpressure=_stage_backpressure(),
+        )
+    with pytest.raises(ValueError, match="requires a matching queue_control.stage_class_wip_limits entry"):
+        QueueControlConfig(enabled=True, stage_backpressure=_stage_backpressure())
+    with pytest.raises(ValueError, match="requires a matching queue_control.stage_class_wip_limits entry"):
+        QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"text": 1}},
+            stage_backpressure=_stage_backpressure(),
+        )
+
+    config = QueueControlConfig(
+        enabled=True,
+        stage_class_wip_limits={0: {"speech": 0}},
+        stage_backpressure=_stage_backpressure(),
+    )
+    assert config.stage_class_wip_limits == {0: {"speech": 0}}
+
+
+def test_stage_backpressure_schema_v1_rejects_non_shared_upstream_deadlock_topology() -> None:
+    with pytest.raises(ValueError, match="upstream_stage_id must be 0 in schema_version 1"):
+        StageBackpressureConfig(
+            enabled=True,
+            upstream_stage_id=1,
+            downstream_stage_ids=(2,),
+            request_class="speech",
+        )
+
+
+def test_stage_backpressure_absence_preserves_legacy_fingerprint() -> None:
+    legacy = QueueControlConfig()
+    assert "stage_backpressure" not in legacy.semantic_mapping()
+    assert legacy.fingerprint() == "2ab535c52658be3a4b35561ffafa999d900d1acd80a0ae2c5ef5a9a41fc4836c"
+    controller = RuntimeQueueController(num_stages=3, config=legacy)
+    assert not controller.active
+    assert not controller.requires_queue(_pending("legacy", request_class="speech"))
+
+    explicit_disabled = QueueControlConfig(stage_backpressure=_stage_backpressure(enabled=False))
+    assert explicit_disabled.fingerprint() != legacy.fingerprint()
+
+
+def test_stage_backpressure_presence_is_covered_by_allocator_cas() -> None:
+    target = QueueControlConfig(
+        enabled=True,
+        stage_class_wip_limits={0: {"speech": 2}},
+        stage_backpressure=_stage_backpressure(),
+    )
+    document = {"queue_control": target.semantic_mapping()}
+    document["queue_control"]["online_allocator"] = {
+        "schema_version": 2,
+        "revision": 1,
+        "source_runtime_id": "runtime-a",
+        "source_snapshot_sequence": 1,
+        "source_config_generation": 0,
+        "source_config_fingerprint": "a" * 64,
+        "target_config_fingerprint": target.fingerprint(),
+        "profile_fingerprint": "b" * 64,
+    }
+    assert QueueControlConfig.from_document(document, num_stages=3).fingerprint() == target.fingerprint()
+
+    document["queue_control"]["stage_backpressure"]["enabled"] = False
+    with pytest.raises(ValueError, match="target_config_fingerprint does not match"):
+        QueueControlConfig.from_document(document, num_stages=3)
 
 
 def test_online_allocator_metadata_is_parsed_and_acknowledged_in_snapshot() -> None:
@@ -1103,6 +1286,300 @@ def test_stage_class_credit_is_inert_when_queue_control_is_disabled() -> None:
     assert controller.snapshot()["active_by_stage_class"] == {"0": {"speech": 1}}
 
 
+def test_disabled_stage_backpressure_is_auditable_but_does_not_queue() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_backpressure=_stage_backpressure(enabled=False),
+        ),
+    )
+    controller.acquire_immediate(_pending("downstream", stage_id=1, starts_request=False, request_class="speech"))
+    upstream = _pending("upstream", request_class="speech")
+
+    assert not controller.requires_queue(upstream)
+    controller.acquire_immediate(upstream)
+    snapshot = controller.snapshot()
+    assert snapshot["stage_backpressure"] == _stage_backpressure_mapping(enabled=False)
+    assert snapshot["stage_backpressure_state"] == {
+        "schema_version": 1,
+        "upstream_unfinished_logical": 1,
+        "downstream_unfinished_logical": 1,
+        "overlap_unfinished_logical": 0,
+        "blocking": False,
+    }
+    assert snapshot["blocked_by_limit"] == {}
+
+
+def test_stage_backpressure_blocks_and_unblocks_matching_upstream_dispatch() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"speech": 100}},
+            stage_backpressure=_stage_backpressure(),
+        ),
+    )
+    assert controller.snapshot()["stage_backpressure_state"] == {
+        "schema_version": 1,
+        "upstream_unfinished_logical": 0,
+        "downstream_unfinished_logical": 0,
+        "overlap_unfinished_logical": 0,
+        "blocking": False,
+    }
+    controller.acquire_immediate(_pending("downstream", stage_id=1, starts_request=False, request_class="speech"))
+    upstream = _pending("upstream", request_class="speech")
+
+    assert controller.requires_queue(upstream)
+    controller.enqueue(upstream)
+    assert controller.pop_ready() is None
+    snapshot = controller.snapshot()
+    assert snapshot["stage_backpressure_state"] == {
+        "schema_version": 1,
+        "upstream_unfinished_logical": 1,
+        "downstream_unfinished_logical": 1,
+        "overlap_unfinished_logical": 0,
+        "blocking": True,
+    }
+    assert snapshot["blocked_by_limit"] == {"backpressure": 1}
+
+    assert controller.release_stage("downstream", 1)
+    snapshot = controller.snapshot()
+    assert snapshot["stage_backpressure_state"] == {
+        "schema_version": 1,
+        "upstream_unfinished_logical": 1,
+        "downstream_unfinished_logical": 0,
+        "overlap_unfinished_logical": 0,
+        "blocking": False,
+    }
+    acquired = controller.pop_ready()
+    assert acquired is not None and acquired.pending.request_id == "upstream"
+
+
+def test_stage_backpressure_allows_existing_lease_updates_while_blocking_new_work() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"speech": 100}},
+            stage_backpressure=_stage_backpressure(),
+        ),
+    )
+    controller.acquire_immediate(_pending("upstream-active", request_class="speech"))
+    controller.acquire_immediate(_pending("downstream-1", stage_id=1, starts_request=False, request_class="speech"))
+    controller.acquire_immediate(_pending("downstream-2", stage_id=2, starts_request=False, request_class="speech"))
+
+    update = _pending("upstream-active", starts_request=False, request_class="speech")
+    new_request = _pending("upstream-new", request_class="speech")
+    assert controller.requires_queue(update)
+    assert controller.requires_queue(new_request)
+    controller.enqueue(update)
+    controller.enqueue(new_request)
+
+    snapshot = controller.snapshot()
+    assert snapshot["stage_backpressure_state"] == {
+        "schema_version": 1,
+        "upstream_unfinished_logical": 2,
+        "downstream_unfinished_logical": 2,
+        "overlap_unfinished_logical": 0,
+        "blocking": True,
+    }
+    assert snapshot["blocked_by_limit"] == {"backpressure": 1}
+    acquired = controller.pop_ready()
+    assert acquired is not None and acquired.pending.request_id == "upstream-active"
+    assert not acquired.acquired_stage
+    assert controller.pop_ready() is None
+
+    assert controller.release_stage("downstream-2", 2)
+    acquired = controller.pop_ready()
+    assert acquired is not None and acquired.pending.request_id == "upstream-new"
+
+
+def test_stage_backpressure_drains_mm_cache_predecessor_before_existing_lease_update() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"speech": 100}},
+            stage_backpressure=_stage_backpressure(),
+        ),
+    )
+    controller.acquire_immediate(_pending("streaming", request_class="speech"))
+    controller.acquire_immediate(_pending("downstream-1", stage_id=1, starts_request=False, request_class="speech"))
+    controller.acquire_immediate(_pending("downstream-2", stage_id=2, starts_request=False, request_class="speech"))
+    predecessor = _pending(
+        "new-request",
+        request_class="speech",
+        preserve_stage0_mm_cache_order=True,
+    )
+    existing_lease_update = _pending(
+        "streaming",
+        starts_request=False,
+        request_class="speech",
+        preserve_stage0_mm_cache_order=True,
+    )
+    controller.enqueue(predecessor)
+    controller.enqueue(existing_lease_update)
+
+    snapshot = controller.snapshot()
+    assert snapshot["stage_backpressure_state"]["blocking"] is True
+    assert snapshot["blocked_by_limit"] == {"mm_cache_order": 1}
+    first = controller.pop_ready()
+    second = controller.pop_ready()
+    assert first is not None and first.pending.request_id == "new-request"
+    assert second is not None and second.pending.request_id == "streaming"
+    assert not second.acquired_stage
+
+
+def test_stage_backpressure_deduplicates_downstream_stages_and_reports_overlap() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"speech": 100}},
+            stage_backpressure=_stage_backpressure(),
+        ),
+    )
+    controller.acquire_immediate(_pending("overlap", request_class="speech"))
+    controller.acquire_immediate(_pending("overlap", stage_id=1, starts_request=False, request_class="speech"))
+    controller.acquire_immediate(_pending("overlap", stage_id=2, starts_request=False, request_class="speech"))
+    controller.enqueue(_pending("overlap", stage_id=2, starts_request=False, request_class="speech"))
+
+    assert controller.snapshot()["stage_backpressure_state"] == {
+        "schema_version": 1,
+        "upstream_unfinished_logical": 1,
+        "downstream_unfinished_logical": 1,
+        "overlap_unfinished_logical": 1,
+        "blocking": True,
+    }
+
+
+def test_stage_backpressure_ignores_non_target_class_and_stage() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"speech": 100}},
+            stage_backpressure=_stage_backpressure(),
+        ),
+    )
+
+    assert not controller.requires_queue(_pending("text-upstream", request_class="text"))
+    assert not controller.requires_queue(
+        _pending("speech-downstream", stage_id=1, starts_request=True, request_class="speech")
+    )
+    assert controller.requires_queue(_pending("speech-upstream", request_class="speech"))
+
+
+def test_unfinished_logical_state_is_computed_once_per_pop_and_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"speech": 100}},
+            stage_backpressure=_stage_backpressure(),
+        ),
+    )
+    controller.acquire_immediate(_pending("downstream", stage_id=1, starts_request=False, request_class="speech"))
+    controller.enqueue(_pending("upstream-1", request_class="speech"))
+    controller.enqueue(_pending("upstream-2", request_class="speech"))
+
+    calls = 0
+    original = controller._unfinished_logical_ids_by_stage_class
+
+    def counted_state() -> dict[tuple[int, str], set[str]]:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(controller, "_unfinished_logical_ids_by_stage_class", counted_state)
+    assert controller.pop_ready() is not None
+    assert calls == 1
+
+    calls = 0
+    controller.snapshot()
+    assert calls == 1
+
+
+def test_block_evaluation_precomputes_request_counts_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=QueueControlConfig(
+            enabled=True,
+            path_wip_limits={"speech": 1},
+            class_wip_limits={"speech": 1},
+        ),
+    )
+    controller.acquire_immediate(_pending("active", request_class="speech", path="speech"))
+    for index in range(20):
+        controller.enqueue(_pending(f"pending-{index}", request_class="speech", path="speech"))
+
+    calls = 0
+    original = controller._request_counts
+
+    def counted_request_counts() -> tuple[object, object]:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(controller, "_request_counts", counted_request_counts)
+    assert controller.pop_ready() is None
+    assert calls == 1
+
+    calls = 0
+    controller.snapshot()
+    assert calls == 1
+
+
+def test_large_backpressure_queue_uses_only_linear_state_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingDict(dict[tuple[str, int], str]):
+        items_calls = 0
+
+        def items(self):  # type: ignore[no-untyped-def]
+            self.items_calls += 1
+            return super().items()
+
+    class CountingList(list[PendingStageDispatch]):
+        iter_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.iter_calls += 1
+            return super().__iter__()
+
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"speech": 2000}},
+            stage_backpressure=_stage_backpressure(),
+        ),
+    )
+    for index in range(1000):
+        controller.acquire_immediate(
+            _pending(f"downstream-{index}", stage_id=1, starts_request=False, request_class="speech")
+        )
+        controller.enqueue(_pending(f"upstream-{index}", request_class="speech"))
+
+    active_stage_classes = CountingDict(controller._active_stage_classes)
+    pending = CountingList(controller._pending)
+    controller._active_stage_classes = active_stage_classes
+    controller._pending = pending
+
+    def unexpected_request_counts() -> tuple[object, object]:
+        raise AssertionError("request counts must be skipped when no path/class limits are configured")
+
+    monkeypatch.setattr(controller, "_request_counts", unexpected_request_counts)
+    assert controller.pop_ready() is None
+    assert active_stage_classes.items_calls == 1
+    assert pending.iter_calls == 2
+
+
 def test_stage_class_live_reconfiguration_and_reduction_are_nonpreemptive() -> None:
     controller = RuntimeQueueController(
         num_stages=2,
@@ -1285,6 +1762,93 @@ def test_released_upstream_still_satisfies_a_queued_downstream_dependency() -> N
         )
     )
     assert controller.pop_ready().pending.stage_id == 1  # type: ignore[union-attr]
+
+
+def test_downstream_unfinished_logical_excludes_stage0_and_deduplicates_pending_stages() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(enabled=True),
+    )
+    controller.acquire_immediate(_pending("stage0-only", request_class="speech"))
+    assert controller.snapshot()["downstream_unfinished_logical_by_class"] == {}
+
+    controller.enqueue(
+        _pending(
+            "pending-stage-1",
+            logical_request_id="pending-logical",
+            stage_id=1,
+            starts_request=False,
+            request_class="speech",
+        )
+    )
+    controller.enqueue(
+        _pending(
+            "pending-stage-2",
+            logical_request_id="pending-logical",
+            stage_id=2,
+            starts_request=False,
+            request_class="speech",
+        )
+    )
+    assert controller.snapshot()["downstream_unfinished_logical_by_class"] == {"speech": 1}
+
+
+def test_unfinished_logical_by_stage_class_deduplicates_active_and_pending_updates() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(enabled=True),
+    )
+    controller.acquire_immediate(_pending("speech-1", request_class="speech"))
+    controller.enqueue(_pending("speech-1", starts_request=False, request_class="speech"))
+    assert controller.snapshot()["unfinished_logical_by_stage_class"] == {"0": {"speech": 1}}
+
+    controller.acquire_immediate(_pending("speech-2", request_class="speech"))
+    controller.acquire_immediate(_pending("speech-1", stage_id=1, starts_request=False, request_class="speech"))
+    controller.enqueue(_pending("text-1", request_class="text"))
+    controller.enqueue(
+        _pending(
+            "text-stage-2",
+            logical_request_id="text-1",
+            stage_id=2,
+            starts_request=False,
+            request_class="text",
+        )
+    )
+    assert controller.snapshot()["unfinished_logical_by_stage_class"] == {
+        "0": {"speech": 2, "text": 1},
+        "1": {"speech": 1},
+        "2": {"text": 1},
+    }
+
+
+def test_downstream_unfinished_logical_count_deduplicates_stage_leases_and_queue() -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={2: {"speech": 1}},
+        ),
+    )
+
+    controller.acquire_immediate(_pending("r1", stage_id=1, starts_request=False, request_class="speech"))
+    controller.acquire_immediate(_pending("r1", stage_id=2, starts_request=False, request_class="speech"))
+    snapshot = controller.snapshot()
+    assert snapshot["active_by_stage_class"] == {
+        "1": {"speech": 1},
+        "2": {"speech": 1},
+    }
+    assert snapshot["downstream_unfinished_logical_by_class"] == {"speech": 1}
+
+    controller.acquire_immediate(_pending("r2", stage_id=1, starts_request=False, request_class="speech"))
+    controller.enqueue(_pending("r2", stage_id=2, starts_request=False, request_class="speech"))
+    snapshot = controller.snapshot()
+    assert snapshot["queued_by_stage_class"] == {"2": {"speech": 1}}
+    assert snapshot["downstream_unfinished_logical_by_class"] == {"speech": 2}
+
+    controller.cancel_request("r1")
+    assert controller.snapshot()["downstream_unfinished_logical_by_class"] == {"speech": 1}
+    controller.cancel_request("r2")
+    assert controller.snapshot()["downstream_unfinished_logical_by_class"] == {}
 
 
 def test_dependency_completion_excludes_rollback_and_is_cleared_on_cancel() -> None:

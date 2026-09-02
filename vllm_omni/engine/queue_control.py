@@ -161,6 +161,12 @@ def _stage_key(value: Any) -> int:
     return stage_id
 
 
+def _strict_stage_id(value: Any, *, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
 def _string_key(value: Any) -> str:
     return _label(str(value), default="default", field_name="limit key")
 
@@ -1102,6 +1108,113 @@ class OnlineAllocatorMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class StageBackpressureConfig:
+    """Schema-v1 dispatch guard from the shared stage to downstream stages."""
+
+    enabled: bool
+    upstream_stage_id: int
+    downstream_stage_ids: tuple[int, ...]
+    request_class: str
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("queue_control.stage_backpressure.schema_version must be 1")
+        if not isinstance(self.enabled, bool):
+            raise ValueError("queue_control.stage_backpressure.enabled must be boolean")
+        upstream_stage_id = _strict_stage_id(
+            self.upstream_stage_id,
+            field_name="queue_control.stage_backpressure.upstream_stage_id",
+        )
+        if upstream_stage_id != 0:
+            raise ValueError("queue_control.stage_backpressure.upstream_stage_id must be 0 in schema_version 1")
+        raw_downstream_stage_ids = self.downstream_stage_ids
+        if not isinstance(raw_downstream_stage_ids, (list, tuple)):
+            raise ValueError("queue_control.stage_backpressure.downstream_stage_ids must be an array")
+        if not raw_downstream_stage_ids:
+            raise ValueError("queue_control.stage_backpressure.downstream_stage_ids must not be empty")
+        downstream_stage_ids = tuple(
+            _strict_stage_id(
+                stage_id,
+                field_name=f"queue_control.stage_backpressure.downstream_stage_ids[{index}]",
+            )
+            for index, stage_id in enumerate(raw_downstream_stage_ids)
+        )
+        if len(set(downstream_stage_ids)) != len(downstream_stage_ids):
+            raise ValueError("queue_control.stage_backpressure.downstream_stage_ids must not contain duplicates")
+        if any(stage_id <= upstream_stage_id for stage_id in downstream_stage_ids):
+            raise ValueError(
+                "queue_control.stage_backpressure.downstream_stage_ids must contain only stage ids "
+                "greater than upstream_stage_id"
+            )
+        if not isinstance(self.request_class, str):
+            raise ValueError("queue_control.stage_backpressure.request_class must be a string")
+        request_class = _label(
+            self.request_class,
+            default="",
+            field_name="queue_control.stage_backpressure.request_class",
+        )
+        if not request_class:
+            raise ValueError("queue_control.stage_backpressure.request_class must be non-empty")
+        object.__setattr__(self, "upstream_stage_id", upstream_stage_id)
+        object.__setattr__(self, "downstream_stage_ids", tuple(sorted(downstream_stage_ids)))
+        object.__setattr__(self, "request_class", request_class)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Any,
+        *,
+        num_stages: int | None = None,
+    ) -> StageBackpressureConfig:
+        if not isinstance(raw, Mapping):
+            raise ValueError("queue_control.stage_backpressure must be a JSON object")
+        expected_fields = {
+            "schema_version",
+            "enabled",
+            "upstream_stage_id",
+            "downstream_stage_ids",
+            "request_class",
+        }
+        missing_fields = sorted(expected_fields - set(raw))
+        if missing_fields:
+            raise ValueError(f"queue_control.stage_backpressure is missing required fields: {missing_fields}")
+        unknown_fields = sorted(str(field) for field in set(raw) - expected_fields)
+        if unknown_fields:
+            raise ValueError(f"queue_control.stage_backpressure contains unknown fields: {unknown_fields}")
+        downstream_stage_ids = raw["downstream_stage_ids"]
+        if not isinstance(downstream_stage_ids, list):
+            raise ValueError("queue_control.stage_backpressure.downstream_stage_ids must be a JSON array")
+        config = cls(
+            schema_version=raw["schema_version"],
+            enabled=raw["enabled"],
+            upstream_stage_id=raw["upstream_stage_id"],
+            downstream_stage_ids=tuple(downstream_stage_ids),
+            request_class=raw["request_class"],
+        )
+        config.validate_num_stages(num_stages)
+        return config
+
+    def validate_num_stages(self, num_stages: int | None) -> None:
+        if num_stages is None:
+            return
+        invalid_stage_ids = sorted(
+            stage_id for stage_id in (self.upstream_stage_id, *self.downstream_stage_ids) if stage_id >= num_stages
+        )
+        if invalid_stage_ids:
+            raise ValueError(f"stage_backpressure contains unavailable stage ids: {invalid_stage_ids}")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "enabled": self.enabled,
+            "upstream_stage_id": self.upstream_stage_id,
+            "downstream_stage_ids": list(self.downstream_stage_ids),
+            "request_class": self.request_class,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class QueueControlConfig:
     """Validated queue-control settings loaded from ``queue_control`` JSON."""
 
@@ -1113,10 +1226,28 @@ class QueueControlConfig:
     path_wip_limits: dict[str, int] = field(default_factory=dict)
     class_wip_limits: dict[str, int] = field(default_factory=dict)
     admission: AdmissionControlConfig = field(default_factory=AdmissionControlConfig)
+    stage_backpressure: StageBackpressureConfig | None = None
     online_allocator: OnlineAllocatorMetadata | None = None
     _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.stage_backpressure is not None and not isinstance(
+            self.stage_backpressure,
+            StageBackpressureConfig,
+        ):
+            raise ValueError("queue_control.stage_backpressure must be a StageBackpressureConfig")
+        if self.stage_backpressure is not None and self.stage_backpressure.enabled:
+            if not self.enabled:
+                raise ValueError("enabled queue_control.stage_backpressure requires queue_control.enabled to be true")
+            upstream_class_limits = self.stage_class_wip_limits.get(
+                self.stage_backpressure.upstream_stage_id,
+                {},
+            )
+            if self.stage_backpressure.request_class not in upstream_class_limits:
+                raise ValueError(
+                    "enabled queue_control.stage_backpressure requires a matching "
+                    "queue_control.stage_class_wip_limits entry"
+                )
         if self.admission.enabled and self.admission.enforce and self.policy != "edf":
             raise ValueError("queue_control.policy must be 'edf' when admission enforcement is enabled")
         object.__setattr__(self, "_fingerprint", _sha256_fingerprint(self.semantic_mapping()))
@@ -1124,7 +1255,7 @@ class QueueControlConfig:
     def semantic_mapping(self) -> dict[str, Any]:
         """Return the normalized config covered by allocator compare-and-swap."""
 
-        return {
+        semantic = {
             "enabled": self.enabled,
             "policy": self.policy,
             "global_wip_limit": self.global_wip_limit,
@@ -1161,6 +1292,9 @@ class QueueControlConfig:
                 },
             },
         }
+        if self.stage_backpressure is not None:
+            semantic["stage_backpressure"] = self.stage_backpressure.to_mapping()
+        return semantic
 
     def fingerprint(self) -> str:
         """Hash every semantic queue-control field except allocator metadata."""
@@ -1205,6 +1339,14 @@ class QueueControlConfig:
                 raise ValueError(f"stage_class_wip_limits contains unavailable stage ids: {invalid}")
 
         admission = AdmissionControlConfig.from_mapping(raw.get("admission"))
+        stage_backpressure = (
+            StageBackpressureConfig.from_mapping(
+                raw["stage_backpressure"],
+                num_stages=num_stages,
+            )
+            if "stage_backpressure" in raw
+            else None
+        )
         config = cls(
             enabled=enabled,
             policy=policy,  # type: ignore[arg-type]
@@ -1225,6 +1367,7 @@ class QueueControlConfig:
                 key_parser=_string_key,
             ),
             admission=admission,
+            stage_backpressure=stage_backpressure,
             online_allocator=OnlineAllocatorMetadata.from_mapping(raw.get("online_allocator")),
         )
         if (
@@ -1276,6 +1419,25 @@ class _ActiveStageTelemetry:
 
 
 @dataclass(frozen=True, slots=True)
+class _StageBackpressureState:
+    upstream_count: int
+    downstream_count: int
+    overlap_unfinished_logical: int
+    blocking: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _QueueBlockState:
+    stage_backpressure: _StageBackpressureState | None
+    active_stage_counts: Mapping[int, int]
+    active_stage_class_counts: Mapping[tuple[int, str], int]
+    request_path_counts: Mapping[str, int]
+    request_class_counts: Mapping[str, int]
+    mm_cache_head_sequence_by_stage: Mapping[int, int]
+    mm_cache_progress_cutoff_by_stage: Mapping[int, int]
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionDecision:
     """One calibrated ingress-admission evaluation."""
 
@@ -1321,6 +1483,8 @@ class RuntimeQueueController:
             raise ValueError("num_stages must be non-negative")
         self.num_stages = num_stages
         self.config = config or QueueControlConfig()
+        if self.config.stage_backpressure is not None:
+            self.config.stage_backpressure.validate_num_stages(num_stages)
         self._clock = clock
         self._pending: list[PendingStageDispatch] = []
         self._next_sequence = 0
@@ -1370,9 +1534,14 @@ class RuntimeQueueController:
 
     @property
     def active(self) -> bool:
-        """Whether either queue credits or ingress admission needs the path."""
+        """Whether credits, admission, or stage backpressure needs the path."""
 
-        return self.enabled or self.config.admission.enabled
+        stage_backpressure = self.config.stage_backpressure
+        return (
+            self.enabled
+            or self.config.admission.enabled
+            or bool(stage_backpressure is not None and stage_backpressure.enabled)
+        )
 
     @property
     def config_generation(self) -> int:
@@ -1383,6 +1552,8 @@ class RuntimeQueueController:
     def configure(self, config: QueueControlConfig) -> bool:
         if config == self.config:
             return False
+        if config.stage_backpressure is not None:
+            config.stage_backpressure.validate_num_stages(self.num_stages)
         current_update = self.config.online_allocator
         incoming_update = config.online_allocator
         if current_update is not None and incoming_update is not None:
@@ -1443,8 +1614,9 @@ class RuntimeQueueController:
 
         End-to-end request limits and admission only gate the first stage
         submission. Later stages stay on the immediate dispatch path unless a
-        dependency, stage, or stage-class WIP limit requires queuing. This
-        avoids serializing every pipeline edge behind a class-level controller.
+        dependency, stage, stage-class, or backpressure guard requires queuing.
+        This avoids serializing every pipeline edge behind a class-level
+        controller.
         """
         if pending.preserve_stage0_mm_cache_order and any(
             item.preserve_stage0_mm_cache_order and item.stage_id == pending.stage_id for item in self._pending
@@ -1452,6 +1624,8 @@ class RuntimeQueueController:
             return True
         if not self.active:
             return False
+        if self._matches_stage_backpressure_upstream(pending):
+            return True
         if (
             self.config.admission.enabled
             and pending.starts_request
@@ -1485,6 +1659,14 @@ class RuntimeQueueController:
         class_counts = Counter(metadata.request_class for metadata in self._active_requests.values())
         return path_counts, class_counts
 
+    def _active_stage_counts(self) -> tuple[Counter[int], Counter[tuple[int, str]]]:
+        stage_counts: Counter[int] = Counter()
+        stage_class_counts: Counter[tuple[int, str]] = Counter()
+        for (_, stage_id), request_class in self._active_stage_classes.items():
+            stage_counts[stage_id] += 1
+            stage_class_counts[stage_id, request_class] += 1
+        return stage_counts, stage_class_counts
+
     def _active_stage_class_count(self, stage_id: int, request_class: str) -> int:
         return sum(
             active_stage_id == stage_id and active_class == request_class
@@ -1494,6 +1676,69 @@ class RuntimeQueueController:
     def _request_class(self, pending: PendingStageDispatch) -> str:
         metadata = self._active_requests.get(pending.logical_request_id, pending.metadata)
         return metadata.request_class
+
+    def _matches_stage_backpressure_upstream(self, pending: PendingStageDispatch) -> bool:
+        config = self.config.stage_backpressure
+        return bool(
+            config is not None
+            and config.enabled
+            and pending.stage_id == config.upstream_stage_id
+            and self._request_class(pending) == config.request_class
+        )
+
+    def _mm_cache_order_state(self) -> tuple[dict[int, int], dict[int, int]]:
+        head_sequence_by_stage: dict[int, int] = {}
+        progress_cutoff_by_stage: dict[int, int] = {}
+        for item in self._pending:
+            if not item.preserve_stage0_mm_cache_order:
+                continue
+            head_sequence_by_stage[item.stage_id] = min(
+                item.sequence,
+                head_sequence_by_stage.get(item.stage_id, item.sequence),
+            )
+            if (item.request_id, item.stage_id) in self._active_stages and self._matches_stage_backpressure_upstream(
+                item
+            ):
+                progress_cutoff_by_stage[item.stage_id] = min(
+                    item.sequence,
+                    progress_cutoff_by_stage.get(item.stage_id, item.sequence),
+                )
+        return head_sequence_by_stage, progress_cutoff_by_stage
+
+    def _unfinished_logical_ids_by_stage_class(self) -> dict[tuple[int, str], set[str]]:
+        unfinished: dict[tuple[int, str], set[str]] = {}
+        for (_, stage_id), lease in self._active_stage_telemetry.items():
+            unfinished.setdefault((stage_id, lease.request_class), set()).add(lease.logical_request_id)
+        for item in self._pending:
+            unfinished.setdefault((item.stage_id, self._request_class(item)), set()).add(item.logical_request_id)
+        return unfinished
+
+    def _stage_backpressure_state(
+        self,
+        unfinished_logical_ids_by_stage_class: Mapping[tuple[int, str], set[str]],
+    ) -> _StageBackpressureState | None:
+        config = self.config.stage_backpressure
+        if config is None:
+            return None
+
+        upstream_logical_ids = unfinished_logical_ids_by_stage_class.get(
+            (config.upstream_stage_id, config.request_class),
+            set(),
+        )
+        downstream_logical_ids: set[str] = set()
+        for stage_id in config.downstream_stage_ids:
+            downstream_logical_ids.update(
+                unfinished_logical_ids_by_stage_class.get((stage_id, config.request_class), ())
+            )
+
+        upstream_count = len(upstream_logical_ids)
+        downstream_count = len(downstream_logical_ids)
+        return _StageBackpressureState(
+            upstream_count=upstream_count,
+            downstream_count=downstream_count,
+            overlap_unfinished_logical=len(upstream_logical_ids & downstream_logical_ids),
+            blocking=config.enabled and upstream_count > 0 and upstream_count <= downstream_count,
+        )
 
     def _dependency_satisfied(self, pending: PendingStageDispatch) -> bool:
         required_stage_id = pending.required_active_stage_id
@@ -1781,34 +2026,51 @@ class RuntimeQueueController:
             self._pending = [pending for pending in self._pending if pending.sequence not in rejected_sequences]
         return rejected
 
-    def _blocked_reasons(self, pending: PendingStageDispatch) -> tuple[str, ...]:
+    def _blocked_reasons(
+        self,
+        pending: PendingStageDispatch,
+        *,
+        block_state: _QueueBlockState,
+    ) -> tuple[str, ...]:
         reasons: list[str] = []
-        if pending.preserve_stage0_mm_cache_order and any(
-            item.preserve_stage0_mm_cache_order
-            and item.stage_id == pending.stage_id
-            and item.sequence < pending.sequence
-            for item in self._pending
+        mm_cache_head_sequence = block_state.mm_cache_head_sequence_by_stage.get(pending.stage_id)
+        if (
+            pending.preserve_stage0_mm_cache_order
+            and mm_cache_head_sequence is not None
+            and pending.sequence != mm_cache_head_sequence
         ):
             reasons.append("mm_cache_order")
         if not self.active:
             return tuple(reasons)
         if not self._dependency_satisfied(pending):
             reasons.append("dependency")
+        stage_backpressure_state = block_state.stage_backpressure
+        mm_cache_progress_cutoff = block_state.mm_cache_progress_cutoff_by_stage.get(pending.stage_id)
+        must_drain_for_existing_lease_progress = bool(
+            pending.preserve_stage0_mm_cache_order
+            and mm_cache_progress_cutoff is not None
+            and pending.sequence < mm_cache_progress_cutoff
+        )
+        if (
+            stage_backpressure_state is not None
+            and stage_backpressure_state.blocking
+            and self._matches_stage_backpressure_upstream(pending)
+            and (pending.request_id, pending.stage_id) not in self._active_stages
+            and not must_drain_for_existing_lease_progress
+        ):
+            reasons.append("backpressure")
         if self.enabled:
             stage_key = (pending.request_id, pending.stage_id)
             if stage_key not in self._active_stages:
                 stage_limit = self.config.stage_wip_limits.get(pending.stage_id)
                 if stage_limit is not None:
-                    active = sum(stage_id == pending.stage_id for _, stage_id in self._active_stages)
+                    active = block_state.active_stage_counts.get(pending.stage_id, 0)
                     if active >= stage_limit:
                         reasons.append("stage")
                 request_class = self._request_class(pending)
                 stage_class_limit = self.config.stage_class_wip_limits.get(pending.stage_id, {}).get(request_class)
                 if stage_class_limit is not None:
-                    active = sum(
-                        stage_id == pending.stage_id and active_class == request_class
-                        for (_, stage_id), active_class in self._active_stage_classes.items()
-                    )
+                    active = block_state.active_stage_class_counts.get((pending.stage_id, request_class), 0)
                     if active >= stage_class_limit:
                         reasons.append("stage_class")
 
@@ -1816,16 +2078,21 @@ class RuntimeQueueController:
             if not pending.starts_request:
                 reasons.append("request")
                 return tuple(reasons)
-            path_counts, class_counts = self._request_counts()
             if self.enabled:
                 global_limit = self.config.global_wip_limit
                 if global_limit is not None and len(self._active_requests) >= global_limit:
                     reasons.append("global")
                 path_limit = self.config.path_wip_limits.get(pending.metadata.path)
-                if path_limit is not None and path_counts[pending.metadata.path] >= path_limit:
+                if (
+                    path_limit is not None
+                    and block_state.request_path_counts.get(pending.metadata.path, 0) >= path_limit
+                ):
                     reasons.append("path")
                 class_limit = self.config.class_wip_limits.get(pending.metadata.request_class)
-                if class_limit is not None and class_counts[pending.metadata.request_class] >= class_limit:
+                if (
+                    class_limit is not None
+                    and block_state.request_class_counts.get(pending.metadata.request_class, 0) >= class_limit
+                ):
                     reasons.append("class")
         return tuple(reasons)
 
@@ -1838,9 +2105,37 @@ class RuntimeQueueController:
     def pop_ready(self) -> AcquiredStageDispatch | None:
         if not self._pending:
             return None
+        stage_backpressure_state = None
+        if self.config.stage_backpressure is not None:
+            stage_backpressure_state = self._stage_backpressure_state(self._unfinished_logical_ids_by_stage_class())
+        active_stage_counts: Mapping[int, int] = {}
+        active_stage_class_counts: Mapping[tuple[int, str], int] = {}
+        if self.enabled and (self.config.stage_wip_limits or self.config.stage_class_wip_limits):
+            active_stage_counts, active_stage_class_counts = self._active_stage_counts()
+        request_path_counts: Mapping[str, int] = {}
+        request_class_counts: Mapping[str, int] = {}
+        if self.enabled and (self.config.path_wip_limits or self.config.class_wip_limits):
+            request_path_counts, request_class_counts = self._request_counts()
+        mm_cache_head_sequences, mm_cache_progress_cutoffs = self._mm_cache_order_state()
+        block_state = _QueueBlockState(
+            stage_backpressure=stage_backpressure_state,
+            active_stage_counts=active_stage_counts,
+            active_stage_class_counts=active_stage_class_counts,
+            request_path_counts=request_path_counts,
+            request_class_counts=request_class_counts,
+            mm_cache_head_sequence_by_stage=mm_cache_head_sequences,
+            mm_cache_progress_cutoff_by_stage=mm_cache_progress_cutoffs,
+        )
         ordered_indices = sorted(range(len(self._pending)), key=lambda index: self._order_key(self._pending[index]))
         selected_index = next(
-            (index for index in ordered_indices if not self._blocked_reasons(self._pending[index])),
+            (
+                index
+                for index in ordered_indices
+                if not self._blocked_reasons(
+                    self._pending[index],
+                    block_state=block_state,
+                )
+            ),
             None,
         )
         if selected_index is None:
@@ -2001,18 +2296,38 @@ class RuntimeQueueController:
 
     def snapshot(self) -> dict[str, Any]:
         path_counts, class_counts = self._request_counts()
-        stage_counts = Counter(stage_id for _, stage_id in self._active_stages)
-        stage_class_counts = Counter(
-            (stage_id, request_class) for (_, stage_id), request_class in self._active_stage_classes.items()
-        )
+        stage_counts, stage_class_counts = self._active_stage_counts()
         queued_stage_counts = Counter(item.stage_id for item in self._pending)
         queued_stage_class_counts = Counter((item.stage_id, self._request_class(item)) for item in self._pending)
+        unfinished_logical_ids_by_stage_class = self._unfinished_logical_ids_by_stage_class()
+        downstream_unfinished_logical_ids_by_class: dict[str, set[str]] = {}
+        for (stage_id, request_class), logical_request_ids in unfinished_logical_ids_by_stage_class.items():
+            if stage_id > 0:
+                downstream_unfinished_logical_ids_by_class.setdefault(request_class, set()).update(logical_request_ids)
         queued_class_counts = Counter(
             item.metadata.request_class
             for item in self._pending
             if item.starts_request and item.stage_id == 0 and item.logical_request_id not in self._active_requests
         )
-        blocked = Counter(reason for pending in self._pending for reason in self._blocked_reasons(pending))
+        stage_backpressure_state = self._stage_backpressure_state(unfinished_logical_ids_by_stage_class)
+        mm_cache_head_sequences, mm_cache_progress_cutoffs = self._mm_cache_order_state()
+        block_state = _QueueBlockState(
+            stage_backpressure=stage_backpressure_state,
+            active_stage_counts=stage_counts,
+            active_stage_class_counts=stage_class_counts,
+            request_path_counts=path_counts,
+            request_class_counts=class_counts,
+            mm_cache_head_sequence_by_stage=mm_cache_head_sequences,
+            mm_cache_progress_cutoff_by_stage=mm_cache_progress_cutoffs,
+        )
+        blocked = Counter(
+            reason
+            for pending in self._pending
+            for reason in self._blocked_reasons(
+                pending,
+                block_state=block_state,
+            )
+        )
         recent_admission_decisions = list(self._recent_admission_decisions)
         now = self._clock()
         stage_class_active_time_s_total = Counter(self._stage_class_active_time_s_total)
@@ -2075,6 +2390,20 @@ class RuntimeQueueController:
             },
             "path_wip_limits": dict(sorted(self.config.path_wip_limits.items())),
             "class_wip_limits": dict(sorted(self.config.class_wip_limits.items())),
+            "stage_backpressure": (
+                None if self.config.stage_backpressure is None else self.config.stage_backpressure.to_mapping()
+            ),
+            "stage_backpressure_state": (
+                None
+                if stage_backpressure_state is None
+                else {
+                    "schema_version": 1,
+                    "upstream_unfinished_logical": stage_backpressure_state.upstream_count,
+                    "downstream_unfinished_logical": stage_backpressure_state.downstream_count,
+                    "overlap_unfinished_logical": stage_backpressure_state.overlap_unfinished_logical,
+                    "blocking": stage_backpressure_state.blocking,
+                }
+            ),
             "online_allocator": (
                 None if self.config.online_allocator is None else self.config.online_allocator.to_snapshot()
             ),
@@ -2150,6 +2479,18 @@ class RuntimeQueueController:
                 for stage_id in sorted({stage_id for stage_id, _ in queued_stage_class_counts})
             },
             "queued_by_class": dict(sorted(queued_class_counts.items())),
+            "unfinished_logical_by_stage_class": {
+                str(stage_id): {
+                    request_class: len(unfinished_logical_ids_by_stage_class[stage_id, request_class])
+                    for candidate_stage_id, request_class in sorted(unfinished_logical_ids_by_stage_class)
+                    if candidate_stage_id == stage_id
+                }
+                for stage_id in sorted({stage_id for stage_id, _ in unfinished_logical_ids_by_stage_class})
+            },
+            "downstream_unfinished_logical_by_class": {
+                request_class: len(logical_request_ids)
+                for request_class, logical_request_ids in sorted(downstream_unfinished_logical_ids_by_class.items())
+            },
             "arrivals_by_class_total": dict(sorted(self._arrivals_by_class_total.items())),
             "admitted_arrivals_by_class_total": dict(sorted(self._admitted_arrivals_by_class_total.items())),
             "recheck_rejections_by_class_total": dict(sorted(self._recheck_rejections_by_class_total.items())),
