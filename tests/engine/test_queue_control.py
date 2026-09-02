@@ -14,6 +14,7 @@ import vllm_omni.engine.queue_control as queue_control_module
 from vllm_omni.engine.queue_control import (
     ADMISSION_DECISION_HISTORY_LIMIT,
     DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS,
+    RECENT_STAGE_CANCELLATION_HISTORY_LIMIT,
     RECENT_STAGE_COMPLETION_HISTORY_LIMIT,
     AdmissionClassConfig,
     AdmissionControlConfig,
@@ -2836,6 +2837,7 @@ def test_stage_class_runtime_telemetry_records_live_and_completed_time() -> None
                     "active_time_s_total": pytest.approx(3.0),
                     "rollback_total": 0,
                     "cancelled_active_total": 0,
+                    "cancelled_pending_total": 0,
                 }
             }
         },
@@ -2955,6 +2957,73 @@ def test_stage_class_runtime_telemetry_cancel_closes_parent_and_child_leases() -
         "0": {"speech": 1},
         "1": {"speech": 1},
     }
+
+
+def test_stage_cancellation_ring_identifies_active_and_pending_terminals() -> None:
+    now = [1.0]
+    controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
+    controller.acquire_immediate(
+        _pending(
+            "active",
+            request_class="speech",
+            admission_correlation_id="client-active",
+        )
+    )
+    controller.enqueue(
+        _pending(
+            "pending",
+            request_class="text",
+            admission_correlation_id="client-pending",
+        )
+    )
+
+    now[0] = 2.0
+    controller.cancel_request("active")
+    now[0] = 3.0
+    controller.cancel_request("pending")
+    snapshot = controller.snapshot()
+
+    assert snapshot["cancelled_active_by_stage_class_total"] == {"0": {"speech": 1, "text": 0}}
+    assert snapshot["cancelled_pending_by_stage_class_total"] == {"0": {"speech": 0, "text": 1}}
+    assert snapshot["recent_stage_cancellation_schema_version"] == 1
+    assert snapshot["recent_stage_cancellation_capacity"] == (RECENT_STAGE_CANCELLATION_HISTORY_LIMIT)
+    assert snapshot["recent_stage_cancellation_overwritten_total"] == 0
+    assert snapshot["recent_stage_cancellation_first_sequence"] == 1
+    assert snapshot["recent_stage_cancellation_last_sequence"] == 2
+    assert [
+        {
+            key: row[key]
+            for key in (
+                "cancellation_sequence",
+                "outcome",
+                "request_id",
+                "logical_request_id",
+                "stage_id",
+                "request_class",
+                "admission_correlation_id",
+            )
+        }
+        for row in snapshot["recent_stage_cancellations"]
+    ] == [
+        {
+            "cancellation_sequence": 1,
+            "outcome": "cancelled_active",
+            "request_id": "active",
+            "logical_request_id": "active",
+            "stage_id": 0,
+            "request_class": "speech",
+            "admission_correlation_id": "client-active",
+        },
+        {
+            "cancellation_sequence": 2,
+            "outcome": "cancelled_pending",
+            "request_id": "pending",
+            "logical_request_id": "pending",
+            "stage_id": 0,
+            "request_class": "text",
+            "admission_correlation_id": "client-pending",
+        },
+    ]
 
 
 def test_repeated_stage_update_does_not_reset_service_timer_or_double_retire() -> None:

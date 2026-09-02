@@ -31,6 +31,7 @@ DispatchCallable = Callable[[], Awaitable[bool]]
 AdmissionScoreMethod = Literal["erlang_empirical", "erlang_empirical_threshold"]
 ADMISSION_DECISION_HISTORY_LIMIT = 128
 RECENT_STAGE_COMPLETION_HISTORY_LIMIT = 512
+RECENT_STAGE_CANCELLATION_HISTORY_LIMIT = 512
 ADMISSION_SCORE_REFERENCE_TOLERANCE = 1e-12
 ADMISSION_THRESHOLD_TABLE_SCHEMA_VERSION = 1
 DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS = 2048
@@ -1508,9 +1509,13 @@ class RuntimeQueueController:
         self._stage_class_active_time_s_total: Counter[tuple[int, str]] = Counter()
         self._stage_class_rollback_total: Counter[tuple[int, str]] = Counter()
         self._stage_class_cancelled_active_total: Counter[tuple[int, str]] = Counter()
+        self._stage_class_cancelled_pending_total: Counter[tuple[int, str]] = Counter()
         self._stage_completion_sequence = 0
         self._recent_stage_completions: deque[dict[str, Any]] = deque(maxlen=RECENT_STAGE_COMPLETION_HISTORY_LIMIT)
         self._recent_stage_completions_overwritten_total = 0
+        self._stage_cancellation_sequence = 0
+        self._recent_stage_cancellations: deque[dict[str, Any]] = deque(maxlen=RECENT_STAGE_CANCELLATION_HISTORY_LIMIT)
+        self._recent_stage_cancellations_overwritten_total = 0
         self._config_generation = 0
         self._enqueued_total = 0
         self._dispatch_attempts_total = 0
@@ -2264,13 +2269,70 @@ class RuntimeQueueController:
             self._stage_class_rollback_total[counter_key] += 1
         else:
             self._stage_class_cancelled_active_total[counter_key] += 1
+            self._record_stage_cancellation(
+                request_id=key[0],
+                logical_request_id=lease.logical_request_id,
+                stage_id=key[1],
+                request_class=request_class,
+                admission_correlation_id=lease.admission_correlation_id,
+                outcome="cancelled_active",
+                enqueued_monotonic_s=lease.enqueued_monotonic_s,
+                acquired_monotonic_s=lease.acquired_monotonic_s,
+                cancelled_monotonic_s=retired_s,
+            )
         return True
+
+    def _record_stage_cancellation(
+        self,
+        *,
+        request_id: str,
+        logical_request_id: str,
+        stage_id: int,
+        request_class: str,
+        admission_correlation_id: str | None,
+        outcome: Literal["cancelled_active", "cancelled_pending"],
+        enqueued_monotonic_s: float,
+        acquired_monotonic_s: float | None,
+        cancelled_monotonic_s: float,
+    ) -> None:
+        self._stage_cancellation_sequence += 1
+        if len(self._recent_stage_cancellations) == RECENT_STAGE_CANCELLATION_HISTORY_LIMIT:
+            self._recent_stage_cancellations_overwritten_total += 1
+        self._recent_stage_cancellations.append(
+            {
+                "cancellation_sequence": self._stage_cancellation_sequence,
+                "outcome": outcome,
+                "request_id": request_id,
+                "logical_request_id": logical_request_id,
+                "stage_id": stage_id,
+                "request_class": request_class,
+                "admission_correlation_id": admission_correlation_id,
+                "enqueued_monotonic_s": enqueued_monotonic_s,
+                "acquired_monotonic_s": acquired_monotonic_s,
+                "cancelled_monotonic_s": cancelled_monotonic_s,
+            }
+        )
+
+    def _retire_pending_cancellation(self, pending: PendingStageDispatch, *, now: float) -> None:
+        request_class = self._request_class(pending)
+        self._stage_class_cancelled_pending_total[(pending.stage_id, request_class)] += 1
+        self._record_stage_cancellation(
+            request_id=pending.request_id,
+            logical_request_id=pending.logical_request_id,
+            stage_id=pending.stage_id,
+            request_class=request_class,
+            admission_correlation_id=pending.metadata.admission_correlation_id,
+            outcome="cancelled_pending",
+            enqueued_monotonic_s=pending.enqueued_monotonic_s,
+            acquired_monotonic_s=None,
+            cancelled_monotonic_s=now,
+        )
 
     def cancel_request(self, request_id: str) -> None:
         logical_id = self._request_to_logical.get(request_id, request_id)
-        before = len(self._pending)
         now = self._clock()
         if request_id == logical_id:
+            cancelled_pending = [item for item in self._pending if item.logical_request_id == logical_id]
             self._pending = [item for item in self._pending if item.logical_request_id != logical_id]
             active_keys = [
                 key for key in self._active_stages if self._request_to_logical.get(key[0], key[0]) == logical_id
@@ -2286,13 +2348,16 @@ class RuntimeQueueController:
                     self._request_to_logical.pop(actual_id, None)
             self._observed_initial_requests.discard(logical_id)
         else:
+            cancelled_pending = [item for item in self._pending if item.request_id == request_id]
             self._pending = [item for item in self._pending if item.request_id != request_id]
             active_keys = [key for key in self._active_stages if key[0] == request_id]
             for key in active_keys:
                 self._retire_active_stage(key, outcome="cancelled", now=now)
             self._completed_stages = {key for key in self._completed_stages if key[0] != request_id}
             self._request_to_logical.pop(request_id, None)
-        self._cancelled_total += before - len(self._pending)
+        for pending in cancelled_pending:
+            self._retire_pending_cancellation(pending, now=now)
+        self._cancelled_total += len(cancelled_pending)
 
     def snapshot(self) -> dict[str, Any]:
         path_counts, class_counts = self._request_counts()
@@ -2343,6 +2408,7 @@ class RuntimeQueueController:
         stage_class_keys.update(self._stage_class_service_time_s_sum_sq_total)
         stage_class_keys.update(self._stage_class_rollback_total)
         stage_class_keys.update(self._stage_class_cancelled_active_total)
+        stage_class_keys.update(self._stage_class_cancelled_pending_total)
         stage_class_keys.update(
             (stage_id, request_class)
             for stage_id, class_limits in self.config.stage_class_wip_limits.items()
@@ -2370,6 +2436,7 @@ class RuntimeQueueController:
                     "active_time_s_total": stage_class_active_time_s_total[(stage_id, request_class)],
                     "rollback_total": self._stage_class_rollback_total[(stage_id, request_class)],
                     "cancelled_active_total": self._stage_class_cancelled_active_total[(stage_id, request_class)],
+                    "cancelled_pending_total": self._stage_class_cancelled_pending_total[(stage_id, request_class)],
                 }
                 for candidate_stage, request_class in sorted(stage_class_keys)
                 if candidate_stage == stage_id
@@ -2502,6 +2569,7 @@ class RuntimeQueueController:
             "active_time_s_by_stage_class_total": stage_class_totals(stage_class_active_time_s_total),
             "rollbacks_by_stage_class_total": stage_class_totals(self._stage_class_rollback_total),
             "cancelled_active_by_stage_class_total": stage_class_totals(self._stage_class_cancelled_active_total),
+            "cancelled_pending_by_stage_class_total": stage_class_totals(self._stage_class_cancelled_pending_total),
             "stage_class_runtime": {
                 "schema_version": 1,
                 "observation_monotonic_s": now,
@@ -2517,6 +2585,20 @@ class RuntimeQueueController:
                 self._recent_stage_completions[-1]["completion_sequence"] if self._recent_stage_completions else None
             ),
             "recent_stage_completions": list(self._recent_stage_completions),
+            "recent_stage_cancellation_schema_version": 1,
+            "recent_stage_cancellation_capacity": RECENT_STAGE_CANCELLATION_HISTORY_LIMIT,
+            "recent_stage_cancellation_overwritten_total": self._recent_stage_cancellations_overwritten_total,
+            "recent_stage_cancellation_first_sequence": (
+                self._recent_stage_cancellations[0]["cancellation_sequence"]
+                if self._recent_stage_cancellations
+                else None
+            ),
+            "recent_stage_cancellation_last_sequence": (
+                self._recent_stage_cancellations[-1]["cancellation_sequence"]
+                if self._recent_stage_cancellations
+                else None
+            ),
+            "recent_stage_cancellations": list(self._recent_stage_cancellations),
             "blocked_by_limit": dict(sorted(blocked.items())),
             "oldest_queue_wait_s": max(
                 (max(now - pending.enqueued_monotonic_s, 0.0) for pending in self._pending),
