@@ -98,6 +98,27 @@ def _stage_backpressure_mapping(**overrides: object) -> dict[str, object]:
     return mapping
 
 
+def _soft_stage0_config(
+    *,
+    stage_limit: int = 2,
+    text_reservation: int = 1,
+    speech_reservation: int = 1,
+    policy: str = "fifo",
+) -> QueueControlConfig:
+    return QueueControlConfig(
+        enabled=True,
+        policy=policy,  # type: ignore[arg-type]
+        stage_wip_limits={0: stage_limit},
+        stage_class_wip_limits={
+            0: {
+                "text": text_reservation,
+                "speech": speech_reservation,
+            }
+        },
+        stage_class_wip_modes={0: "soft_reservation"},
+    )
+
+
 def _admission_config(
     *,
     effective_k: int = 1,
@@ -212,6 +233,69 @@ def test_queue_control_config_defaults_and_validation() -> None:
     with pytest.raises(ValueError, match="stage_class_wip_limits contains unavailable stage ids"):
         QueueControlConfig.from_document(
             {"queue_control": {"stage_class_wip_limits": {"1": {"interactive": 1}}}},
+            num_stages=1,
+        )
+
+
+def test_soft_stage_class_reservation_config_is_validated_and_fingerprinted() -> None:
+    document = {
+        "queue_control": {
+            "enabled": True,
+            "stage_wip_limits": {"0": 8},
+            "stage_class_wip_limits": {"0": {"text": 6, "speech": 2}},
+            "stage_class_wip_modes": {"0": "soft_reservation"},
+        }
+    }
+    config = QueueControlConfig.from_document(document, num_stages=3)
+    assert config.stage_class_wip_modes == {0: "soft_reservation"}
+    assert config.semantic_mapping()["stage_class_wip_modes"] == {"0": "soft_reservation"}
+
+    hard = QueueControlConfig(
+        enabled=True,
+        stage_wip_limits={0: 8},
+        stage_class_wip_limits={0: {"text": 6, "speech": 2}},
+    )
+    assert config.fingerprint() != hard.fingerprint()
+
+    with pytest.raises(ValueError, match="requires queue_control.stage_wip_limits"):
+        QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"text": 1}},
+            stage_class_wip_modes={0: "soft_reservation"},
+        )
+    with pytest.raises(ValueError, match="shares must not exceed"):
+        QueueControlConfig(
+            enabled=True,
+            stage_wip_limits={0: 1},
+            stage_class_wip_limits={0: {"text": 1, "speech": 1}},
+            stage_class_wip_modes={0: "soft_reservation"},
+        )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        QueueControlConfig(
+            enabled=True,
+            stage_wip_limits={0: 2},
+            stage_class_wip_limits={0: {"text": 1, "speech": 1}},
+            stage_class_wip_modes={0: "soft_reservation"},
+            stage_backpressure=_stage_backpressure(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("modes", "error"),
+    [
+        ([], "must be a JSON object"),
+        ({"0": 1}, "must be a string"),
+        ({"0": "soft"}, "must be 'hard_limit' or 'soft_reservation'"),
+        ({"1": "soft_reservation"}, "contains unavailable stage ids"),
+    ],
+)
+def test_soft_stage_class_reservation_config_rejects_invalid_modes(
+    modes: object,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        QueueControlConfig.from_document(
+            {"queue_control": {"stage_class_wip_modes": modes}},
             num_stages=1,
         )
 
@@ -1218,6 +1302,116 @@ def test_stage0_multimodal_cache_order_fence_survives_live_disable() -> None:
 
     assert controller.pop_ready().pending.request_id == "producer"  # type: ignore[union-attr]
     assert controller.pop_ready().pending.request_id == "consumer"  # type: ignore[union-attr]
+
+
+def test_soft_stage_class_reservation_borrows_idle_share_up_to_stage_cap() -> None:
+    controller = RuntimeQueueController(num_stages=1, config=_soft_stage0_config())
+
+    controller.enqueue(_pending("text-reserved", request_class="text"))
+    assert controller.pop_ready().pending.request_id == "text-reserved"  # type: ignore[union-attr]
+
+    controller.enqueue(_pending("text-borrowed", request_class="text"))
+    assert controller.pop_ready().pending.request_id == "text-borrowed"  # type: ignore[union-attr]
+
+    controller.enqueue(_pending("text-blocked", request_class="text"))
+    assert controller.pop_ready() is None
+    snapshot = controller.snapshot()
+    assert snapshot["blocked_by_limit"] == {"stage": 1}
+    assert snapshot["soft_reservation_state"]["0"] == {
+        "stage_wip_limit": 2,
+        "reservations": {"speech": 1, "text": 1},
+        "active_total": 2,
+        "active_by_class": {"speech": 0, "text": 2},
+        "demand_classes": [],
+        "reservation_priority_dispatch_total": 0,
+        "borrowed_dispatch_total": 1,
+        "global_cap_block_events_total": 1,
+        "global_cap_blocked_pending": 1,
+    }
+
+
+def test_soft_stage_class_reservation_prioritizes_an_underfilled_class() -> None:
+    controller = RuntimeQueueController(num_stages=1, config=_soft_stage0_config())
+    controller.enqueue(_pending("text-active", request_class="text"))
+    assert controller.pop_ready().pending.request_id == "text-active"  # type: ignore[union-attr]
+
+    # FIFO would choose text-borrower first. The speech reservation has ready
+    # demand, so speech receives its reserved slot before text may borrow it.
+    controller.enqueue(_pending("text-borrower", request_class="text"))
+    controller.enqueue(_pending("speech-reserved", request_class="speech"))
+    snapshot = controller.snapshot()
+    assert snapshot["blocked_by_limit"] == {"stage_class_reservation": 1}
+    assert snapshot["soft_reservation_state"]["0"]["demand_classes"] == ["speech"]
+
+    assert controller.pop_ready().pending.request_id == "speech-reserved"  # type: ignore[union-attr]
+    snapshot = controller.snapshot()
+    assert snapshot["soft_reservation_state"]["0"]["reservation_priority_dispatch_total"] == 1
+    assert snapshot["soft_reservation_state"]["0"]["active_by_class"] == {
+        "speech": 1,
+        "text": 1,
+    }
+
+
+def test_soft_stage_class_reservation_does_not_create_cache_order_hol() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_soft_stage0_config(policy="edf"),
+    )
+    controller.enqueue(
+        _pending(
+            "text-active",
+            deadline=30.0,
+            request_class="text",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    assert controller.pop_ready().pending.request_id == "text-active"  # type: ignore[union-attr]
+
+    # The later speech request has an earlier deadline and an unused reserved
+    # share. It cannot bypass the multimodal cache head. Because it is not yet
+    # runnable, it also cannot prevent the head from borrowing the free slot.
+    controller.enqueue(
+        _pending(
+            "cache-head",
+            deadline=20.0,
+            request_class="text",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(
+        _pending(
+            "cache-follower",
+            deadline=10.0,
+            request_class="speech",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    snapshot = controller.snapshot()
+    assert snapshot["blocked_by_limit"] == {"mm_cache_order": 1}
+    assert snapshot["soft_reservation_state"]["0"]["demand_classes"] == []
+    assert controller.pop_ready().pending.request_id == "cache-head"  # type: ignore[union-attr]
+
+    assert controller.release_stage("text-active", 0)
+    assert controller.pop_ready().pending.request_id == "cache-follower"  # type: ignore[union-attr]
+
+
+def test_soft_stage_class_reservation_can_be_enabled_by_live_config() -> None:
+    hard = QueueControlConfig(
+        enabled=True,
+        stage_wip_limits={0: 2},
+        stage_class_wip_limits={0: {"text": 1, "speech": 1}},
+    )
+    controller = RuntimeQueueController(num_stages=1, config=hard)
+    controller.enqueue(_pending("text-active", request_class="text"))
+    assert controller.pop_ready().pending.request_id == "text-active"  # type: ignore[union-attr]
+    controller.enqueue(_pending("text-waiting", request_class="text"))
+    assert controller.pop_ready() is None
+
+    assert controller.configure(_soft_stage0_config())
+    assert controller.pop_ready().pending.request_id == "text-waiting"  # type: ignore[union-attr]
+    snapshot = controller.snapshot()
+    assert snapshot["stage_class_wip_modes"] == {"0": "soft_reservation"}
+    assert snapshot["soft_reservation_state"]["0"]["borrowed_dispatch_total"] == 1
 
 
 def test_stage_credit_allows_updates_but_blocks_new_wip() -> None:
