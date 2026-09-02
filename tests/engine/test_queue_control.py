@@ -1503,6 +1503,34 @@ def test_unfinished_logical_state_is_computed_once_per_pop_and_snapshot(
     assert calls == 1
 
 
+def test_disabled_stage_backpressure_skips_pop_state_but_keeps_snapshot_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = RuntimeQueueController(
+        num_stages=3,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_backpressure=_stage_backpressure(enabled=False),
+        ),
+    )
+    controller.enqueue(_pending("upstream", request_class="speech"))
+
+    calls = 0
+    original = controller._unfinished_logical_ids_by_stage_class
+
+    def counted_state() -> dict[tuple[int, str], set[str]]:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(controller, "_unfinished_logical_ids_by_stage_class", counted_state)
+    assert controller.pop_ready() is not None
+    assert calls == 0
+
+    controller.snapshot()
+    assert calls == 1
+
+
 def test_block_evaluation_precomputes_request_counts_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2106,7 +2106,7 @@ class RuntimeQueueController:
         if not self._pending:
             return None
         stage_backpressure_state = None
-        if self.config.stage_backpressure is not None:
+        if self.config.stage_backpressure is not None and self.config.stage_backpressure.enabled:
             stage_backpressure_state = self._stage_backpressure_state(self._unfinished_logical_ids_by_stage_class())
         active_stage_counts: Mapping[int, int] = {}
         active_stage_class_counts: Mapping[tuple[int, str], int] = {}
