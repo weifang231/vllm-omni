@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import json
 import math
+import random
 from collections.abc import Awaitable, Callable
 
 import pytest
 
+import vllm_omni.engine.queue_control as queue_control_module
 from vllm_omni.engine.queue_control import (
     ADMISSION_DECISION_HISTORY_LIMIT,
+    RECENT_STAGE_COMPLETION_HISTORY_LIMIT,
     AdmissionClassConfig,
     AdmissionControlConfig,
     OnlineAllocatorMetadata,
@@ -18,6 +22,7 @@ from vllm_omni.engine.queue_control import (
     RequestSchedulingMetadata,
     RuntimeQueueController,
     erlang_empirical_admission_score,
+    erlang_empirical_admission_score_reference,
     erlang_wait_cdf,
     scheduling_kwargs_from_headers,
 )
@@ -139,12 +144,18 @@ def test_queue_control_config_defaults_and_validation() -> None:
 
 
 def test_online_allocator_metadata_is_parsed_and_acknowledged_in_snapshot() -> None:
+    target = QueueControlConfig(
+        enabled=True,
+        class_wip_limits={"audio": 3, "text": 1},
+    )
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "revision": 7,
         "source_runtime_id": "runtime-a",
         "source_snapshot_sequence": 13,
         "source_config_generation": 2,
+        "source_config_fingerprint": "b" * 64,
+        "target_config_fingerprint": target.fingerprint(),
         "profile_fingerprint": "a" * 64,
     }
     config = QueueControlConfig.from_document(
@@ -161,15 +172,50 @@ def test_online_allocator_metadata_is_parsed_and_acknowledged_in_snapshot() -> N
         source_runtime_id="runtime-a",
         source_snapshot_sequence=13,
         source_config_generation=2,
+        source_config_fingerprint="b" * 64,
+        target_config_fingerprint=target.fingerprint(),
         profile_fingerprint="a" * 64,
     )
 
     controller = RuntimeQueueController(num_stages=1, config=config)
     assert controller.snapshot()["online_allocator"] == metadata
+    assert controller.snapshot()["queue_control_config_fingerprint"] == target.fingerprint()
+
+
+def test_online_allocator_target_fingerprint_covers_full_semantic_config() -> None:
+    target = QueueControlConfig(
+        enabled=True,
+        policy="edf",
+        stage_class_wip_limits={0: {"interactive": 2}},
+        admission=_admission_config(
+            effective_k=2,
+            service_samples_s=(0.1, 0.2),
+        ).admission,
+    )
+    document = {"queue_control": target.semantic_mapping()}
+    document["queue_control"]["online_allocator"] = {
+        "schema_version": 2,
+        "revision": 1,
+        "source_runtime_id": "runtime-a",
+        "source_snapshot_sequence": 1,
+        "source_config_generation": 0,
+        "source_config_fingerprint": "a" * 64,
+        "target_config_fingerprint": target.fingerprint(),
+        "profile_fingerprint": "b" * 64,
+    }
+    assert QueueControlConfig.from_document(document).fingerprint() == target.fingerprint()
+
+    document["queue_control"]["admission"]["classes"]["interactive"]["gamma"] = 0.25
+    with pytest.raises(ValueError, match="target_config_fingerprint does not match"):
+        QueueControlConfig.from_document(document)
 
 
 def test_online_allocator_revision_prevents_stale_or_torn_logical_updates() -> None:
     def config(revision: int, audio_limit: int) -> QueueControlConfig:
+        target = QueueControlConfig(
+            enabled=True,
+            class_wip_limits={"audio": audio_limit},
+        )
         return QueueControlConfig(
             enabled=True,
             class_wip_limits={"audio": audio_limit},
@@ -178,6 +224,8 @@ def test_online_allocator_revision_prevents_stale_or_torn_logical_updates() -> N
                 source_runtime_id="runtime-a",
                 source_snapshot_sequence=revision,
                 source_config_generation=revision - 1,
+                source_config_fingerprint="a" * 64,
+                target_config_fingerprint=target.fingerprint(),
                 profile_fingerprint="b" * 64,
             ),
         )
@@ -191,6 +239,22 @@ def test_online_allocator_revision_prevents_stale_or_torn_logical_updates() -> N
         controller.configure(config(2, 1))
     with pytest.raises(ValueError, match="without advancing"):
         controller.configure(config(3, 1))
+    replayed_target = QueueControlConfig(enabled=True, class_wip_limits={"audio": 1})
+    replayed_source = QueueControlConfig(
+        enabled=replayed_target.enabled,
+        class_wip_limits=replayed_target.class_wip_limits,
+        online_allocator=OnlineAllocatorMetadata(
+            revision=4,
+            source_runtime_id="runtime-a",
+            source_snapshot_sequence=3,
+            source_config_generation=3,
+            source_config_fingerprint="a" * 64,
+            target_config_fingerprint=replayed_target.fingerprint(),
+            profile_fingerprint="b" * 64,
+        ),
+    )
+    with pytest.raises(ValueError, match="source_snapshot_sequence must advance"):
+        controller.configure(replayed_source)
     assert controller.snapshot()["class_wip_limits"] == {"audio": 3}
     assert controller.snapshot()["config_generation"] == 1
 
@@ -328,6 +392,34 @@ def test_erlang_empirical_formula_matches_closed_form() -> None:
     )
     expected = ((1.0 - math.exp(-3.0)) + (1.0 - math.exp(-2.0))) / 2.0
     assert score == pytest.approx(expected)
+
+
+def test_vectorized_erlang_empirical_score_matches_scalar_reference_randomized() -> None:
+    rng = random.Random(18401)
+    for _ in range(500):
+        effective_k = rng.randint(1, 16)
+        active_count = rng.randint(0, effective_k + 1)
+        queue_position = rng.randint(0, 128)
+        remaining_budget_s = rng.uniform(-0.1, 20.0)
+        mu = rng.uniform(0.01, 20.0)
+        samples = tuple(rng.uniform(0.0, 10.0) for _ in range(rng.randint(1, 128)))
+        vectorized = erlang_empirical_admission_score(
+            remaining_budget_s,
+            effective_k=effective_k,
+            mu=mu,
+            active_count=active_count,
+            queue_position=queue_position,
+            service_samples_s=samples,
+        )
+        scalar = erlang_empirical_admission_score_reference(
+            remaining_budget_s,
+            effective_k=effective_k,
+            mu=mu,
+            active_count=active_count,
+            queue_position=queue_position,
+            service_samples_s=samples,
+        )
+        assert vectorized == pytest.approx(scalar, abs=1e-12, rel=1e-12)
 
 
 def test_request_metadata_builds_absolute_deadline() -> None:
@@ -1284,6 +1376,145 @@ def test_arrival_position_excludes_waiters_that_now_fail_recheck() -> None:
     assert controller.pop_ready().pending.request_id == "new"  # type: ignore[union-attr]
 
 
+def test_arrival_fast_path_matches_scalar_legacy_decisions_and_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = random.Random(18402)
+
+    def run_trace(*, scalar_reference: bool, deadlines: list[float], newcomer_deadline: float):
+        now = [2.0]
+        controller = RuntimeQueueController(
+            num_stages=1,
+            config=_admission_config(
+                effective_k=4,
+                mu=0.7,
+                service_samples_s=tuple(0.05 + index * 0.01 for index in range(64)),
+                gamma=0.65,
+            ),
+            clock=lambda: now[0],
+        )
+        for index, deadline in enumerate(deadlines):
+            candidate = _pending(
+                f"waiting-{index}",
+                request_class="interactive",
+                deadline=deadline,
+            )
+            controller._stamp_pending(candidate)
+            controller._pending.append(candidate)
+
+        newcomer = _pending(
+            "newcomer",
+            request_class="interactive",
+            deadline=newcomer_deadline,
+        )
+        controller._stamp_pending(newcomer)
+        if scalar_reference:
+            candidates = [*controller._admission_candidates("interactive"), newcomer]
+            candidates.sort(key=controller._admission_order_key)
+            queue_position = 0
+            decision = None
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    queue_control_module,
+                    "erlang_empirical_admission_score",
+                    erlang_empirical_admission_score_reference,
+                )
+                for candidate in candidates:
+                    if candidate is newcomer:
+                        decision = controller._evaluate_admission(
+                            newcomer,
+                            queue_position=queue_position,
+                            phase="arrival",
+                            now_monotonic_s=now[0],
+                        )
+                        break
+                    prior = controller._evaluate_admission(
+                        candidate,
+                        queue_position=queue_position,
+                        phase="recheck",
+                        now_monotonic_s=now[0],
+                    )
+                    if prior is None or prior.admitted:
+                        queue_position += 1
+        else:
+            decision = controller._evaluate_arrival_admission(newcomer)
+        assert decision is not None
+        if decision.admitted:
+            controller._pending.append(newcomer)
+        rejected = controller.recheck_admission()
+        dispatch_order: list[str] = []
+        while (acquired := controller.pop_ready()) is not None:
+            dispatch_order.append(acquired.pending.request_id)
+        return (
+            (decision.admitted, decision.would_admit, decision.reason),
+            [(item.pending.request_id, item.decision.reason) for item in rejected],
+            dispatch_order,
+        )
+
+    for _ in range(100):
+        deadlines = [rng.uniform(0.0, 8.0) for _ in range(rng.randint(0, 40))]
+        newcomer_deadline = rng.uniform(0.0, 8.0)
+        assert run_trace(
+            scalar_reference=False,
+            deadlines=deadlines,
+            newcomer_deadline=newcomer_deadline,
+        ) == run_trace(
+            scalar_reference=True,
+            deadlines=deadlines,
+            newcomer_deadline=newcomer_deadline,
+        )
+
+
+@pytest.mark.parametrize("queue_size", [10, 50, 100, 500])
+@pytest.mark.parametrize("sample_count", [64, 576, 2000])
+def test_successful_arrival_scores_only_the_new_request(
+    monkeypatch: pytest.MonkeyPatch,
+    queue_size: int,
+    sample_count: int,
+) -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_admission_config(
+            effective_k=8,
+            mu=2.0,
+            service_samples_s=tuple(0.1 + index / sample_count for index in range(sample_count)),
+            gamma=0.1,
+        ),
+        clock=lambda: 0.0,
+    )
+    for index in range(queue_size):
+        candidate = _pending(
+            f"waiting-{index}",
+            request_class="interactive",
+            deadline=10_000.0 + index,
+        )
+        controller._stamp_pending(candidate)
+        controller._pending.append(candidate)
+
+    score_calls = 0
+    original = queue_control_module.erlang_empirical_admission_score
+
+    def counted_score(*args, **kwargs):
+        nonlocal score_calls
+        score_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        queue_control_module,
+        "erlang_empirical_admission_score",
+        counted_score,
+    )
+    decision = controller.enqueue(
+        _pending(
+            "newcomer",
+            request_class="interactive",
+            deadline=20_000.0,
+        )
+    )
+    assert decision is not None and decision.admitted
+    assert score_calls == 1
+
+
 def test_admission_rechecks_after_effective_limit_change() -> None:
     controller = RuntimeQueueController(
         num_stages=1,
@@ -1309,3 +1540,244 @@ def test_admission_default_off_preserves_expired_request() -> None:
     assert decision is None
     assert controller.recheck_admission() == []
     assert controller.pop_ready().pending.request_id == "stock"  # type: ignore[union-attr]
+
+
+def test_stage_class_runtime_telemetry_records_live_and_completed_time() -> None:
+    now = [1.0]
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=QueueControlConfig(
+            enabled=True,
+            stage_class_wip_limits={0: {"text": 1}},
+        ),
+        clock=lambda: now[0],
+    )
+
+    controller.enqueue(
+        _pending(
+            "request",
+            request_class="text",
+            admission_correlation_id="client-record-7",
+        )
+    )
+    assert controller.pop_ready() is not None
+
+    now[0] = 2.5
+    live = controller.snapshot()
+    assert live["active_time_s_by_stage_class_total"] == {"0": {"text": pytest.approx(1.5)}}
+    assert live["completed_by_stage_class_total"] == {"0": {"text": 0}}
+    assert live["service_time_s_by_stage_class_total"] == {"0": {"text": 0}}
+    assert live["admitted_arrivals_by_class_total"] == {"text": 1}
+
+    now[0] = 4.0
+    assert controller.release_stage("request", 0)
+    completed = controller.snapshot()
+    assert completed["completed_by_stage_class_total"] == {"0": {"text": 1}}
+    assert completed["service_time_s_by_stage_class_total"] == {"0": {"text": pytest.approx(3.0)}}
+    assert completed["service_time_s_sum_sq_by_stage_class_total"] == {"0": {"text": pytest.approx(9.0)}}
+    assert completed["active_time_s_by_stage_class_total"] == {"0": {"text": pytest.approx(3.0)}}
+    assert completed["rollbacks_by_stage_class_total"] == {"0": {"text": 0}}
+    assert completed["cancelled_active_by_stage_class_total"] == {"0": {"text": 0}}
+    assert completed["stage_class_runtime"] == {
+        "schema_version": 1,
+        "observation_monotonic_s": 4.0,
+        "stages": {
+            "0": {
+                "text": {
+                    "completed_total": 1,
+                    "service_time_s_total": pytest.approx(3.0),
+                    "service_time_s_sum_sq_total": pytest.approx(9.0),
+                    "active_time_s_total": pytest.approx(3.0),
+                    "rollback_total": 0,
+                    "cancelled_active_total": 0,
+                }
+            }
+        },
+    }
+    assert completed["recent_stage_completion_overwritten_total"] == 0
+    assert completed["recent_stage_completion_schema_version"] == 1
+    assert completed["recent_stage_completion_first_sequence"] == 1
+    assert completed["recent_stage_completion_last_sequence"] == 1
+    assert completed["recent_stage_completions"] == [
+        {
+            "completion_sequence": 1,
+            "request_id": "request",
+            "logical_request_id": "request",
+            "stage_id": 0,
+            "request_class": "text",
+            "admission_correlation_id": "client-record-7",
+            "enqueued_monotonic_s": 1.0,
+            "acquired_monotonic_s": 1.0,
+            "released_monotonic_s": 4.0,
+            "queue_wait_s": 0.0,
+            "service_s": 3.0,
+        }
+    ]
+
+    now[0] = 8.0
+    assert not controller.release_stage("request", 0)
+    assert controller.snapshot()["completed_by_stage_class_total"] == {"0": {"text": 1}}
+
+
+def test_stage_class_runtime_telemetry_does_not_count_rollback_as_completion() -> None:
+    now = [10.0]
+    controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
+    acquired = controller.acquire_immediate(_pending("request", request_class="text"))
+
+    now[0] = 12.0
+    controller.rollback(acquired)
+    snapshot = controller.snapshot()
+    assert snapshot["completed_by_stage_class_total"] == {"0": {"text": 0}}
+    assert snapshot["service_time_s_by_stage_class_total"] == {"0": {"text": 0}}
+    assert snapshot["active_time_s_by_stage_class_total"] == {"0": {"text": pytest.approx(2.0)}}
+    assert snapshot["rollbacks_by_stage_class_total"] == {"0": {"text": 1}}
+    assert snapshot["cancelled_active_by_stage_class_total"] == {"0": {"text": 0}}
+
+
+def test_failed_dispatch_is_rollback_and_late_terminal_is_ignored() -> None:
+    now = [10.0]
+    controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
+    acquired = controller.acquire_immediate(_pending("request", request_class="text"))
+
+    now[0] = 12.0
+    assert controller.fail_stage_dispatch("request", 0)
+    controller.cancel_request("request")
+    controller.rollback(acquired)
+    now[0] = 15.0
+    assert not controller.release_stage("request", 0)
+
+    snapshot = controller.snapshot()
+    assert snapshot["completed_by_stage_class_total"] == {"0": {"text": 0}}
+    assert snapshot["service_time_s_by_stage_class_total"] == {"0": {"text": 0}}
+    assert snapshot["active_time_s_by_stage_class_total"] == {"0": {"text": pytest.approx(2.0)}}
+    assert snapshot["rollbacks_by_stage_class_total"] == {"0": {"text": 1}}
+    assert snapshot["cancelled_active_by_stage_class_total"] == {"0": {"text": 0}}
+
+
+def test_failed_update_to_existing_stage_remains_a_cancellation() -> None:
+    now = [10.0]
+    controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
+    controller.acquire_immediate(_pending("request", request_class="text"))
+    update = controller.acquire_immediate(_pending("request", starts_request=False, request_class="text"))
+    assert not update.acquired_stage
+
+    now[0] = 12.0
+    # Mirrors the orchestrator guard: only newly acquired leases are marked as
+    # rollback before request-level failure cleanup.
+    if update.pending.acquired_stage_for_dispatch:
+        controller.fail_stage_dispatch("request", 0)
+    controller.cancel_request("request")
+    controller.rollback(update)
+
+    snapshot = controller.snapshot()
+    assert snapshot["rollbacks_by_stage_class_total"] == {"0": {"text": 0}}
+    assert snapshot["cancelled_active_by_stage_class_total"] == {"0": {"text": 1}}
+    assert snapshot["dispatch_failures_total"] == 1
+
+
+def test_stage_class_runtime_telemetry_cancel_closes_parent_and_child_leases() -> None:
+    now = [0.0]
+    controller = RuntimeQueueController(num_stages=2, clock=lambda: now[0])
+    controller.acquire_immediate(_pending("parent", request_class="speech"))
+    controller.acquire_immediate(
+        _pending(
+            "child",
+            logical_request_id="parent",
+            stage_id=1,
+            starts_request=False,
+            request_class="untrusted-child-label",
+        )
+    )
+
+    now[0] = 3.0
+    controller.cancel_request("parent")
+    snapshot = controller.snapshot()
+    assert snapshot["active_by_stage_class"] == {}
+    assert snapshot["completed_by_stage_class_total"] == {
+        "0": {"speech": 0},
+        "1": {"speech": 0},
+    }
+    assert snapshot["service_time_s_by_stage_class_total"] == {
+        "0": {"speech": 0},
+        "1": {"speech": 0},
+    }
+    assert snapshot["active_time_s_by_stage_class_total"] == {
+        "0": {"speech": pytest.approx(3.0)},
+        "1": {"speech": pytest.approx(3.0)},
+    }
+    assert snapshot["cancelled_active_by_stage_class_total"] == {
+        "0": {"speech": 1},
+        "1": {"speech": 1},
+    }
+
+
+def test_repeated_stage_update_does_not_reset_service_timer_or_double_retire() -> None:
+    now = [1.0]
+    controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
+    controller.acquire_immediate(_pending("request", request_class="speech"))
+
+    now[0] = 2.0
+    update = controller.acquire_immediate(_pending("request", starts_request=False, request_class="speech"))
+    assert not update.acquired_stage
+    controller.rollback(update)
+
+    now[0] = 5.0
+    assert controller.release_stage("request", 0)
+    snapshot = controller.snapshot()
+    assert snapshot["completed_by_stage_class_total"] == {"0": {"speech": 1}}
+    assert snapshot["service_time_s_by_stage_class_total"] == {"0": {"speech": pytest.approx(4.0)}}
+    assert snapshot["active_time_s_by_stage_class_total"] == {"0": {"speech": pytest.approx(4.0)}}
+    assert snapshot["rollbacks_by_stage_class_total"] == {"0": {"speech": 0}}
+
+
+def test_recent_stage_completions_are_bounded_and_count_overwrites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(queue_control_module, "RECENT_STAGE_COMPLETION_HISTORY_LIMIT", 2)
+    now = [0.0]
+    controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
+    for index in range(3):
+        request_id = f"request-{index}"
+        controller.acquire_immediate(
+            _pending(
+                request_id,
+                request_class="text",
+                admission_correlation_id=f"correlation-{index}",
+            )
+        )
+        now[0] += 1.0
+        assert controller.release_stage(request_id, 0)
+        controller.cancel_request(request_id)
+
+    snapshot = controller.snapshot()
+    assert snapshot["recent_stage_completion_capacity"] == 2
+    assert snapshot["recent_stage_completion_overwritten_total"] == 1
+    assert snapshot["recent_stage_completion_first_sequence"] == 2
+    assert snapshot["recent_stage_completion_last_sequence"] == 3
+    assert [row["request_id"] for row in snapshot["recent_stage_completions"]] == [
+        "request-1",
+        "request-2",
+    ]
+
+
+def test_default_snapshot_completion_history_has_bounded_serialized_size(tmp_path) -> None:
+    now = [0.0]
+    controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])
+    for index in range(RECENT_STAGE_COMPLETION_HISTORY_LIMIT + 64):
+        request_id = f"request-{index}"
+        controller.acquire_immediate(
+            _pending(
+                request_id,
+                request_class="text",
+                admission_correlation_id=f"correlation-{index}",
+            )
+        )
+        now[0] += 0.01
+        assert controller.release_stage(request_id, 0)
+        controller.cancel_request(request_id)
+
+    encoded = json.dumps(controller.snapshot(), separators=(",", ":")).encode()
+    output = tmp_path / "snapshot.json"
+    output.write_bytes(encoded)
+    assert len(encoded) < 256 * 1024
+    assert len(controller.snapshot()["recent_stage_completions"]) == RECENT_STAGE_COMPLETION_HISTORY_LIMIT

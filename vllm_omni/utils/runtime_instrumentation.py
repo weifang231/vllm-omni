@@ -83,6 +83,13 @@ class RuntimeInstrumentation:
     def metrics_enabled(self) -> bool:
         return self.metrics_dir is not None
 
+    @property
+    def snapshot_sequence(self) -> int:
+        """Return the last snapshot sequence successfully published."""
+
+        with self._snapshot_lock:
+            return self._snapshot_sequence
+
     def _warn_once(self, key: str, message: str, *args: Any) -> None:
         if key in self._warned:
             return

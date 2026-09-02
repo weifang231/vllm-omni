@@ -67,11 +67,13 @@ by the controller. The orchestrator polls it without preempting active work:
     "class_wip_limits": {"interactive": 4},
     "stage_wip_limits": {"0": 8, "1": 7, "2": 7},
     "online_allocator": {
-      "schema_version": 1,
+      "schema_version": 2,
       "revision": 12,
       "source_runtime_id": "2f23d1...",
       "source_snapshot_sequence": 91,
       "source_config_generation": 11,
+      "source_config_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "target_config_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "profile_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     "admission": {
@@ -98,6 +100,10 @@ cooperating external controller. Its revision must increase whenever any
 versioned queue-control field changes; the runtime rejects a replayed lower
 revision or changed fields under the same revision. The complete validated
 configuration is then swapped as one object on the orchestrator event loop.
+`source_config_fingerprint` must match the configuration named by the source
+snapshot, and `target_config_fingerprint` must match every semantic field in
+the requested configuration. This prevents a valid revision envelope from
+acknowledging torn or independently modified limits/admission samples.
 
 Admission is disabled unless `queue_control.admission.enabled` is true. For
 each configured class, `effective_k` is the class concurrency limit, `mu` is
@@ -113,6 +119,11 @@ type. A raw-audio stream cannot change its HTTP status after headers have been
 sent and therefore terminates with the exception instead. Admission requires
 `policy: "edf"`; operators should also use mutually consistent class/global
 limits so runtime ordering and available capacity match the fitted model.
+The runtime evaluates the empirical convolution with the vectorized regularized
+incomplete-gamma form of the Erlang CDF. A successful arrival scores only the
+new request at its conservative EDF insertion rank; a provisional rejection
+falls back to an exact sweep so expired predecessors cannot cause a false
+rejection. Full queue rechecks remain authoritative after queue/config changes.
 
 `VLLM_OMNI_RUNTIME_METRICS_DIR` enables an atomic, bounded-cardinality JSON
 snapshot containing queue lengths, active leases, blocked reasons, dispatch
@@ -135,8 +146,9 @@ causal allocator:
   waiting to acquire their end-to-end request lease. It excludes downstream
   dispatches and streaming updates. Together with `active_by_class`, it is the
   runtime observation of the model's class queue and running count.
-- `config_generation`, `class_wip_limits`, and `online_allocator` acknowledge
-  exactly which atomic control revision produced the observed queue state.
+- `config_generation`, `queue_control_config_fingerprint`, class/stage limits,
+  and `online_allocator` acknowledge exactly which atomic control revision and
+  complete semantic configuration produced the observed queue state.
 
 A controller should admit at most one unacknowledged update: atomically replace
 the complete control document, then wait until the same `online_allocator`

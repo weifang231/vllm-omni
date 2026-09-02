@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import time
 
+import vllm_omni.utils.runtime_instrumentation as runtime_instrumentation_module
 from vllm_omni.utils.runtime_instrumentation import (
     RUNTIME_CONTROL_FILE_ENV,
     RUNTIME_METRICS_DIR_ENV,
@@ -78,3 +80,58 @@ def test_snapshot_payload_cannot_spoof_causal_envelope(monkeypatch, tmp_path) ->
     assert payload["runtime_id"] == instrumentation.runtime_id
     assert payload["snapshot_sequence"] == 1
     assert payload["monotonic_time_s"] >= 0
+
+
+def test_hot_snapshot_write_cost_stays_bounded(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(RUNTIME_METRICS_DIR_ENV, str(tmp_path))
+    # Isolate JSON/copy/file-replacement overhead from filesystem durability,
+    # whose latency is host-specific and is tested by the normal write path.
+    monkeypatch.setattr(runtime_instrumentation_module.os, "fsync", lambda _fd: None)
+    instrumentation = RuntimeInstrumentation(
+        engine="test",
+        component="queue",
+        stage_id="pipeline",
+    )
+    completions = [
+        {
+            "completion_sequence": index + 1,
+            "request_id": f"request-{index}",
+            "logical_request_id": f"request-{index}",
+            "stage_id": 0,
+            "request_class": "text",
+            "admission_correlation_id": f"correlation-{index}",
+            "enqueued_monotonic_s": float(index),
+            "acquired_monotonic_s": float(index) + 0.01,
+            "released_monotonic_s": float(index) + 0.02,
+            "queue_wait_s": 0.01,
+            "service_s": 0.01,
+        }
+        for index in range(512)
+    ]
+    payload = {
+        "stage_class_runtime": {
+            "schema_version": 1,
+            "observation_monotonic_s": 1.0,
+            "stages": {
+                "0": {
+                    "text": {
+                        "completed_total": 10_000,
+                        "service_time_s_total": 100.0,
+                        "service_time_s_sum_sq_total": 2.0,
+                        "active_time_s_total": 400.0,
+                    }
+                }
+            },
+        },
+        "recent_stage_completion_capacity": 512,
+        "recent_stage_completions": completions,
+    }
+
+    started = time.perf_counter()
+    for _ in range(10):
+        assert instrumentation.write_snapshot(payload, force=True)
+    elapsed_s = time.perf_counter() - started
+    snapshot_path = instrumentation.snapshot_path
+    assert snapshot_path is not None
+    assert snapshot_path.stat().st_size < 256 * 1024
+    assert elapsed_s < 0.5

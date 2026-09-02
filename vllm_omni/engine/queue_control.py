@@ -11,6 +11,8 @@ available.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import time
@@ -19,10 +21,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import numpy as np
+from scipy.special import gammainc
+
 QueuePolicy = Literal["fifo", "edf"]
 DispatchCallable = Callable[[], Awaitable[bool]]
 AdmissionScoreMethod = Literal["erlang_empirical"]
 ADMISSION_DECISION_HISTORY_LIMIT = 128
+RECENT_STAGE_COMPLETION_HISTORY_LIMIT = 512
+ADMISSION_SCORE_REFERENCE_TOLERANCE = 1e-12
 
 REQUEST_CLASS_HEADER = "x-vllm-omni-request-class"
 REQUEST_PATH_HEADER = "x-vllm-omni-request-path"
@@ -183,6 +190,23 @@ def _finite_float(value: Any, *, field_name: str, minimum: float | None = None) 
     return parsed
 
 
+def _sha256_fingerprint(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_sha256(value: Any, *, field_name: str) -> str:
+    fingerprint = _label(value, default="", field_name=field_name)
+    if len(fingerprint) != 64 or any(character not in "0123456789abcdef" for character in fingerprint):
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 hex digest")
+    return fingerprint
+
+
 @dataclass(frozen=True, slots=True)
 class AdmissionClassConfig:
     """Calibrated Proposition-2 inputs for one request class.
@@ -197,6 +221,18 @@ class AdmissionClassConfig:
     mu: float
     service_samples_s: tuple[float, ...]
     gamma: float
+    _service_samples_array: np.ndarray = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        samples = np.asarray(self.service_samples_s, dtype=np.float64)
+        samples.setflags(write=False)
+        object.__setattr__(self, "_service_samples_array", samples)
+
+    @property
+    def service_samples_array(self) -> np.ndarray:
+        """Return a cached, immutable NumPy view for the admission hot path."""
+
+        return self._service_samples_array
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any], *, field_name: str) -> AdmissionClassConfig:
@@ -314,21 +350,21 @@ def erlang_wait_cdf(
     return min(max(1.0 - poisson_cdf, 0.0), 1.0)
 
 
-def erlang_empirical_admission_score(
+def erlang_empirical_admission_score_reference(
     remaining_budget_s: float,
     *,
     effective_k: int,
     mu: float,
     active_count: int,
     queue_position: int,
-    service_samples_s: tuple[float, ...],
+    service_samples_s: tuple[float, ...] | np.ndarray,
 ) -> float:
-    """Compute the Proposition-2 Erlang--empirical convolution score."""
+    """Compute the score with the scalar definition used as an oracle."""
 
     if remaining_budget_s < 0 or effective_k <= 0 or active_count > effective_k:
         return 0.0
     required_returns = max(active_count + queue_position - effective_k + 1, 0)
-    if not service_samples_s:
+    if len(service_samples_s) == 0:
         raise ValueError("service_samples_s must not be empty")
     return sum(
         erlang_wait_cdf(
@@ -339,6 +375,48 @@ def erlang_empirical_admission_score(
         )
         for sample in service_samples_s
     ) / len(service_samples_s)
+
+
+def erlang_empirical_admission_score(
+    remaining_budget_s: float,
+    *,
+    effective_k: int,
+    mu: float,
+    active_count: int,
+    queue_position: int,
+    service_samples_s: tuple[float, ...] | np.ndarray,
+) -> float:
+    """Compute the exact Erlang--empirical score with vectorized CDF calls.
+
+    ``scipy.special.gammainc(r, x)`` is the Erlang CDF for integer shape
+    ``r`` and scaled time ``x``.  It is algebraically identical to the
+    Poisson-tail implementation in :func:`erlang_wait_cdf`, but evaluates all
+    empirical service samples in compiled code instead of nesting Python loops
+    over samples and required returns.
+    """
+
+    if remaining_budget_s < 0 or effective_k <= 0 or active_count > effective_k:
+        return 0.0
+    samples = np.asarray(service_samples_s, dtype=np.float64)
+    if samples.size == 0:
+        raise ValueError("service_samples_s must not be empty")
+    required_returns = max(active_count + queue_position - effective_k + 1, 0)
+    if required_returns <= 0:
+        # Even with no queue wait, the sampled service time must fit inside the
+        # remaining first-output budget.  This matches erlang_wait_cdf's
+        # intentional negative-budget check before its zero-return shortcut.
+        return float(np.mean(samples <= remaining_budget_s))
+
+    wait_budgets = remaining_budget_s - samples
+    positive = wait_budgets > 0.0
+    if not np.any(positive):
+        return 0.0
+    probabilities = np.zeros(samples.shape, dtype=np.float64)
+    probabilities[positive] = gammainc(
+        required_returns,
+        effective_k * mu * wait_budgets[positive],
+    )
+    return float(np.mean(probabilities))
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +514,8 @@ class OnlineAllocatorMetadata:
     source_runtime_id: str
     source_snapshot_sequence: int
     source_config_generation: int
+    source_config_fingerprint: str
+    target_config_fingerprint: str
     profile_fingerprint: str
 
     @classmethod
@@ -444,8 +524,8 @@ class OnlineAllocatorMetadata:
             return None
         if not isinstance(raw, Mapping):
             raise ValueError("queue_control.online_allocator must be a JSON object")
-        if raw.get("schema_version") != 1:
-            raise ValueError("queue_control.online_allocator.schema_version must be 1")
+        if raw.get("schema_version") != 2:
+            raise ValueError("queue_control.online_allocator.schema_version must be 2")
         revision = _optional_limit(
             raw.get("revision"),
             field_name="queue_control.online_allocator.revision",
@@ -471,32 +551,37 @@ class OnlineAllocatorMetadata:
         )
         if not source_runtime_id:
             raise ValueError("queue_control.online_allocator.source_runtime_id is required")
-        profile_fingerprint = _label(
+        source_config_fingerprint = _validated_sha256(
+            raw.get("source_config_fingerprint"),
+            field_name="queue_control.online_allocator.source_config_fingerprint",
+        )
+        target_config_fingerprint = _validated_sha256(
+            raw.get("target_config_fingerprint"),
+            field_name="queue_control.online_allocator.target_config_fingerprint",
+        )
+        profile_fingerprint = _validated_sha256(
             raw.get("profile_fingerprint"),
-            default="",
             field_name="queue_control.online_allocator.profile_fingerprint",
         )
-        if len(profile_fingerprint) != 64 or any(
-            character not in "0123456789abcdef" for character in profile_fingerprint
-        ):
-            raise ValueError(
-                "queue_control.online_allocator.profile_fingerprint must be a lowercase SHA-256 hex digest"
-            )
         return cls(
             revision=revision,
             source_runtime_id=source_runtime_id,
             source_snapshot_sequence=source_snapshot_sequence,
             source_config_generation=source_config_generation,
+            source_config_fingerprint=source_config_fingerprint,
+            target_config_fingerprint=target_config_fingerprint,
             profile_fingerprint=profile_fingerprint,
         )
 
     def to_snapshot(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "revision": self.revision,
             "source_runtime_id": self.source_runtime_id,
             "source_snapshot_sequence": self.source_snapshot_sequence,
             "source_config_generation": self.source_config_generation,
+            "source_config_fingerprint": self.source_config_fingerprint,
+            "target_config_fingerprint": self.target_config_fingerprint,
             "profile_fingerprint": self.profile_fingerprint,
         }
 
@@ -514,10 +599,47 @@ class QueueControlConfig:
     class_wip_limits: dict[str, int] = field(default_factory=dict)
     admission: AdmissionControlConfig = field(default_factory=AdmissionControlConfig)
     online_allocator: OnlineAllocatorMetadata | None = None
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.admission.enabled and self.admission.enforce and self.policy != "edf":
             raise ValueError("queue_control.policy must be 'edf' when admission enforcement is enabled")
+        object.__setattr__(self, "_fingerprint", _sha256_fingerprint(self.semantic_mapping()))
+
+    def semantic_mapping(self) -> dict[str, Any]:
+        """Return the normalized config covered by allocator compare-and-swap."""
+
+        return {
+            "enabled": self.enabled,
+            "policy": self.policy,
+            "global_wip_limit": self.global_wip_limit,
+            "stage_wip_limits": {str(key): value for key, value in sorted(self.stage_wip_limits.items())},
+            "stage_class_wip_limits": {
+                str(stage_id): dict(sorted(class_limits.items()))
+                for stage_id, class_limits in sorted(self.stage_class_wip_limits.items())
+            },
+            "path_wip_limits": dict(sorted(self.path_wip_limits.items())),
+            "class_wip_limits": dict(sorted(self.class_wip_limits.items())),
+            "admission": {
+                "enabled": self.admission.enabled,
+                "enforce": self.admission.enforce,
+                "score_method": self.admission.score_method,
+                "classes": {
+                    request_class: {
+                        "effective_k": class_config.effective_k,
+                        "mu": class_config.mu,
+                        "service_samples_s": list(class_config.service_samples_s),
+                        "gamma": class_config.gamma,
+                    }
+                    for request_class, class_config in sorted(self.admission.classes.items())
+                },
+            },
+        }
+
+    def fingerprint(self) -> str:
+        """Hash every semantic queue-control field except allocator metadata."""
+
+        return self._fingerprint
 
     @classmethod
     def from_document(
@@ -557,7 +679,7 @@ class QueueControlConfig:
                 raise ValueError(f"stage_class_wip_limits contains unavailable stage ids: {invalid}")
 
         admission = AdmissionControlConfig.from_mapping(raw.get("admission"))
-        return cls(
+        config = cls(
             enabled=enabled,
             policy=policy,  # type: ignore[arg-type]
             global_wip_limit=_optional_limit(
@@ -579,6 +701,14 @@ class QueueControlConfig:
             admission=admission,
             online_allocator=OnlineAllocatorMetadata.from_mapping(raw.get("online_allocator")),
         )
+        if (
+            config.online_allocator is not None
+            and config.online_allocator.target_config_fingerprint != config.fingerprint()
+        ):
+            raise ValueError(
+                "queue_control.online_allocator.target_config_fingerprint does not match the requested config"
+            )
+        return config
 
 
 @dataclass(slots=True)
@@ -598,6 +728,7 @@ class PendingStageDispatch:
     preserve_stage0_mm_cache_order: bool = False
     sequence: int = 0
     enqueued_monotonic_s: float = 0.0
+    acquired_stage_for_dispatch: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -605,6 +736,16 @@ class AcquiredStageDispatch:
     pending: PendingStageDispatch
     acquired_request: bool
     acquired_stage: bool
+    queue_wait_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveStageTelemetry:
+    logical_request_id: str
+    request_class: str
+    admission_correlation_id: str | None
+    enqueued_monotonic_s: float
+    acquired_monotonic_s: float
     queue_wait_s: float
 
 
@@ -656,6 +797,7 @@ class RuntimeQueueController:
         self._request_to_logical: dict[str, str] = {}
         self._active_stages: set[tuple[str, int]] = set()
         self._active_stage_classes: dict[tuple[str, int], str] = {}
+        self._active_stage_telemetry: dict[tuple[str, int], _ActiveStageTelemetry] = {}
         # A dependency is monotone within one logical-request lifetime: an
         # upstream stage satisfies it while active and after successful
         # completion. Rollback never records completion, and cancellation
@@ -663,6 +805,17 @@ class RuntimeQueueController:
         self._completed_stages: set[tuple[str, int]] = set()
         self._observed_initial_requests: set[str] = set()
         self._arrivals_by_class_total: Counter[str] = Counter()
+        self._admitted_arrivals_by_class_total: Counter[str] = Counter()
+        self._recheck_rejections_by_class_total: Counter[str] = Counter()
+        self._stage_class_completed_total: Counter[tuple[int, str]] = Counter()
+        self._stage_class_service_time_s_total: Counter[tuple[int, str]] = Counter()
+        self._stage_class_service_time_s_sum_sq_total: Counter[tuple[int, str]] = Counter()
+        self._stage_class_active_time_s_total: Counter[tuple[int, str]] = Counter()
+        self._stage_class_rollback_total: Counter[tuple[int, str]] = Counter()
+        self._stage_class_cancelled_active_total: Counter[tuple[int, str]] = Counter()
+        self._stage_completion_sequence = 0
+        self._recent_stage_completions: deque[dict[str, Any]] = deque(maxlen=RECENT_STAGE_COMPLETION_HISTORY_LIMIT)
+        self._recent_stage_completions_overwritten_total = 0
         self._config_generation = 0
         self._enqueued_total = 0
         self._dispatch_attempts_total = 0
@@ -690,6 +843,12 @@ class RuntimeQueueController:
 
         return self.enabled or self.config.admission.enabled
 
+    @property
+    def config_generation(self) -> int:
+        """Return the generation used for causal online-control updates."""
+
+        return self._config_generation
+
     def configure(self, config: QueueControlConfig) -> bool:
         if config == self.config:
             return False
@@ -705,6 +864,14 @@ class RuntimeQueueController:
                 raise ValueError(
                     "queue_control fields changed without advancing queue_control.online_allocator.revision"
                 )
+            if (
+                incoming_update.source_runtime_id == current_update.source_runtime_id
+                and incoming_update.source_snapshot_sequence <= current_update.source_snapshot_sequence
+            ):
+                raise ValueError(
+                    "queue_control.online_allocator.source_snapshot_sequence must advance "
+                    "between revisions for one runtime"
+                )
         self.config = config
         self._config_generation += 1
         return True
@@ -712,7 +879,7 @@ class RuntimeQueueController:
     def enqueue(self, pending: PendingStageDispatch) -> AdmissionDecision | None:
         if pending.stage_id < 0 or pending.stage_id >= self.num_stages:
             raise ValueError(f"stage_id {pending.stage_id} is outside [0, {self.num_stages})")
-        self._stamp_pending(pending)
+        first_arrival = self._stamp_pending(pending)
         decision = self._evaluate_arrival_admission(pending)
         if decision is not None:
             self._record_admission_decision(decision)
@@ -720,21 +887,25 @@ class RuntimeQueueController:
                 self._admission_rejected_total += 1
                 return decision
             self._admission_admitted_total += 1
+        if first_arrival:
+            self._admitted_arrivals_by_class_total[pending.metadata.request_class] += 1
         self._pending.append(pending)
         return decision
 
-    def _stamp_pending(self, pending: PendingStageDispatch) -> None:
-        if (
+    def _stamp_pending(self, pending: PendingStageDispatch) -> bool:
+        first_arrival = (
             pending.starts_request
             and pending.stage_id == 0
             and pending.logical_request_id not in self._observed_initial_requests
-        ):
+        )
+        if first_arrival:
             self._observed_initial_requests.add(pending.logical_request_id)
             self._arrivals_by_class_total[pending.metadata.request_class] += 1
         pending.sequence = self._next_sequence
         self._next_sequence += 1
         pending.enqueued_monotonic_s = self._clock()
         self._enqueued_total += 1
+        return first_arrival
 
     def requires_queue(self, pending: PendingStageDispatch) -> bool:
         """Return whether this dispatch competes for an enforced credit.
@@ -824,6 +995,7 @@ class RuntimeQueueController:
         *,
         queue_position: int,
         phase: Literal["arrival", "recheck"],
+        now_monotonic_s: float | None = None,
     ) -> AdmissionDecision | None:
         admission = self.config.admission
         if not admission.enabled or not pending.starts_request or pending.stage_id != 0:
@@ -841,7 +1013,8 @@ class RuntimeQueueController:
             pending.metadata.request_class,
         )
         deadline = pending.metadata.deadline_monotonic_s
-        remaining_budget_s = None if deadline is None else deadline - self._clock()
+        now = self._clock() if now_monotonic_s is None else now_monotonic_s
+        remaining_budget_s = None if deadline is None else deadline - now
         if class_config.effective_k == 0:
             score = 0.0
             reason = "zero_effective_k"
@@ -866,8 +1039,21 @@ class RuntimeQueueController:
                 mu=class_config.mu,
                 active_count=active_count,
                 queue_position=queue_position,
-                service_samples_s=class_config.service_samples_s,
+                service_samples_s=class_config.service_samples_array,
             )
+            # The vectorized and scalar forms are mathematically identical but
+            # can differ by a few ulps.  Resolve only threshold-near cases with
+            # the slow scalar oracle so admission never flips due to numerical
+            # implementation details.
+            if abs(score - class_config.gamma) <= ADMISSION_SCORE_REFERENCE_TOLERANCE:
+                score = erlang_empirical_admission_score_reference(
+                    remaining_budget_s,
+                    effective_k=class_config.effective_k,
+                    mu=class_config.mu,
+                    active_count=active_count,
+                    queue_position=queue_position,
+                    service_samples_s=class_config.service_samples_s,
+                )
             would_admit = score >= class_config.gamma
             reason = "score_pass" if would_admit else "score_below_gamma"
         return AdmissionDecision(
@@ -889,24 +1075,64 @@ class RuntimeQueueController:
         )
 
     def _evaluate_arrival_admission(self, pending: PendingStageDispatch) -> AdmissionDecision | None:
-        candidates = [*self._admission_candidates(pending.metadata.request_class), pending]
-        candidates.sort(key=self._admission_order_key)
+        request_class = pending.metadata.request_class
+        pending_key = self._admission_order_key(pending)
+        # Every request retained in the enforced queue passed the previous
+        # authoritative recheck.  The common arrival path therefore needs only
+        # the new request's EDF insertion rank, not another empirical
+        # convolution for every prior waiter.  This turns a successful arrival
+        # from O(queue * samples) vector work (formerly worse due to scalar
+        # Erlang sums) into O(queue + samples).
+        queue_position = sum(
+            1
+            for candidate in self._pending
+            if candidate.starts_request
+            and candidate.stage_id == 0
+            and candidate.logical_request_id not in self._active_requests
+            and candidate.metadata.request_class == request_class
+            and self._admission_order_key(candidate) < pending_key
+        )
+        now = self._clock()
+        decision = self._evaluate_admission(
+            pending,
+            queue_position=queue_position,
+            phase="arrival",
+            now_monotonic_s=now,
+        )
+        if decision is None or decision.admitted:
+            return decision
+
+        # EDF rank is conservative if an older waiter has become infeasible
+        # since the last recheck.  Only a provisional rejection needs the slow
+        # exact sweep; this preserves the legacy admit/reject result and avoids
+        # rejecting a feasible newcomer after stale predecessors are removed.
         queue_position = 0
-        for candidate in candidates:
-            if candidate is pending:
-                return self._evaluate_admission(
-                    pending,
-                    queue_position=queue_position,
-                    phase="arrival",
-                )
+        for candidate in sorted(
+            (
+                candidate
+                for candidate in self._pending
+                if candidate.starts_request
+                and candidate.stage_id == 0
+                and candidate.logical_request_id not in self._active_requests
+                and candidate.metadata.request_class == request_class
+                and self._admission_order_key(candidate) < pending_key
+            ),
+            key=self._admission_order_key,
+        ):
             prior_decision = self._evaluate_admission(
                 candidate,
                 queue_position=queue_position,
                 phase="recheck",
+                now_monotonic_s=now,
             )
             if prior_decision is None or prior_decision.admitted:
                 queue_position += 1
-        raise AssertionError("arrival candidate disappeared from its tentative class queue")
+        return self._evaluate_admission(
+            pending,
+            queue_position=queue_position,
+            phase="arrival",
+            now_monotonic_s=now,
+        )
 
     def _record_admission_decision(self, decision: AdmissionDecision) -> None:
         self._admission_decision_sequence += 1
@@ -957,11 +1183,13 @@ class RuntimeQueueController:
         }
         for request_class in sorted(classes):
             queue_position = 0
+            now = self._clock()
             for pending in self._admission_candidates(request_class):
                 decision = self._evaluate_admission(
                     pending,
                     queue_position=queue_position,
                     phase="recheck",
+                    now_monotonic_s=now,
                 )
                 if decision is None:
                     queue_position += 1
@@ -972,6 +1200,7 @@ class RuntimeQueueController:
                     queue_position += 1
                     continue
                 self._admission_rejected_total += 1
+                self._recheck_rejections_by_class_total[request_class] += 1
                 rejected_sequences.add(pending.sequence)
                 rejected.append(RejectedStageDispatch(pending=pending, decision=decision))
         if rejected_sequences:
@@ -1050,21 +1279,34 @@ class RuntimeQueueController:
         """Record an unqueued dispatch while preserving lease telemetry."""
         if pending.stage_id < 0 or pending.stage_id >= self.num_stages:
             raise ValueError(f"stage_id {pending.stage_id} is outside [0, {self.num_stages})")
-        self._stamp_pending(pending)
+        first_arrival = self._stamp_pending(pending)
+        if first_arrival:
+            self._admitted_arrivals_by_class_total[pending.metadata.request_class] += 1
         return self._acquire(pending)
 
     def _acquire(self, pending: PendingStageDispatch) -> AcquiredStageDispatch:
+        now = self._clock()
         acquired_request = pending.logical_request_id not in self._active_requests
         acquired_stage = (pending.request_id, pending.stage_id) not in self._active_stages
+        pending.acquired_stage_for_dispatch = acquired_stage
         if acquired_request:
             self._active_requests[pending.logical_request_id] = pending.metadata
         self._request_to_logical[pending.request_id] = pending.logical_request_id
         if acquired_stage:
             stage_key = (pending.request_id, pending.stage_id)
             self._active_stages.add(stage_key)
-            self._active_stage_classes[stage_key] = self._request_class(pending)
+            request_class = self._request_class(pending)
+            self._active_stage_classes[stage_key] = request_class
+            self._active_stage_telemetry[stage_key] = _ActiveStageTelemetry(
+                logical_request_id=pending.logical_request_id,
+                request_class=request_class,
+                admission_correlation_id=pending.metadata.admission_correlation_id,
+                enqueued_monotonic_s=pending.enqueued_monotonic_s,
+                acquired_monotonic_s=now,
+                queue_wait_s=max(now - pending.enqueued_monotonic_s, 0.0),
+            )
 
-        queue_wait_s = max(self._clock() - pending.enqueued_monotonic_s, 0.0)
+        queue_wait_s = max(now - pending.enqueued_monotonic_s, 0.0)
         self._dispatch_attempts_total += 1
         self._queue_wait_s_total += queue_wait_s
         self._queue_wait_s_max = max(self._queue_wait_s_max, queue_wait_s)
@@ -1078,9 +1320,10 @@ class RuntimeQueueController:
     def rollback(self, acquired: AcquiredStageDispatch) -> None:
         pending = acquired.pending
         if acquired.acquired_stage:
-            stage_key = (pending.request_id, pending.stage_id)
-            self._active_stages.discard(stage_key)
-            self._active_stage_classes.pop(stage_key, None)
+            self._retire_active_stage(
+                (pending.request_id, pending.stage_id),
+                outcome="rollback",
+            )
         if acquired.acquired_request:
             self._active_requests.pop(pending.logical_request_id, None)
         if not any(request_id == pending.request_id for request_id, _ in self._active_stages) and not any(
@@ -1089,28 +1332,82 @@ class RuntimeQueueController:
             self._request_to_logical.pop(pending.request_id, None)
         self._dispatch_failures_total += 1
 
+    def fail_stage_dispatch(self, request_id: str, stage_id: int) -> bool:
+        """Retire a lease whose engine dispatch failed before acceptance.
+
+        Dispatch failure is distinct from cancellation: the controller granted
+        a credit, but the downstream engine never accepted the work.  The
+        orchestrator invokes this before its normal request cleanup so cleanup
+        cannot misclassify the lease as cancelled.  The later generic rollback
+        is intentionally harmless because retirement is idempotent.
+        """
+
+        return self._retire_active_stage((request_id, stage_id), outcome="rollback")
+
     def release_stage(self, request_id: str, stage_id: int) -> bool:
         key = (request_id, stage_id)
+        if not self._retire_active_stage(key, outcome="completed"):
+            return False
+        self._completed_stages.add(key)
+        return True
+
+    def _retire_active_stage(
+        self,
+        key: tuple[str, int],
+        *,
+        outcome: Literal["completed", "rollback", "cancelled"],
+        now: float | None = None,
+    ) -> bool:
+        """Close one stage lease and update outcome-specific accounting."""
+
         if key not in self._active_stages:
             return False
         self._active_stages.remove(key)
-        self._active_stage_classes.pop(key, None)
-        self._completed_stages.add(key)
+        request_class = self._active_stage_classes.pop(key)
+        lease = self._active_stage_telemetry.pop(key)
+        retired_s = self._clock() if now is None else now
+        elapsed_s = max(retired_s - lease.acquired_monotonic_s, 0.0)
+        counter_key = (key[1], request_class)
+        self._stage_class_active_time_s_total[counter_key] += elapsed_s
+        if outcome == "completed":
+            self._stage_class_completed_total[counter_key] += 1
+            self._stage_class_service_time_s_total[counter_key] += elapsed_s
+            self._stage_class_service_time_s_sum_sq_total[counter_key] += elapsed_s * elapsed_s
+            self._stage_completion_sequence += 1
+            if len(self._recent_stage_completions) == RECENT_STAGE_COMPLETION_HISTORY_LIMIT:
+                self._recent_stage_completions_overwritten_total += 1
+            self._recent_stage_completions.append(
+                {
+                    "completion_sequence": self._stage_completion_sequence,
+                    "request_id": key[0],
+                    "logical_request_id": lease.logical_request_id,
+                    "stage_id": key[1],
+                    "request_class": request_class,
+                    "admission_correlation_id": lease.admission_correlation_id,
+                    "enqueued_monotonic_s": lease.enqueued_monotonic_s,
+                    "acquired_monotonic_s": lease.acquired_monotonic_s,
+                    "released_monotonic_s": retired_s,
+                    "queue_wait_s": lease.queue_wait_s,
+                    "service_s": elapsed_s,
+                }
+            )
+        elif outcome == "rollback":
+            self._stage_class_rollback_total[counter_key] += 1
+        else:
+            self._stage_class_cancelled_active_total[counter_key] += 1
         return True
 
     def cancel_request(self, request_id: str) -> None:
         logical_id = self._request_to_logical.get(request_id, request_id)
         before = len(self._pending)
+        now = self._clock()
         if request_id == logical_id:
             self._pending = [item for item in self._pending if item.logical_request_id != logical_id]
-            self._active_stages = {
-                key for key in self._active_stages if self._request_to_logical.get(key[0], key[0]) != logical_id
-            }
-            self._active_stage_classes = {
-                key: request_class
-                for key, request_class in self._active_stage_classes.items()
-                if self._request_to_logical.get(key[0], key[0]) != logical_id
-            }
+            active_keys = [
+                key for key in self._active_stages if self._request_to_logical.get(key[0], key[0]) == logical_id
+            ]
+            for key in active_keys:
+                self._retire_active_stage(key, outcome="cancelled", now=now)
             self._completed_stages = {
                 key for key in self._completed_stages if self._request_to_logical.get(key[0], key[0]) != logical_id
             }
@@ -1121,10 +1418,9 @@ class RuntimeQueueController:
             self._observed_initial_requests.discard(logical_id)
         else:
             self._pending = [item for item in self._pending if item.request_id != request_id]
-            self._active_stages = {key for key in self._active_stages if key[0] != request_id}
-            self._active_stage_classes = {
-                key: request_class for key, request_class in self._active_stage_classes.items() if key[0] != request_id
-            }
+            active_keys = [key for key in self._active_stages if key[0] == request_id]
+            for key in active_keys:
+                self._retire_active_stage(key, outcome="cancelled", now=now)
             self._completed_stages = {key for key in self._completed_stages if key[0] != request_id}
             self._request_to_logical.pop(request_id, None)
         self._cancelled_total += before - len(self._pending)
@@ -1145,10 +1441,58 @@ class RuntimeQueueController:
         blocked = Counter(reason for pending in self._pending for reason in self._blocked_reasons(pending))
         recent_admission_decisions = list(self._recent_admission_decisions)
         now = self._clock()
+        stage_class_active_time_s_total = Counter(self._stage_class_active_time_s_total)
+        for key, lease in self._active_stage_telemetry.items():
+            stage_class_active_time_s_total[(key[1], lease.request_class)] += max(
+                now - lease.acquired_monotonic_s,
+                0.0,
+            )
+
+        stage_class_keys = set(stage_class_active_time_s_total)
+        stage_class_keys.update(self._stage_class_completed_total)
+        stage_class_keys.update(self._stage_class_service_time_s_total)
+        stage_class_keys.update(self._stage_class_service_time_s_sum_sq_total)
+        stage_class_keys.update(self._stage_class_rollback_total)
+        stage_class_keys.update(self._stage_class_cancelled_active_total)
+        stage_class_keys.update(
+            (stage_id, request_class)
+            for stage_id, class_limits in self.config.stage_class_wip_limits.items()
+            for request_class in class_limits
+        )
+
+        def stage_class_totals(values: Mapping[tuple[int, str], int | float]) -> dict[str, dict[str, int | float]]:
+            return {
+                str(stage_id): {
+                    request_class: values.get((stage_id, request_class), 0)
+                    for candidate_stage, request_class in sorted(stage_class_keys)
+                    if candidate_stage == stage_id
+                }
+                for stage_id in sorted({stage_id for stage_id, _ in stage_class_keys})
+            }
+
+        stage_class_runtime = {
+            str(stage_id): {
+                request_class: {
+                    "completed_total": self._stage_class_completed_total[(stage_id, request_class)],
+                    "service_time_s_total": self._stage_class_service_time_s_total[(stage_id, request_class)],
+                    "service_time_s_sum_sq_total": self._stage_class_service_time_s_sum_sq_total[
+                        (stage_id, request_class)
+                    ],
+                    "active_time_s_total": stage_class_active_time_s_total[(stage_id, request_class)],
+                    "rollback_total": self._stage_class_rollback_total[(stage_id, request_class)],
+                    "cancelled_active_total": self._stage_class_cancelled_active_total[(stage_id, request_class)],
+                }
+                for candidate_stage, request_class in sorted(stage_class_keys)
+                if candidate_stage == stage_id
+            }
+            for stage_id in sorted({stage_id for stage_id, _ in stage_class_keys})
+        }
+
         return {
             "enabled": self.enabled,
             "policy": self.config.policy,
             "config_generation": self._config_generation,
+            "queue_control_config_fingerprint": self.config.fingerprint(),
             "global_wip_limit": self.config.global_wip_limit,
             "stage_wip_limits": {str(key): value for key, value in sorted(self.config.stage_wip_limits.items())},
             "stage_class_wip_limits": {
@@ -1217,6 +1561,31 @@ class RuntimeQueueController:
             },
             "queued_by_class": dict(sorted(queued_class_counts.items())),
             "arrivals_by_class_total": dict(sorted(self._arrivals_by_class_total.items())),
+            "admitted_arrivals_by_class_total": dict(sorted(self._admitted_arrivals_by_class_total.items())),
+            "recheck_rejections_by_class_total": dict(sorted(self._recheck_rejections_by_class_total.items())),
+            "completed_by_stage_class_total": stage_class_totals(self._stage_class_completed_total),
+            "service_time_s_by_stage_class_total": stage_class_totals(self._stage_class_service_time_s_total),
+            "service_time_s_sum_sq_by_stage_class_total": stage_class_totals(
+                self._stage_class_service_time_s_sum_sq_total
+            ),
+            "active_time_s_by_stage_class_total": stage_class_totals(stage_class_active_time_s_total),
+            "rollbacks_by_stage_class_total": stage_class_totals(self._stage_class_rollback_total),
+            "cancelled_active_by_stage_class_total": stage_class_totals(self._stage_class_cancelled_active_total),
+            "stage_class_runtime": {
+                "schema_version": 1,
+                "observation_monotonic_s": now,
+                "stages": stage_class_runtime,
+            },
+            "recent_stage_completion_schema_version": 1,
+            "recent_stage_completion_capacity": RECENT_STAGE_COMPLETION_HISTORY_LIMIT,
+            "recent_stage_completion_overwritten_total": self._recent_stage_completions_overwritten_total,
+            "recent_stage_completion_first_sequence": (
+                self._recent_stage_completions[0]["completion_sequence"] if self._recent_stage_completions else None
+            ),
+            "recent_stage_completion_last_sequence": (
+                self._recent_stage_completions[-1]["completion_sequence"] if self._recent_stage_completions else None
+            ),
+            "recent_stage_completions": list(self._recent_stage_completions),
             "blocked_by_limit": dict(sorted(blocked.items())),
             "oldest_queue_wait_s": max(
                 (max(now - pending.enqueued_monotonic_s, 0.0) for pending in self._pending),
