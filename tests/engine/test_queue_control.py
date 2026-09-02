@@ -13,6 +13,7 @@ import pytest
 import vllm_omni.engine.queue_control as queue_control_module
 from vllm_omni.engine.queue_control import (
     ADMISSION_DECISION_HISTORY_LIMIT,
+    DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS,
     RECENT_STAGE_COMPLETION_HISTORY_LIMIT,
     AdmissionClassConfig,
     AdmissionControlConfig,
@@ -21,6 +22,10 @@ from vllm_omni.engine.queue_control import (
     QueueControlConfig,
     RequestSchedulingMetadata,
     RuntimeQueueController,
+    admission_threshold_profile_fingerprint,
+    admission_threshold_table_digest,
+    compile_erlang_empirical_admission_threshold_table,
+    compile_erlang_empirical_admission_thresholds,
     erlang_empirical_admission_score,
     erlang_empirical_admission_score_reference,
     erlang_wait_cdf,
@@ -83,6 +88,45 @@ def _admission_config(
                     mu=mu,
                     service_samples_s=service_samples_s,
                     gamma=gamma,
+                )
+            },
+        ),
+    )
+
+
+def _threshold_admission_config(
+    *,
+    effective_k: int = 1,
+    mu: float = 2.0,
+    service_samples_s: tuple[float, ...] = (0.0,),
+    gamma: float = 0.75,
+    max_required_returns: int = 8,
+    enforce: bool = True,
+) -> QueueControlConfig:
+    table = compile_erlang_empirical_admission_threshold_table(
+        "interactive",
+        effective_k=effective_k,
+        mu=mu,
+        service_samples_s=service_samples_s,
+        gamma=gamma,
+        max_required_returns=max_required_returns,
+    )
+    return QueueControlConfig(
+        policy="edf",
+        admission=AdmissionControlConfig(
+            enabled=True,
+            enforce=enforce,
+            score_method="erlang_empirical_threshold",
+            classes={
+                "interactive": AdmissionClassConfig(
+                    effective_k=effective_k,
+                    mu=mu,
+                    service_samples_s=service_samples_s,
+                    gamma=gamma,
+                    max_required_returns=max_required_returns,
+                    compiled_thresholds_s=table.thresholds_s,
+                    threshold_profile_fingerprint=table.profile_fingerprint,
+                    threshold_table_digest=table.table_digest,
                 )
             },
         ),
@@ -420,6 +464,401 @@ def test_vectorized_erlang_empirical_score_matches_scalar_reference_randomized()
             service_samples_s=samples,
         )
         assert vectorized == pytest.approx(scalar, abs=1e-12, rel=1e-12)
+
+
+def _authoritative_admission_score(
+    remaining_budget_s: float,
+    *,
+    effective_k: int,
+    mu: float,
+    required_returns: int,
+    service_samples_s: tuple[float, ...],
+    gamma: float,
+) -> float:
+    if required_returns == 0:
+        active_count = 0
+        queue_position = 0
+    else:
+        active_count = effective_k
+        queue_position = required_returns - 1
+    score = erlang_empirical_admission_score(
+        remaining_budget_s,
+        effective_k=effective_k,
+        mu=mu,
+        active_count=active_count,
+        queue_position=queue_position,
+        service_samples_s=service_samples_s,
+    )
+    if abs(score - gamma) <= queue_control_module.ADMISSION_SCORE_REFERENCE_TOLERANCE:
+        score = erlang_empirical_admission_score_reference(
+            remaining_budget_s,
+            effective_k=effective_k,
+            mu=mu,
+            active_count=active_count,
+            queue_position=queue_position,
+            service_samples_s=service_samples_s,
+        )
+    return score
+
+
+def _vectorized_admission_score(
+    remaining_budget_s: float,
+    *,
+    effective_k: int,
+    mu: float,
+    required_returns: int,
+    service_samples_s: tuple[float, ...],
+) -> float:
+    if required_returns == 0:
+        active_count = 0
+        queue_position = 0
+    else:
+        active_count = effective_k
+        queue_position = required_returns - 1
+    return erlang_empirical_admission_score(
+        remaining_budget_s,
+        effective_k=effective_k,
+        mu=mu,
+        active_count=active_count,
+        queue_position=queue_position,
+        service_samples_s=service_samples_s,
+    )
+
+
+@pytest.mark.parametrize("gamma", [0.0, 0.65])
+def test_compiled_admission_thresholds_match_vectorized_predicate(gamma: float) -> None:
+    samples = (0.05, 0.2, 0.4, 0.9)
+    thresholds = compile_erlang_empirical_admission_thresholds(
+        effective_k=3,
+        mu=0.7,
+        service_samples_s=samples,
+        gamma=gamma,
+        max_required_returns=8,
+    )
+    assert len(thresholds) == 9
+    assert list(thresholds) == sorted(thresholds)
+
+    rng = random.Random(18403 + int(gamma * 100))
+    for required_returns, threshold in enumerate(thresholds):
+        boundary_target = (
+            gamma
+            if required_returns == 0 or gamma == 0.0
+            else gamma + queue_control_module.ADMISSION_SCORE_REFERENCE_TOLERANCE
+        )
+        assert (
+            _vectorized_admission_score(
+                threshold,
+                effective_k=3,
+                mu=0.7,
+                required_returns=required_returns,
+                service_samples_s=samples,
+            )
+            >= boundary_target
+        )
+        if threshold > 0.0:
+            previous_score = _vectorized_admission_score(
+                math.nextafter(threshold, -math.inf),
+                effective_k=3,
+                mu=0.7,
+                required_returns=required_returns,
+                service_samples_s=samples,
+            )
+            if required_returns == 0:
+                assert previous_score < gamma
+            else:
+                assert previous_score <= boundary_target
+        for _ in range(8):
+            remaining_budget_s = max(0.0, threshold + rng.uniform(-0.5, 0.5))
+            expected = (
+                _authoritative_admission_score(
+                    remaining_budget_s,
+                    effective_k=3,
+                    mu=0.7,
+                    required_returns=required_returns,
+                    service_samples_s=samples,
+                    gamma=gamma,
+                )
+                >= gamma
+            )
+            assert (remaining_budget_s >= threshold) == expected
+
+
+def test_zero_return_threshold_handles_float_product_boundary() -> None:
+    gamma = math.nextafter(1.0 / 3.0, math.inf)
+    thresholds = compile_erlang_empirical_admission_thresholds(
+        effective_k=1,
+        mu=1.0,
+        service_samples_s=(0.1, 0.2, 0.3),
+        gamma=gamma,
+        max_required_returns=0,
+    )
+    assert thresholds == (0.2,)
+
+
+def test_threshold_tie_guard_is_a_conservative_subset_of_legacy_predicate() -> None:
+    samples = (0.05, 0.2, 0.4, 0.9)
+    gamma = 0.65
+    compiled_threshold = compile_erlang_empirical_admission_thresholds(
+        effective_k=3,
+        mu=0.7,
+        service_samples_s=samples,
+        gamma=gamma,
+        max_required_returns=1,
+    )[1]
+
+    low = 0.0
+    high = compiled_threshold
+    while True:
+        midpoint = low + (high - low) / 2.0
+        if midpoint == low or midpoint == high:
+            break
+        score = _authoritative_admission_score(
+            midpoint,
+            effective_k=3,
+            mu=0.7,
+            required_returns=1,
+            service_samples_s=samples,
+            gamma=gamma,
+        )
+        if score >= gamma:
+            high = midpoint
+        else:
+            low = midpoint
+    legacy_threshold = high
+    assert legacy_threshold < compiled_threshold
+
+    tie_budget = legacy_threshold + (compiled_threshold - legacy_threshold) / 2.0
+    assert tie_budget < compiled_threshold
+    assert (
+        _authoritative_admission_score(
+            tie_budget,
+            effective_k=3,
+            mu=0.7,
+            required_returns=1,
+            service_samples_s=samples,
+            gamma=gamma,
+        )
+        >= gamma
+    )
+
+
+def test_threshold_compiler_rejects_gamma_one() -> None:
+    with pytest.raises(ValueError, match="less than 1"):
+        compile_erlang_empirical_admission_thresholds(
+            effective_k=1,
+            mu=1.0,
+            service_samples_s=(0.1,),
+            gamma=1.0,
+            max_required_returns=1,
+        )
+
+
+def test_threshold_compiler_rejects_unrepresentable_finite_boundary() -> None:
+    with pytest.raises(ValueError, match="no representable finite threshold"):
+        compile_erlang_empirical_admission_thresholds(
+            effective_k=1,
+            mu=1e-308,
+            service_samples_s=(1e308,),
+            gamma=0.5,
+            max_required_returns=1,
+        )
+
+
+def test_threshold_control_requires_and_validates_bound_artifact() -> None:
+    table = compile_erlang_empirical_admission_threshold_table(
+        "interactive",
+        effective_k=2,
+        mu=1.25,
+        service_samples_s=(0.1, 0.3, 0.7),
+        gamma=0.8,
+        max_required_returns=4,
+    )
+    class_document = {
+        "effective_k": 2,
+        "mu": 1.25,
+        "service_samples_s": [0.1, 0.3, 0.7],
+        "gamma": 0.8,
+        **table.to_config_fields(),
+    }
+    document = {
+        "queue_control": {
+            "policy": "edf",
+            "admission": {
+                "enabled": True,
+                "score_method": "erlang_empirical_threshold",
+                "classes": {"interactive": class_document},
+            },
+        }
+    }
+    config = QueueControlConfig.from_document(document)
+    installed = config.admission.threshold_tables["interactive"]
+    assert installed == table
+    assert installed.max_required_returns == 4
+    semantic_class = config.semantic_mapping()["admission"]["classes"]["interactive"]
+    assert "compiled_thresholds_s" not in semantic_class
+    assert semantic_class["max_required_returns"] == 4
+    assert semantic_class["threshold_profile_fingerprint"] == table.profile_fingerprint
+    assert semantic_class["threshold_table_digest"] == table.table_digest
+
+    missing = json.loads(json.dumps(document))
+    del missing["queue_control"]["admission"]["classes"]["interactive"]["compiled_thresholds_s"]
+    with pytest.raises(ValueError, match="must be provided together"):
+        QueueControlConfig.from_document(missing)
+
+    stale_profile = json.loads(json.dumps(document))
+    stale_profile["queue_control"]["admission"]["classes"]["interactive"]["mu"] = 2.0
+    with pytest.raises(ValueError, match="profile fingerprint does not match"):
+        QueueControlConfig.from_document(stale_profile)
+
+    corrupt_table = json.loads(json.dumps(document))
+    corrupt_table["queue_control"]["admission"]["classes"]["interactive"]["compiled_thresholds_s"][-1] += 0.1
+    with pytest.raises(ValueError, match="table digest does not match"):
+        QueueControlConfig.from_document(corrupt_table)
+
+    forged_zero_table = json.loads(json.dumps(document))
+    forged_class = forged_zero_table["queue_control"]["admission"]["classes"]["interactive"]
+    forged_class["compiled_thresholds_s"] = [0.0] * len(forged_class["compiled_thresholds_s"])
+    forged_class["threshold_table_digest"] = admission_threshold_table_digest(
+        profile_fingerprint=table.profile_fingerprint,
+        thresholds_s=forged_class["compiled_thresholds_s"],
+    )
+    with pytest.raises(ValueError, match="does not pass its predicate"):
+        QueueControlConfig.from_document(forged_zero_table)
+
+    alternate_table = compile_erlang_empirical_admission_threshold_table(
+        "interactive",
+        effective_k=2,
+        mu=1.25,
+        service_samples_s=(0.1, 0.3, 0.7),
+        gamma=0.7,
+        max_required_returns=4,
+    )
+    alternate = json.loads(json.dumps(document))
+    alternate_class = alternate["queue_control"]["admission"]["classes"]["interactive"]
+    alternate_class["gamma"] = 0.7
+    alternate_class.update(alternate_table.to_config_fields())
+    alternate_config = QueueControlConfig.from_document(alternate)
+    assert alternate_config != config
+    assert alternate_config.fingerprint() != config.fingerprint()
+    controller = RuntimeQueueController(num_stages=1, config=config)
+    assert controller.configure(alternate_config)
+    assert controller.config_generation == 1
+    assert (
+        controller.config.admission.threshold_tables["interactive"].table_digest
+        == alternate_class["threshold_table_digest"]
+    )
+
+    with pytest.raises(ValueError, match="require score_method"):
+        AdmissionControlConfig(
+            enabled=True,
+            classes={
+                "interactive": AdmissionClassConfig(
+                    effective_k=2,
+                    mu=1.25,
+                    service_samples_s=(0.1, 0.3, 0.7),
+                    gamma=0.8,
+                    max_required_returns=4,
+                    compiled_thresholds_s=table.thresholds_s,
+                    threshold_profile_fingerprint=table.profile_fingerprint,
+                    threshold_table_digest=table.table_digest,
+                )
+            },
+        )
+
+
+def test_threshold_profile_and_table_digests_cover_all_inputs() -> None:
+    base = admission_threshold_profile_fingerprint(
+        "interactive",
+        effective_k=2,
+        mu=1.0,
+        service_samples_s=(0.1, 0.2),
+        gamma=0.8,
+        max_required_returns=4,
+    )
+    assert base != admission_threshold_profile_fingerprint(
+        "batch",
+        effective_k=2,
+        mu=1.0,
+        service_samples_s=(0.1, 0.2),
+        gamma=0.8,
+        max_required_returns=4,
+    )
+    assert base != admission_threshold_profile_fingerprint(
+        "interactive",
+        effective_k=2,
+        mu=1.0,
+        service_samples_s=(0.1, 0.2),
+        gamma=0.8,
+        max_required_returns=5,
+    )
+    assert admission_threshold_table_digest(
+        profile_fingerprint=base,
+        thresholds_s=(0.1, 0.2),
+    ) != admission_threshold_table_digest(
+        profile_fingerprint=base,
+        thresholds_s=(0.1, 0.3),
+    )
+    assert DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS >= 2048
+
+
+def test_threshold_artifact_json_round_trip_canonicalizes_integer_floats() -> None:
+    table = compile_erlang_empirical_admission_threshold_table(
+        "interactive",
+        effective_k=1,
+        mu=1,
+        service_samples_s=(0,),
+        gamma=0,
+        max_required_returns=1,
+    )
+    document = {
+        "queue_control": {
+            "policy": "edf",
+            "admission": {
+                "score_method": "erlang_empirical_threshold",
+                "classes": {
+                    "interactive": {
+                        "effective_k": 1,
+                        "mu": 1,
+                        "service_samples_s": [0],
+                        "gamma": 0,
+                        **table.to_config_fields(),
+                    }
+                },
+            },
+        }
+    }
+    config = QueueControlConfig.from_document(json.loads(json.dumps(document)))
+    assert config.admission.threshold_tables["interactive"] == table
+
+
+def test_threshold_boundary_validation_is_cached() -> None:
+    validator = queue_control_module._validate_erlang_empirical_admission_threshold_table_cached
+    validator.cache_clear()
+    table = compile_erlang_empirical_admission_threshold_table(
+        "interactive",
+        effective_k=2,
+        mu=1.0,
+        service_samples_s=(0.1, 0.2, 0.4),
+        gamma=0.8,
+        max_required_returns=4,
+    )
+    kwargs = {
+        "request_class": "interactive",
+        "effective_k": 2,
+        "mu": 1.0,
+        "service_samples_s": (0.1, 0.2, 0.4),
+        "gamma": 0.8,
+        "profile_fingerprint": table.profile_fingerprint,
+        "table_digest": table.table_digest,
+        "thresholds_s": table.thresholds_s,
+    }
+    queue_control_module.validate_erlang_empirical_admission_threshold_table(**kwargs)
+    first = validator.cache_info()
+    queue_control_module.validate_erlang_empirical_admission_threshold_table(**kwargs)
+    second = validator.cache_info()
+    assert first.misses == 1
+    assert second.misses == 1
+    assert second.hits == first.hits + 1
 
 
 def test_request_metadata_builds_absolute_deadline() -> None:
@@ -1106,6 +1545,11 @@ def test_shadow_admission_records_would_reject_and_correlation_without_rejecting
         "active_count": 0,
         "queue_position": 0,
         "remaining_budget_s": 10.0,
+        "required_returns": None,
+        "threshold_s": None,
+        "threshold_slack_s": None,
+        "score_method": "erlang_empirical",
+        "threshold_table_digest": None,
     }
 
 
@@ -1219,6 +1663,182 @@ def test_admission_rejects_expired_deadline_and_zero_effective_k() -> None:
     assert stopped_decision is not None
     assert not stopped_decision.admitted
     assert stopped_decision.reason == "zero_effective_k"
+
+
+def test_threshold_admission_uses_only_lookup_and_records_slack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _threshold_admission_config(
+        effective_k=2,
+        mu=1.0,
+        service_samples_s=(0.1, 0.2, 0.4),
+        gamma=0.75,
+        max_required_returns=4,
+    )
+    table = config.admission.threshold_tables["interactive"]
+
+    def unexpected_score(*args, **kwargs):
+        raise AssertionError("threshold mode must not invoke an online scorer")
+
+    monkeypatch.setattr(
+        queue_control_module,
+        "erlang_empirical_admission_score",
+        unexpected_score,
+    )
+    monkeypatch.setattr(
+        queue_control_module,
+        "erlang_empirical_admission_score_reference",
+        unexpected_score,
+    )
+    controller = RuntimeQueueController(num_stages=1, config=config, clock=lambda: 0.0)
+    threshold = table.thresholds_s[0]
+    decision = controller.enqueue(
+        _pending(
+            "at-threshold",
+            request_class="interactive",
+            deadline=threshold,
+        )
+    )
+    assert decision is not None and decision.admitted and decision.would_admit
+    assert decision.score is None
+    assert decision.required_returns == 0
+    assert decision.threshold_s == threshold
+    assert decision.threshold_slack_s == 0.0
+
+    snapshot = controller.snapshot()["admission"]
+    class_snapshot = snapshot["classes"]["interactive"]
+    assert snapshot["score_method"] == "erlang_empirical_threshold"
+    assert class_snapshot["max_required_returns"] == 4
+    assert class_snapshot["threshold_entry_count"] == 5
+    assert class_snapshot["threshold_profile_fingerprint"] == table.profile_fingerprint
+    assert class_snapshot["threshold_table_digest"] == table.table_digest
+    assert snapshot["recent_decisions"][-1]["threshold_slack_s"] == 0.0
+    assert snapshot["recent_decisions"][-1]["score_method"] == "erlang_empirical_threshold"
+    assert snapshot["recent_decisions"][-1]["threshold_table_digest"] == table.table_digest
+
+
+def test_threshold_admission_fails_closed_beyond_table_without_scorer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_threshold_admission_config(max_required_returns=2),
+        clock=lambda: 0.0,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_active_stage_class_count",
+        lambda stage_id, request_class: 1,
+    )
+
+    def unexpected_score(*args, **kwargs):
+        raise AssertionError("overflow must fail closed without an online scorer")
+
+    monkeypatch.setattr(
+        queue_control_module,
+        "erlang_empirical_admission_score",
+        unexpected_score,
+    )
+    monkeypatch.setattr(
+        queue_control_module,
+        "erlang_empirical_admission_score_reference",
+        unexpected_score,
+    )
+    decision = controller._evaluate_admission(
+        _pending("overflow", request_class="interactive", deadline=100.0),
+        queue_position=2,
+        phase="arrival",
+        now_monotonic_s=0.0,
+    )
+    assert decision is not None
+    assert not decision.admitted
+    assert not decision.would_admit
+    assert decision.reason == "threshold_table_exhausted"
+    assert decision.required_returns == 3
+    assert decision.score is None
+    assert decision.threshold_s is None
+    assert decision.threshold_slack_s is None
+
+    zero_gamma = RuntimeQueueController(
+        num_stages=1,
+        config=_threshold_admission_config(
+            gamma=0.0,
+            max_required_returns=0,
+        ),
+        clock=lambda: 0.0,
+    )
+    monkeypatch.setattr(
+        zero_gamma,
+        "_active_stage_class_count",
+        lambda stage_id, request_class: 1,
+    )
+    zero_gamma_decision = zero_gamma._evaluate_admission(
+        _pending("zero-gamma-overflow", request_class="interactive", deadline=100.0),
+        queue_position=100,
+        phase="arrival",
+        now_monotonic_s=0.0,
+    )
+    assert zero_gamma_decision is not None and zero_gamma_decision.admitted
+    assert zero_gamma_decision.required_returns == 101
+    assert zero_gamma_decision.threshold_s == 0.0
+
+
+def test_threshold_admission_preserves_special_cases_and_shadow_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    no_capacity = RuntimeQueueController(
+        num_stages=1,
+        config=_threshold_admission_config(effective_k=0, mu=0.0),
+        clock=lambda: 1.0,
+    )
+    stopped = no_capacity.enqueue(_pending("stopped", request_class="interactive", deadline=2.0))
+    assert stopped is not None and not stopped.admitted
+    assert stopped.reason == "zero_effective_k"
+
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_threshold_admission_config(
+            service_samples_s=(0.5,),
+            enforce=False,
+        ),
+        clock=lambda: 0.0,
+    )
+    no_deadline = controller.enqueue(_pending("no-deadline-threshold", request_class="interactive"))
+    assert no_deadline is not None and no_deadline.would_admit
+    assert no_deadline.reason == "no_deadline"
+
+    monkeypatch.setattr(
+        controller,
+        "_active_stage_class_count",
+        lambda stage_id, request_class: 2,
+    )
+    above_k = controller._evaluate_admission(
+        _pending("above-k", request_class="interactive", deadline=2.0),
+        queue_position=0,
+        phase="arrival",
+        now_monotonic_s=1.0,
+    )
+    assert above_k is not None and above_k.admitted and not above_k.would_admit
+    assert above_k.reason == "active_above_effective_k"
+
+    monkeypatch.setattr(
+        controller,
+        "_active_stage_class_count",
+        lambda stage_id, request_class: 0,
+    )
+    table = controller.config.admission.threshold_tables["interactive"]
+    below = controller._evaluate_admission(
+        _pending(
+            "shadow-below",
+            request_class="interactive",
+            deadline=math.nextafter(table.thresholds_s[0], -math.inf),
+        ),
+        queue_position=0,
+        phase="arrival",
+        now_monotonic_s=0.0,
+    )
+    assert below is not None and below.admitted and not below.would_admit
+    assert below.reason == "score_below_gamma"
 
 
 def test_admission_rechecks_deadline_position_after_queue_change() -> None:
@@ -1374,6 +1994,40 @@ def test_arrival_position_excludes_waiters_that_now_fail_recheck() -> None:
     rejected = controller.recheck_admission()
     assert [item.pending.request_id for item in rejected] == ["stale"]
     assert controller.pop_ready().pending.request_id == "new"  # type: ignore[union-attr]
+
+
+def test_threshold_arrival_retains_authoritative_edf_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_threshold_admission_config(mu=0.1, gamma=0.8),
+        clock=lambda: now[0],
+    )
+    stale = controller.enqueue(_pending("stale", request_class="interactive", deadline=1.0))
+    assert stale is not None and stale.admitted
+
+    def unexpected_score(*args, **kwargs):
+        raise AssertionError("threshold EDF fallback must remain lookup-only")
+
+    monkeypatch.setattr(
+        queue_control_module,
+        "erlang_empirical_admission_score",
+        unexpected_score,
+    )
+    monkeypatch.setattr(
+        queue_control_module,
+        "erlang_empirical_admission_score_reference",
+        unexpected_score,
+    )
+    now[0] = 2.0
+    newcomer = controller.enqueue(_pending("new", request_class="interactive", deadline=3.0))
+    assert newcomer is not None and newcomer.admitted
+    assert newcomer.queue_position == 0
+
+    rejected = controller.recheck_admission()
+    assert [item.pending.request_id for item in rejected] == ["stale"]
 
 
 def test_arrival_fast_path_matches_scalar_legacy_decisions_and_order(
