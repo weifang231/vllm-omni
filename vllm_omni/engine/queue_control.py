@@ -18,7 +18,7 @@ import os
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Literal
@@ -27,6 +27,7 @@ import numpy as np
 from scipy.special import gammainc
 
 QueuePolicy = Literal["fifo", "edf"]
+StageClassWipMode = Literal["hard_limit", "soft_reservation"]
 DispatchCallable = Callable[[], Awaitable[bool]]
 AdmissionScoreMethod = Literal["erlang_empirical", "erlang_empirical_threshold"]
 ADMISSION_DECISION_HISTORY_LIMIT = 128
@@ -188,6 +189,23 @@ def _stage_class_limit_map(value: Any, *, field_name: str) -> dict[int, dict[str
             field_name=f"{field_name}[{raw_stage_id!r}]",
             key_parser=_string_key,
         )
+    return parsed
+
+
+def _stage_class_wip_mode_map(value: Any, *, field_name: str) -> dict[int, StageClassWipMode]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a JSON object")
+    parsed: dict[int, StageClassWipMode] = {}
+    for raw_stage_id, raw_mode in value.items():
+        stage_id = _stage_key(raw_stage_id)
+        if not isinstance(raw_mode, str):
+            raise ValueError(f"{field_name}[{raw_stage_id!r}] must be a string")
+        mode = raw_mode.strip().lower()
+        if mode not in {"hard_limit", "soft_reservation"}:
+            raise ValueError(f"{field_name}[{raw_stage_id!r}] must be 'hard_limit' or 'soft_reservation'")
+        parsed[stage_id] = mode  # type: ignore[assignment]
     return parsed
 
 
@@ -1227,6 +1245,9 @@ class QueueControlConfig:
     global_wip_limit: int | None = None
     stage_wip_limits: dict[int, int] = field(default_factory=dict)
     stage_class_wip_limits: dict[int, dict[str, int]] = field(default_factory=dict)
+    # An absent stage uses legacy hard limits. Soft reservations share the
+    # corresponding stage_wip_limit and let idle class shares be borrowed.
+    stage_class_wip_modes: dict[int, StageClassWipMode] = field(default_factory=dict)
     path_wip_limits: dict[str, int] = field(default_factory=dict)
     class_wip_limits: dict[str, int] = field(default_factory=dict)
     admission: AdmissionControlConfig = field(default_factory=AdmissionControlConfig)
@@ -1235,6 +1256,23 @@ class QueueControlConfig:
     _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        for stage_id, mode in self.stage_class_wip_modes.items():
+            if type(stage_id) is not int or stage_id < 0:
+                raise ValueError("queue_control.stage_class_wip_modes keys must be non-negative integers")
+            if mode not in {"hard_limit", "soft_reservation"}:
+                raise ValueError(
+                    "queue_control.stage_class_wip_modes values must be 'hard_limit' or 'soft_reservation'"
+                )
+            if mode != "soft_reservation":
+                continue
+            reservations = self.stage_class_wip_limits.get(stage_id)
+            if not reservations:
+                raise ValueError(f"soft_reservation requires queue_control.stage_class_wip_limits for stage {stage_id}")
+            stage_limit = self.stage_wip_limits.get(stage_id)
+            if stage_limit is None:
+                raise ValueError(f"soft_reservation requires queue_control.stage_wip_limits for stage {stage_id}")
+            if sum(reservations.values()) > stage_limit:
+                raise ValueError(f"soft_reservation shares must not exceed the stage WIP limit for stage {stage_id}")
         if self.stage_backpressure is not None and not isinstance(
             self.stage_backpressure,
             StageBackpressureConfig,
@@ -1251,6 +1289,11 @@ class QueueControlConfig:
                 raise ValueError(
                     "enabled queue_control.stage_backpressure requires a matching "
                     "queue_control.stage_class_wip_limits entry"
+                )
+            if self.stage_class_wip_modes.get(self.stage_backpressure.upstream_stage_id) == "soft_reservation":
+                raise ValueError(
+                    "enabled queue_control.stage_backpressure cannot be combined with "
+                    "soft_reservation at its upstream stage"
                 )
         if self.admission.enabled and self.admission.enforce and self.policy != "edf":
             raise ValueError("queue_control.policy must be 'edf' when admission enforcement is enabled")
@@ -1296,6 +1339,10 @@ class QueueControlConfig:
                 },
             },
         }
+        if self.stage_class_wip_modes:
+            semantic["stage_class_wip_modes"] = {
+                str(stage_id): mode for stage_id, mode in sorted(self.stage_class_wip_modes.items())
+            }
         if self.stage_backpressure is not None:
             semantic["stage_backpressure"] = self.stage_backpressure.to_mapping()
         return semantic
@@ -1334,6 +1381,10 @@ class QueueControlConfig:
             raw.get("stage_class_wip_limits"),
             field_name="queue_control.stage_class_wip_limits",
         )
+        stage_class_wip_modes = _stage_class_wip_mode_map(
+            raw.get("stage_class_wip_modes"),
+            field_name="queue_control.stage_class_wip_modes",
+        )
         if num_stages is not None:
             invalid = sorted(stage_id for stage_id in stage_limits if stage_id >= num_stages)
             if invalid:
@@ -1341,6 +1392,9 @@ class QueueControlConfig:
             invalid = sorted(stage_id for stage_id in stage_class_limits if stage_id >= num_stages)
             if invalid:
                 raise ValueError(f"stage_class_wip_limits contains unavailable stage ids: {invalid}")
+            invalid = sorted(stage_id for stage_id in stage_class_wip_modes if stage_id >= num_stages)
+            if invalid:
+                raise ValueError(f"stage_class_wip_modes contains unavailable stage ids: {invalid}")
 
         admission = AdmissionControlConfig.from_mapping(raw.get("admission"))
         stage_backpressure = (
@@ -1360,6 +1414,7 @@ class QueueControlConfig:
             ),
             stage_wip_limits=stage_limits,
             stage_class_wip_limits=stage_class_limits,
+            stage_class_wip_modes=stage_class_wip_modes,
             path_wip_limits=_limit_map(
                 raw.get("path_wip_limits"),
                 field_name="queue_control.path_wip_limits",
@@ -1439,6 +1494,7 @@ class _QueueBlockState:
     request_class_counts: Mapping[str, int]
     mm_cache_head_sequence_by_stage: Mapping[int, int]
     mm_cache_progress_cutoff_by_stage: Mapping[int, int]
+    soft_reservation_demand_by_stage: Mapping[int, frozenset[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1535,6 +1591,9 @@ class RuntimeQueueController:
         self._admission_decision_sequence = 0
         self._admission_reason_counts: Counter[str] = Counter()
         self._recent_admission_decisions: deque[dict[str, Any]] = deque(maxlen=ADMISSION_DECISION_HISTORY_LIMIT)
+        self._soft_reservation_reserved_dispatch_total: Counter[int] = Counter()
+        self._soft_reservation_borrowed_dispatch_total: Counter[int] = Counter()
+        self._soft_reservation_global_cap_blocked_total: Counter[int] = Counter()
 
     @property
     def enabled(self) -> bool:
@@ -1680,6 +1739,87 @@ class RuntimeQueueController:
             active_stage_id == stage_id and active_class == request_class
             for (_, active_stage_id), active_class in self._active_stage_classes.items()
         )
+
+    def _stage_class_wip_mode(self, stage_id: int) -> StageClassWipMode:
+        return self.config.stage_class_wip_modes.get(stage_id, "hard_limit")
+
+    def _with_soft_reservation_demand(self, block_state: _QueueBlockState) -> _QueueBlockState:
+        """Record underfilled classes that can run without reservation priority.
+
+        A request behind a multimodal cache-order head is not ready demand.
+        This prevents a later reserved request from blocking the head itself.
+        """
+        demand_by_stage: dict[int, set[str]] = {}
+        if not self.enabled or not self.config.stage_class_wip_modes:
+            return block_state
+        for pending in self._pending:
+            stage_id = pending.stage_id
+            if self._stage_class_wip_mode(stage_id) != "soft_reservation":
+                continue
+            if (pending.request_id, stage_id) in self._active_stages:
+                continue
+            request_class = self._request_class(pending)
+            reservation = self.config.stage_class_wip_limits[stage_id].get(request_class, 0)
+            active = block_state.active_stage_class_counts.get((stage_id, request_class), 0)
+            if active >= reservation:
+                continue
+            if self._blocked_reasons(
+                pending,
+                block_state=block_state,
+                enforce_soft_reservations=False,
+            ):
+                continue
+            demand_by_stage.setdefault(stage_id, set()).add(request_class)
+        return replace(
+            block_state,
+            soft_reservation_demand_by_stage={
+                stage_id: frozenset(request_classes) for stage_id, request_classes in demand_by_stage.items()
+            },
+        )
+
+    def _record_soft_reservation_dispatch(
+        self,
+        pending: PendingStageDispatch,
+        *,
+        block_state: _QueueBlockState,
+    ) -> None:
+        stage_id = pending.stage_id
+        if self._stage_class_wip_mode(stage_id) != "soft_reservation":
+            return
+        if (pending.request_id, stage_id) in self._active_stages:
+            return
+        request_class = self._request_class(pending)
+        reservation = self.config.stage_class_wip_limits[stage_id].get(request_class, 0)
+        active = block_state.active_stage_class_counts.get((stage_id, request_class), 0)
+        if active >= reservation:
+            self._soft_reservation_borrowed_dispatch_total[stage_id] += 1
+            return
+        if request_class not in block_state.soft_reservation_demand_by_stage.get(stage_id, ()):
+            return
+        for candidate in self._pending:
+            if candidate is pending or candidate.stage_id != stage_id:
+                continue
+            if self._blocked_reasons(
+                candidate,
+                block_state=block_state,
+            ) == ("stage_class_reservation",):
+                self._soft_reservation_reserved_dispatch_total[stage_id] += 1
+                return
+
+    def _record_soft_reservation_global_cap_block(self, block_state: _QueueBlockState) -> None:
+        if not self.enabled or not self.config.stage_class_wip_modes:
+            return
+        blocked_stages: set[int] = set()
+        for pending in self._pending:
+            stage_id = pending.stage_id
+            if self._stage_class_wip_mode(stage_id) != "soft_reservation":
+                continue
+            if (pending.request_id, stage_id) in self._active_stages:
+                continue
+            stage_limit = self.config.stage_wip_limits[stage_id]
+            if block_state.active_stage_counts.get(stage_id, 0) >= stage_limit:
+                blocked_stages.add(stage_id)
+        self._soft_reservation_global_cap_blocked_total.update(blocked_stages)
 
     def _request_class(self, pending: PendingStageDispatch) -> str:
         metadata = self._active_requests.get(pending.logical_request_id, pending.metadata)
@@ -2039,6 +2179,7 @@ class RuntimeQueueController:
         pending: PendingStageDispatch,
         *,
         block_state: _QueueBlockState,
+        enforce_soft_reservations: bool = True,
     ) -> tuple[str, ...]:
         reasons: list[str] = []
         mm_cache_head_sequence = block_state.mm_cache_head_sequence_by_stage.get(pending.stage_id)
@@ -2077,10 +2218,23 @@ class RuntimeQueueController:
                         reasons.append("stage")
                 request_class = self._request_class(pending)
                 stage_class_limit = self.config.stage_class_wip_limits.get(pending.stage_id, {}).get(request_class)
-                if stage_class_limit is not None:
-                    active = block_state.active_stage_class_counts.get((pending.stage_id, request_class), 0)
-                    if active >= stage_class_limit:
+                active = block_state.active_stage_class_counts.get((pending.stage_id, request_class), 0)
+                mode = self._stage_class_wip_mode(pending.stage_id)
+                if mode == "hard_limit":
+                    if stage_class_limit is not None and active >= stage_class_limit:
                         reasons.append("stage_class")
+                elif (
+                    enforce_soft_reservations
+                    and active >= (stage_class_limit or 0)
+                    and any(
+                        reserved_class != request_class
+                        for reserved_class in block_state.soft_reservation_demand_by_stage.get(
+                            pending.stage_id,
+                            (),
+                        )
+                    )
+                ):
+                    reasons.append("stage_class_reservation")
 
         if pending.logical_request_id not in self._active_requests:
             if not pending.starts_request:
@@ -2133,7 +2287,9 @@ class RuntimeQueueController:
             request_class_counts=request_class_counts,
             mm_cache_head_sequence_by_stage=mm_cache_head_sequences,
             mm_cache_progress_cutoff_by_stage=mm_cache_progress_cutoffs,
+            soft_reservation_demand_by_stage={},
         )
+        block_state = self._with_soft_reservation_demand(block_state)
         ordered_indices = sorted(range(len(self._pending)), key=lambda index: self._order_key(self._pending[index]))
         selected_index = next(
             (
@@ -2147,8 +2303,13 @@ class RuntimeQueueController:
             None,
         )
         if selected_index is None:
+            self._record_soft_reservation_global_cap_block(block_state)
             return None
 
+        self._record_soft_reservation_dispatch(
+            self._pending[selected_index],
+            block_state=block_state,
+        )
         pending = self._pending.pop(selected_index)
         return self._acquire(pending)
 
@@ -2389,7 +2550,9 @@ class RuntimeQueueController:
             request_class_counts=class_counts,
             mm_cache_head_sequence_by_stage=mm_cache_head_sequences,
             mm_cache_progress_cutoff_by_stage=mm_cache_progress_cutoffs,
+            soft_reservation_demand_by_stage={},
         )
+        block_state = self._with_soft_reservation_demand(block_state)
         blocked = Counter(
             reason
             for pending in self._pending
@@ -2449,6 +2612,30 @@ class RuntimeQueueController:
             for stage_id in sorted({stage_id for stage_id, _ in stage_class_keys})
         }
 
+        soft_reservation_state = {
+            str(stage_id): {
+                "stage_wip_limit": self.config.stage_wip_limits[stage_id],
+                "reservations": dict(sorted(self.config.stage_class_wip_limits[stage_id].items())),
+                "active_total": stage_counts[stage_id],
+                "active_by_class": {
+                    request_class: stage_class_counts[stage_id, request_class]
+                    for request_class in sorted(self.config.stage_class_wip_limits[stage_id])
+                },
+                "demand_classes": sorted(block_state.soft_reservation_demand_by_stage.get(stage_id, ())),
+                "reservation_priority_dispatch_total": self._soft_reservation_reserved_dispatch_total[stage_id],
+                "borrowed_dispatch_total": self._soft_reservation_borrowed_dispatch_total[stage_id],
+                "global_cap_block_events_total": self._soft_reservation_global_cap_blocked_total[stage_id],
+                "global_cap_blocked_pending": sum(
+                    pending.stage_id == stage_id
+                    and (pending.request_id, stage_id) not in self._active_stages
+                    and stage_counts[stage_id] >= self.config.stage_wip_limits[stage_id]
+                    for pending in self._pending
+                ),
+            }
+            for stage_id, mode in sorted(self.config.stage_class_wip_modes.items())
+            if mode == "soft_reservation"
+        }
+
         return {
             "enabled": self.enabled,
             "policy": self.config.policy,
@@ -2460,6 +2647,10 @@ class RuntimeQueueController:
                 str(stage_id): dict(sorted(class_limits.items()))
                 for stage_id, class_limits in sorted(self.config.stage_class_wip_limits.items())
             },
+            "stage_class_wip_modes": {
+                str(stage_id): mode for stage_id, mode in sorted(self.config.stage_class_wip_modes.items())
+            },
+            "soft_reservation_state": soft_reservation_state,
             "path_wip_limits": dict(sorted(self.config.path_wip_limits.items())),
             "class_wip_limits": dict(sorted(self.config.class_wip_limits.items())),
             "stage_backpressure": (
