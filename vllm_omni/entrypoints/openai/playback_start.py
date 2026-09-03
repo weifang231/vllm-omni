@@ -27,6 +27,7 @@ from vllm_omni.engine.queue_control import (
 )
 
 PLAYBACK_BUFFER_MS_HEADER = "x-vllm-omni-playback-buffer-ms"
+PLAYBACK_DEADLINE_GUARD_MS_HEADER = "x-vllm-omni-playback-deadline-guard-ms"
 
 # A trusted proxy can select the target, but a typo must not make the adapter
 # retain an arbitrarily long response.  At 24 kHz mono PCM16 this limit is
@@ -58,6 +59,7 @@ class PlaybackStartConfig:
 
     target_ms: float
     deadline_monotonic_s: float | None = None
+    deadline_guard_ms: float = 0.0
 
 
 def playback_start_config_from_headers(
@@ -84,15 +86,29 @@ def playback_start_config_from_headers(
         maximum=MAX_PLAYBACK_BUFFER_MS,
     )
     deadline_monotonic_s = None
+    deadline_guard_ms = 0.0
     if FIRST_OUTPUT_DEADLINE_MS_HEADER in normalized:
         deadline_ms = _nonnegative_header_ms(
             normalized[FIRST_OUTPUT_DEADLINE_MS_HEADER],
             field_name=FIRST_OUTPUT_DEADLINE_MS_HEADER,
         )
         deadline_monotonic_s = request_start_s + deadline_ms / 1000.0
+    raw_guard = normalized.get(PLAYBACK_DEADLINE_GUARD_MS_HEADER)
+    if raw_guard is not None:
+        if deadline_monotonic_s is None:
+            raise ValueError(
+                f"{PLAYBACK_DEADLINE_GUARD_MS_HEADER} requires "
+                f"{FIRST_OUTPUT_DEADLINE_MS_HEADER}"
+            )
+        deadline_guard_ms = _nonnegative_header_ms(
+            raw_guard,
+            field_name=PLAYBACK_DEADLINE_GUARD_MS_HEADER,
+            maximum=MAX_PLAYBACK_BUFFER_MS,
+        )
     return PlaybackStartConfig(
         target_ms=target_ms,
         deadline_monotonic_s=deadline_monotonic_s,
+        deadline_guard_ms=deadline_guard_ms,
     )
 
 
@@ -105,6 +121,7 @@ class PlaybackStartBuffer:
     _pending: list[Any] = field(default_factory=list)
     _buffered_audio_ms: float = 0.0
     _first_audio_ready_s: float | None = None
+    _first_audio_deadline_slack_ms: float | None = None
     _released_s: float | None = None
     _release_reason: PlaybackReleaseReason | None = None
     _telemetry_recorded: bool = False
@@ -115,7 +132,9 @@ class PlaybackStartBuffer:
 
     @property
     def deadline_monotonic_s(self) -> float | None:
-        return self.config.deadline_monotonic_s
+        if self.config.deadline_monotonic_s is None:
+            return None
+        return self.config.deadline_monotonic_s - self.config.deadline_guard_ms / 1000.0
 
     def seconds_until_deadline(self, *, now: float | None = None) -> float | None:
         if self.released or self.deadline_monotonic_s is None:
@@ -151,6 +170,10 @@ class PlaybackStartBuffer:
             return (*prefix_items, delivery_item)
         if pcm_byte_count > 0 and self._first_audio_ready_s is None:
             self._first_audio_ready_s = current
+            if self.config.deadline_monotonic_s is not None:
+                self._first_audio_deadline_slack_ms = (
+                    self.config.deadline_monotonic_s - current
+                ) * 1000.0
         self._pending.extend(prefix_items)
         self._pending.append(delivery_item)
         frames = pcm_byte_count // frame_width
@@ -201,6 +224,12 @@ class PlaybackStartBuffer:
             "hold_ms": round(hold_ms, 3),
             "release_reason": self._release_reason or "none",
             "deadline_fallback": self._release_reason == "deadline",
+            "deadline_guard_ms": round(self.config.deadline_guard_ms, 3),
+            "first_audio_deadline_slack_ms": (
+                None
+                if self._first_audio_deadline_slack_ms is None
+                else round(self._first_audio_deadline_slack_ms, 3)
+            ),
         }
 
     def record_telemetry(
@@ -219,7 +248,9 @@ class PlaybackStartBuffer:
             request_state.playback_start_telemetry = telemetry
         logger.info(
             "[PlaybackStart] request_id=%s status=%s target_ms=%.3f "
-            "buffered_audio_ms=%.3f hold_ms=%.3f release_reason=%s deadline_fallback=%s",
+            "buffered_audio_ms=%.3f hold_ms=%.3f release_reason=%s "
+            "deadline_fallback=%s deadline_guard_ms=%.3f "
+            "first_audio_deadline_slack_ms=%s",
             request_id,
             telemetry["status"],
             telemetry["target_ms"],
@@ -227,6 +258,8 @@ class PlaybackStartBuffer:
             telemetry["hold_ms"],
             telemetry["release_reason"],
             telemetry["deadline_fallback"],
+            telemetry["deadline_guard_ms"],
+            telemetry["first_audio_deadline_slack_ms"],
         )
         return telemetry
 
