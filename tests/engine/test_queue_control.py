@@ -1327,6 +1327,13 @@ def test_soft_stage_class_reservation_borrows_idle_share_up_to_stage_cap() -> No
         "borrowed_dispatch_total": 1,
         "contended_borrowed_dispatch_total": 0,
         "cache_order_head_exempt_dispatch_total": 0,
+        "cache_order_head_exempt_inflight": 0,
+        "cache_order_head_exempt_inflight_by_class": {"speech": 0, "text": 0},
+        "cache_order_head_exempt_inflight_high_watermark": 0,
+        "cache_order_head_exempt_limit": 1,
+        "cache_order_head_exempt_blocked_total": 0,
+        "cache_order_head_exempt_blocked_pending": 0,
+        "unprotected_reservation_violation_dispatch_total": 0,
         "global_cap_block_events_total": 1,
         "global_cap_blocked_pending": 1,
     }
@@ -1444,19 +1451,126 @@ def test_soft_stage_class_reservation_blocks_arbitrary_borrower_behind_cache_hea
         "text": 1,
     }
     assert snapshot["soft_reservation_state"]["0"]["borrowed_dispatch_total"] == 1
-    assert (
-        snapshot["soft_reservation_state"]["0"][
-            "contended_borrowed_dispatch_total"
-        ]
-        == 1
-    )
-    assert (
-        snapshot["soft_reservation_state"]["0"][
-            "cache_order_head_exempt_dispatch_total"
-        ]
-        == 1
-    )
+    assert snapshot["soft_reservation_state"]["0"]["contended_borrowed_dispatch_total"] == 1
+    assert snapshot["soft_reservation_state"]["0"]["cache_order_head_exempt_dispatch_total"] == 1
     assert snapshot["queued_by_stage_class"] == {"0": {"speech": 1}}
+
+
+def test_soft_stage_class_reservation_bounds_active_cache_head_exemptions() -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_soft_stage0_config(stage_limit=3, policy="edf"),
+    )
+    controller.enqueue(_pending("speech-base", request_class="speech"))
+    assert controller.pop_ready().pending.request_id == "speech-base"  # type: ignore[union-attr]
+
+    controller.enqueue(
+        _pending(
+            "cache-head-a",
+            deadline=1.0,
+            request_class="speech",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(
+        _pending(
+            "cache-head-b",
+            deadline=2.0,
+            request_class="speech",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(_pending("text-reserved", deadline=10.0, request_class="text"))
+
+    assert controller.pop_ready().pending.request_id == "cache-head-a"  # type: ignore[union-attr]
+    snapshot = controller.snapshot()
+    soft_state = snapshot["soft_reservation_state"]["0"]
+    assert soft_state["cache_order_head_exempt_inflight"] == 1
+    assert soft_state["cache_order_head_exempt_inflight_by_class"] == {
+        "speech": 1,
+        "text": 0,
+    }
+    assert soft_state["cache_order_head_exempt_inflight_high_watermark"] == 1
+    assert soft_state["cache_order_head_exempt_limit"] == 1
+    assert soft_state["cache_order_head_exempt_blocked_total"] == 0
+    assert soft_state["cache_order_head_exempt_blocked_pending"] == 1
+    assert soft_state["cache_order_head_exempt_dispatch_total"] == 1
+    assert soft_state["unprotected_reservation_violation_dispatch_total"] == 0
+    assert snapshot["blocked_by_limit"] == {"stage_class_reservation": 1}
+
+    # The next cache head cannot chain another exception while the first
+    # lease is active. The reserved class can use the free stage slot.
+    assert controller.pop_ready().pending.request_id == "text-reserved"  # type: ignore[union-attr]
+    soft_state = controller.snapshot()["soft_reservation_state"]["0"]
+    assert soft_state["cache_order_head_exempt_blocked_total"] == 1
+    assert soft_state["unprotected_reservation_violation_dispatch_total"] == 0
+    assert controller.release_stage("text-reserved", 0)
+    controller.enqueue(_pending("text-waiting", deadline=10.0, request_class="text"))
+    assert controller.snapshot()["soft_reservation_state"]["0"]["cache_order_head_exempt_inflight"] == 1
+
+    # Completion retires the exception. The next cache head can then make
+    # ordered progress and becomes the sole active exception for the stage.
+    assert controller.release_stage("cache-head-a", 0)
+    assert controller.pop_ready().pending.request_id == "cache-head-b"  # type: ignore[union-attr]
+    soft_state = controller.snapshot()["soft_reservation_state"]["0"]
+    assert soft_state["cache_order_head_exempt_inflight"] == 1
+    assert soft_state["cache_order_head_exempt_inflight"] <= soft_state["cache_order_head_exempt_limit"]
+    assert soft_state["cache_order_head_exempt_dispatch_total"] == 2
+    assert soft_state["cache_order_head_exempt_inflight_high_watermark"] == 1
+    assert soft_state["unprotected_reservation_violation_dispatch_total"] == 0
+
+
+@pytest.mark.parametrize("retirement", ["rollback", "dispatch_failure", "cancel"])
+def test_soft_stage_class_reservation_cleans_up_cache_head_exemption(
+    retirement: str,
+) -> None:
+    controller = RuntimeQueueController(
+        num_stages=1,
+        config=_soft_stage0_config(stage_limit=3, policy="edf"),
+    )
+    controller.enqueue(_pending("speech-base", request_class="speech"))
+    assert controller.pop_ready().pending.request_id == "speech-base"  # type: ignore[union-attr]
+    controller.enqueue(
+        _pending(
+            "cache-head-a",
+            deadline=1.0,
+            request_class="speech",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(
+        _pending(
+            "cache-head-b",
+            deadline=2.0,
+            request_class="speech",
+            preserve_stage0_mm_cache_order=True,
+        )
+    )
+    controller.enqueue(_pending("text-reserved", deadline=10.0, request_class="text"))
+    acquired = controller.pop_ready()
+    assert acquired is not None
+    assert acquired.pending.request_id == "cache-head-a"
+    assert controller.snapshot()["soft_reservation_state"]["0"]["cache_order_head_exempt_inflight"] == 1
+
+    if retirement == "rollback":
+        controller.rollback(acquired)
+    elif retirement == "dispatch_failure":
+        assert controller.fail_stage_dispatch("cache-head-a", 0)
+    else:
+        controller.cancel_request("cache-head-a")
+
+    soft_state = controller.snapshot()["soft_reservation_state"]["0"]
+    assert soft_state["cache_order_head_exempt_inflight"] == 0
+    assert soft_state["cache_order_head_exempt_inflight_by_class"] == {
+        "speech": 0,
+        "text": 0,
+    }
+    assert controller.pop_ready().pending.request_id == "cache-head-b"  # type: ignore[union-attr]
+    soft_state = controller.snapshot()["soft_reservation_state"]["0"]
+    assert soft_state["cache_order_head_exempt_inflight"] == 1
+    assert soft_state["cache_order_head_exempt_inflight"] <= soft_state["cache_order_head_exempt_limit"]
+    assert soft_state["cache_order_head_exempt_inflight_high_watermark"] == 1
+    assert soft_state["unprotected_reservation_violation_dispatch_total"] == 0
 
 
 def test_soft_stage_class_reservation_does_not_promote_multiply_blocked_cache_demand() -> None:

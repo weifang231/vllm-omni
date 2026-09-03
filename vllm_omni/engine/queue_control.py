@@ -39,6 +39,7 @@ RECENT_STAGE_CANCELLATION_HISTORY_LIMIT = 8192
 ADMISSION_SCORE_REFERENCE_TOLERANCE = 1e-12
 ADMISSION_THRESHOLD_TABLE_SCHEMA_VERSION = 1
 DEFAULT_ADMISSION_MAX_REQUIRED_RETURNS = 2048
+SOFT_RESERVATION_CACHE_HEAD_EXEMPT_LIMIT = 1
 
 REQUEST_CLASS_HEADER = "x-vllm-omni-request-class"
 REQUEST_PATH_HEADER = "x-vllm-omni-request-path"
@@ -1475,6 +1476,7 @@ class _ActiveStageTelemetry:
     enqueued_monotonic_s: float
     acquired_monotonic_s: float
     queue_wait_s: float
+    soft_reservation_cache_head_exempt: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1495,6 +1497,7 @@ class _QueueBlockState:
     mm_cache_head_sequence_by_stage: Mapping[int, int]
     mm_cache_progress_cutoff_by_stage: Mapping[int, int]
     soft_reservation_demand_by_stage: Mapping[int, frozenset[str]]
+    soft_reservation_cache_head_exempt_inflight_by_stage: Mapping[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1595,6 +1598,9 @@ class RuntimeQueueController:
         self._soft_reservation_borrowed_dispatch_total: Counter[int] = Counter()
         self._soft_reservation_contended_borrowed_dispatch_total: Counter[int] = Counter()
         self._soft_reservation_cache_head_exempt_dispatch_total: Counter[int] = Counter()
+        self._soft_reservation_cache_head_exempt_inflight_high_watermark: Counter[int] = Counter()
+        self._soft_reservation_cache_head_exempt_blocked_total: Counter[int] = Counter()
+        self._soft_reservation_unprotected_violation_dispatch_total: Counter[int] = Counter()
         self._soft_reservation_global_cap_blocked_total: Counter[int] = Counter()
 
     @property
@@ -1742,6 +1748,18 @@ class RuntimeQueueController:
             for (_, active_stage_id), active_class in self._active_stage_classes.items()
         )
 
+    def _soft_reservation_cache_head_exempt_inflight(
+        self,
+    ) -> tuple[Counter[int], Counter[tuple[int, str]]]:
+        by_stage: Counter[int] = Counter()
+        by_stage_class: Counter[tuple[int, str]] = Counter()
+        for (_, stage_id), lease in self._active_stage_telemetry.items():
+            if not lease.soft_reservation_cache_head_exempt:
+                continue
+            by_stage[stage_id] += 1
+            by_stage_class[stage_id, lease.request_class] += 1
+        return by_stage, by_stage_class
+
     def _stage_class_wip_mode(self, stage_id: int) -> StageClassWipMode:
         return self.config.stage_class_wip_modes.get(stage_id, "hard_limit")
 
@@ -1749,9 +1767,9 @@ class RuntimeQueueController:
         """Record ready or cache-fenced demand for underfilled classes.
 
         A request blocked only by the stage cap, multimodal cache order, or
-        both is latent demand. The cache head remains exempt from reservation
-        blocking, so this protects the reserved share without stopping ordered
-        progress.
+        both is latent demand. One cache head per stage may remain exempt from
+        reservation blocking. This protects the reserved share without
+        stopping ordered progress.
         """
         demand_by_stage: dict[int, set[str]] = {}
         if not self.enabled or not self.config.stage_class_wip_modes:
@@ -1772,10 +1790,7 @@ class RuntimeQueueController:
                 block_state=block_state,
                 enforce_soft_reservations=False,
             )
-            if any(
-                reason not in {"mm_cache_order", "stage"}
-                for reason in blocked_reasons
-            ):
+            if any(reason not in {"mm_cache_order", "stage"} for reason in blocked_reasons):
                 continue
             demand_by_stage.setdefault(stage_id, set()).add(request_class)
         return replace(
@@ -1790,12 +1805,14 @@ class RuntimeQueueController:
         pending: PendingStageDispatch,
         *,
         block_state: _QueueBlockState,
-    ) -> None:
+    ) -> bool:
+        """Record one dispatch and return whether its lease is cache-head exempt."""
+
         stage_id = pending.stage_id
         if self._stage_class_wip_mode(stage_id) != "soft_reservation":
-            return
+            return False
         if (pending.request_id, stage_id) in self._active_stages:
-            return
+            return False
         request_class = self._request_class(pending)
         reservation = self.config.stage_class_wip_limits[stage_id].get(request_class, 0)
         active = block_state.active_stage_class_counts.get((stage_id, request_class), 0)
@@ -1803,26 +1820,27 @@ class RuntimeQueueController:
             self._soft_reservation_borrowed_dispatch_total[stage_id] += 1
             contended = any(
                 reserved_class != request_class
-                for reserved_class in block_state.soft_reservation_demand_by_stage.get(
-                    stage_id, ()
-                )
+                for reserved_class in block_state.soft_reservation_demand_by_stage.get(stage_id, ())
             )
             if contended:
                 self._soft_reservation_contended_borrowed_dispatch_total[stage_id] += 1
-                mm_cache_head_sequence = (
-                    block_state.mm_cache_head_sequence_by_stage.get(stage_id)
-                )
+                mm_cache_head_sequence = block_state.mm_cache_head_sequence_by_stage.get(stage_id)
                 if (
                     pending.preserve_stage0_mm_cache_order
                     and mm_cache_head_sequence is not None
                     and pending.sequence == mm_cache_head_sequence
+                    and block_state.soft_reservation_cache_head_exempt_inflight_by_stage.get(
+                        stage_id,
+                        0,
+                    )
+                    < SOFT_RESERVATION_CACHE_HEAD_EXEMPT_LIMIT
                 ):
-                    self._soft_reservation_cache_head_exempt_dispatch_total[
-                        stage_id
-                    ] += 1
-            return
+                    self._soft_reservation_cache_head_exempt_dispatch_total[stage_id] += 1
+                    return True
+                self._soft_reservation_unprotected_violation_dispatch_total[stage_id] += 1
+            return False
         if request_class not in block_state.soft_reservation_demand_by_stage.get(stage_id, ()):
-            return
+            return False
         for candidate in self._pending:
             if candidate is pending or candidate.stage_id != stage_id:
                 continue
@@ -1831,7 +1849,75 @@ class RuntimeQueueController:
                 block_state=block_state,
             ) == ("stage_class_reservation",):
                 self._soft_reservation_reserved_dispatch_total[stage_id] += 1
-                return
+                return False
+        return False
+
+    def _soft_reservation_cache_head_exemption_blocks(
+        self,
+        pending: PendingStageDispatch,
+        *,
+        block_state: _QueueBlockState,
+    ) -> bool:
+        """Return whether the active-exemption limit alone blocks this head."""
+
+        stage_id = pending.stage_id
+        if not self.enabled or self._stage_class_wip_mode(stage_id) != "soft_reservation":
+            return False
+        if (pending.request_id, stage_id) in self._active_stages:
+            return False
+        mm_cache_head_sequence = block_state.mm_cache_head_sequence_by_stage.get(stage_id)
+        if (
+            not pending.preserve_stage0_mm_cache_order
+            or mm_cache_head_sequence is None
+            or pending.sequence != mm_cache_head_sequence
+        ):
+            return False
+        if (
+            block_state.soft_reservation_cache_head_exempt_inflight_by_stage.get(
+                stage_id,
+                0,
+            )
+            < SOFT_RESERVATION_CACHE_HEAD_EXEMPT_LIMIT
+        ):
+            return False
+        request_class = self._request_class(pending)
+        reservation = self.config.stage_class_wip_limits[stage_id].get(request_class, 0)
+        active = block_state.active_stage_class_counts.get((stage_id, request_class), 0)
+        if active < reservation:
+            return False
+        if not any(
+            reserved_class != request_class
+            for reserved_class in block_state.soft_reservation_demand_by_stage.get(
+                stage_id,
+                (),
+            )
+        ):
+            return False
+        return not self._blocked_reasons(
+            pending,
+            block_state=block_state,
+            enforce_soft_reservations=False,
+        )
+
+    def _record_soft_reservation_cache_head_exemption_blocks(
+        self,
+        block_state: _QueueBlockState,
+    ) -> None:
+        if (
+            not self.enabled
+            or not block_state.soft_reservation_cache_head_exempt_inflight_by_stage
+            or not any(mode == "soft_reservation" for mode in self.config.stage_class_wip_modes.values())
+        ):
+            return
+        blocked_stages = {
+            pending.stage_id
+            for pending in self._pending
+            if self._soft_reservation_cache_head_exemption_blocks(
+                pending,
+                block_state=block_state,
+            )
+        }
+        self._soft_reservation_cache_head_exempt_blocked_total.update(blocked_stages)
 
     def _record_soft_reservation_global_cap_block(self, block_state: _QueueBlockState) -> None:
         if not self.enabled or not self.config.stage_class_wip_modes:
@@ -2257,7 +2343,6 @@ class RuntimeQueueController:
                         reasons.append("stage_class")
                 elif (
                     enforce_soft_reservations
-                    and not is_mm_cache_order_head
                     and active >= (stage_class_limit or 0)
                     and any(
                         reserved_class != request_class
@@ -2265,6 +2350,14 @@ class RuntimeQueueController:
                             pending.stage_id,
                             (),
                         )
+                    )
+                    and (
+                        not is_mm_cache_order_head
+                        or block_state.soft_reservation_cache_head_exempt_inflight_by_stage.get(
+                            pending.stage_id,
+                            0,
+                        )
+                        >= SOFT_RESERVATION_CACHE_HEAD_EXEMPT_LIMIT
                     )
                 ):
                     reasons.append("stage_class_reservation")
@@ -2312,6 +2405,10 @@ class RuntimeQueueController:
         if self.enabled and (self.config.path_wip_limits or self.config.class_wip_limits):
             request_path_counts, request_class_counts = self._request_counts()
         mm_cache_head_sequences, mm_cache_progress_cutoffs = self._mm_cache_order_state()
+        (
+            soft_reservation_cache_head_exempt_inflight,
+            _,
+        ) = self._soft_reservation_cache_head_exempt_inflight()
         block_state = _QueueBlockState(
             stage_backpressure=stage_backpressure_state,
             active_stage_counts=active_stage_counts,
@@ -2321,8 +2418,10 @@ class RuntimeQueueController:
             mm_cache_head_sequence_by_stage=mm_cache_head_sequences,
             mm_cache_progress_cutoff_by_stage=mm_cache_progress_cutoffs,
             soft_reservation_demand_by_stage={},
+            soft_reservation_cache_head_exempt_inflight_by_stage=(soft_reservation_cache_head_exempt_inflight),
         )
         block_state = self._with_soft_reservation_demand(block_state)
+        self._record_soft_reservation_cache_head_exemption_blocks(block_state)
         ordered_indices = sorted(range(len(self._pending)), key=lambda index: self._order_key(self._pending[index]))
         selected_index = next(
             (
@@ -2339,12 +2438,15 @@ class RuntimeQueueController:
             self._record_soft_reservation_global_cap_block(block_state)
             return None
 
-        self._record_soft_reservation_dispatch(
+        soft_reservation_cache_head_exempt = self._record_soft_reservation_dispatch(
             self._pending[selected_index],
             block_state=block_state,
         )
         pending = self._pending.pop(selected_index)
-        return self._acquire(pending)
+        return self._acquire(
+            pending,
+            soft_reservation_cache_head_exempt=(soft_reservation_cache_head_exempt),
+        )
 
     def acquire_immediate(self, pending: PendingStageDispatch) -> AcquiredStageDispatch:
         """Record an unqueued dispatch while preserving lease telemetry."""
@@ -2355,11 +2457,22 @@ class RuntimeQueueController:
             self._admitted_arrivals_by_class_total[pending.metadata.request_class] += 1
         return self._acquire(pending)
 
-    def _acquire(self, pending: PendingStageDispatch) -> AcquiredStageDispatch:
+    def _acquire(
+        self,
+        pending: PendingStageDispatch,
+        *,
+        soft_reservation_cache_head_exempt: bool = False,
+    ) -> AcquiredStageDispatch:
         now = self._clock()
         acquired_request = pending.logical_request_id not in self._active_requests
         acquired_stage = (pending.request_id, pending.stage_id) not in self._active_stages
         pending.acquired_stage_for_dispatch = acquired_stage
+        exempt_inflight_after_acquire = 0
+        if acquired_stage and soft_reservation_cache_head_exempt:
+            exempt_inflight, _ = self._soft_reservation_cache_head_exempt_inflight()
+            if exempt_inflight[pending.stage_id] >= SOFT_RESERVATION_CACHE_HEAD_EXEMPT_LIMIT:
+                raise RuntimeError(f"soft-reservation cache-head exemption limit exceeded for stage {pending.stage_id}")
+            exempt_inflight_after_acquire = exempt_inflight[pending.stage_id] + 1
         if acquired_request:
             self._active_requests[pending.logical_request_id] = pending.metadata
         self._request_to_logical[pending.request_id] = pending.logical_request_id
@@ -2375,7 +2488,13 @@ class RuntimeQueueController:
                 enqueued_monotonic_s=pending.enqueued_monotonic_s,
                 acquired_monotonic_s=now,
                 queue_wait_s=max(now - pending.enqueued_monotonic_s, 0.0),
+                soft_reservation_cache_head_exempt=(soft_reservation_cache_head_exempt),
             )
+            if soft_reservation_cache_head_exempt:
+                self._soft_reservation_cache_head_exempt_inflight_high_watermark[pending.stage_id] = max(
+                    self._soft_reservation_cache_head_exempt_inflight_high_watermark[pending.stage_id],
+                    exempt_inflight_after_acquire,
+                )
 
         queue_wait_s = max(now - pending.enqueued_monotonic_s, 0.0)
         self._dispatch_attempts_total += 1
@@ -2575,6 +2694,10 @@ class RuntimeQueueController:
         )
         stage_backpressure_state = self._stage_backpressure_state(unfinished_logical_ids_by_stage_class)
         mm_cache_head_sequences, mm_cache_progress_cutoffs = self._mm_cache_order_state()
+        (
+            soft_reservation_cache_head_exempt_inflight,
+            soft_reservation_cache_head_exempt_inflight_by_class,
+        ) = self._soft_reservation_cache_head_exempt_inflight()
         block_state = _QueueBlockState(
             stage_backpressure=stage_backpressure_state,
             active_stage_counts=stage_counts,
@@ -2584,6 +2707,7 @@ class RuntimeQueueController:
             mm_cache_head_sequence_by_stage=mm_cache_head_sequences,
             mm_cache_progress_cutoff_by_stage=mm_cache_progress_cutoffs,
             soft_reservation_demand_by_stage={},
+            soft_reservation_cache_head_exempt_inflight_by_stage=(soft_reservation_cache_head_exempt_inflight),
         )
         block_state = self._with_soft_reservation_demand(block_state)
         blocked = Counter(
@@ -2662,6 +2786,40 @@ class RuntimeQueueController:
                 ),
                 "cache_order_head_exempt_dispatch_total": (
                     self._soft_reservation_cache_head_exempt_dispatch_total[stage_id]
+                ),
+                "cache_order_head_exempt_inflight": (soft_reservation_cache_head_exempt_inflight[stage_id]),
+                "cache_order_head_exempt_inflight_by_class": {
+                    request_class: soft_reservation_cache_head_exempt_inflight_by_class[
+                        stage_id,
+                        request_class,
+                    ]
+                    for request_class in sorted(
+                        set(self.config.stage_class_wip_limits[stage_id])
+                        | {
+                            request_class
+                            for candidate_stage_id, request_class in (
+                                soft_reservation_cache_head_exempt_inflight_by_class
+                            )
+                            if candidate_stage_id == stage_id
+                        }
+                    )
+                },
+                "cache_order_head_exempt_inflight_high_watermark": (
+                    self._soft_reservation_cache_head_exempt_inflight_high_watermark[stage_id]
+                ),
+                "cache_order_head_exempt_limit": (SOFT_RESERVATION_CACHE_HEAD_EXEMPT_LIMIT),
+                "cache_order_head_exempt_blocked_total": (
+                    self._soft_reservation_cache_head_exempt_blocked_total[stage_id]
+                ),
+                "cache_order_head_exempt_blocked_pending": sum(
+                    self._soft_reservation_cache_head_exemption_blocks(
+                        pending,
+                        block_state=block_state,
+                    )
+                    for pending in self._pending
+                ),
+                "unprotected_reservation_violation_dispatch_total": (
+                    self._soft_reservation_unprotected_violation_dispatch_total[stage_id]
                 ),
                 "global_cap_block_events_total": self._soft_reservation_global_cap_blocked_total[stage_id],
                 "global_cap_blocked_pending": sum(
