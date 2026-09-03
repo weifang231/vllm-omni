@@ -14,6 +14,7 @@ from vllm_omni.engine.queue_control import (
 from vllm_omni.entrypoints.openai.playback_start import (
     MAX_PLAYBACK_BUFFER_MS,
     PLAYBACK_DEADLINE_GUARD_MS_HEADER,
+    PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER,
     PLAYBACK_DEADLINE_EVENT,
     PlaybackStartBuffer,
     PlaybackStartConfig,
@@ -36,6 +37,7 @@ def test_playback_headers_require_explicit_trust(monkeypatch: pytest.MonkeyPatch
         target_ms=300.0,
         deadline_monotonic_s=10.75,
         deadline_guard_ms=0.0,
+        deadline_guard_min_buffer_ms=None,
     )
 
 
@@ -54,6 +56,7 @@ def test_playback_deadline_guard_uses_live_runtime_slack(
     assert config is not None
     assert config.deadline_monotonic_s == 11.0
     assert config.deadline_guard_ms == 20.0
+    assert config.deadline_guard_min_buffer_ms is None
 
     now = [10.7]
     buffer = PlaybackStartBuffer(config, clock=lambda: now[0])
@@ -69,7 +72,79 @@ def test_playback_deadline_guard_uses_live_runtime_slack(
     assert buffer.release_deadline() == ("first",)
     telemetry = buffer.telemetry(status="ok")
     assert telemetry["deadline_guard_ms"] == 20.0
+    assert telemetry["deadline_guard_min_buffer_ms"] is None
+    assert telemetry["deadline_guard_evaluated"] is False
+    assert telemetry["deadline_guard_deferred"] is False
+    assert telemetry["deadline_guard_released"] is False
     assert telemetry["first_audio_deadline_slack_ms"] == pytest.approx(300.0)
+
+
+def test_selective_deadline_guard_defers_until_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_TRUST_SCHEDULING_HEADERS", "1")
+    config = playback_start_config_from_headers(
+        {
+            "x-vllm-omni-playback-buffer-ms": "321",
+            "x-vllm-omni-first-output-deadline-ms": "1000",
+            PLAYBACK_DEADLINE_GUARD_MS_HEADER: "20",
+            PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER: "120",
+        },
+        request_start_s=10.0,
+    )
+    assert config == PlaybackStartConfig(
+        target_ms=321.0,
+        deadline_monotonic_s=11.0,
+        deadline_guard_ms=20.0,
+        deadline_guard_min_buffer_ms=120.0,
+    )
+
+    now = [10.98]
+    buffer = PlaybackStartBuffer(config, clock=lambda: now[0])
+    assert buffer.deadline_due()
+    assert buffer.release_deadline() == ()
+    assert not buffer.released
+    assert buffer.seconds_until_deadline() == pytest.approx(0.02)
+    assert buffer.add_pcm(
+        "first",
+        pcm_byte_count=4_800,
+        sample_rate=24_000,
+        num_channels=1,
+    ) == ()
+    now[0] = 11.0
+    assert buffer.deadline_due()
+    assert buffer.release_deadline() == ("first",)
+    telemetry = buffer.telemetry(status="ok")
+    assert telemetry["release_reason"] == "deadline"
+    assert telemetry["deadline_guard_evaluated"] is True
+    assert telemetry["deadline_guard_deferred"] is True
+    assert telemetry["deadline_guard_released"] is False
+
+
+def test_selective_deadline_guard_releases_sufficient_buffer() -> None:
+    now = [10.9]
+    buffer = PlaybackStartBuffer(
+        PlaybackStartConfig(
+            target_ms=321.0,
+            deadline_monotonic_s=11.0,
+            deadline_guard_ms=20.0,
+            deadline_guard_min_buffer_ms=120.0,
+        ),
+        clock=lambda: now[0],
+    )
+    assert buffer.add_pcm(
+        "first",
+        pcm_byte_count=14_250,
+        sample_rate=24_000,
+        num_channels=1,
+    ) == ()
+    now[0] = 10.98
+    assert buffer.release_deadline() == ("first",)
+    telemetry = buffer.telemetry(status="ok")
+    assert telemetry["release_reason"] == "deadline_guard"
+    assert telemetry["deadline_guard_evaluated"] is True
+    assert telemetry["deadline_guard_deferred"] is False
+    assert telemetry["deadline_guard_released"] is True
 
 
 def test_playback_deadline_guard_requires_deadline() -> None:
@@ -78,6 +153,19 @@ def test_playback_deadline_guard_requires_deadline() -> None:
             {
                 "x-vllm-omni-playback-buffer-ms": "321",
                 PLAYBACK_DEADLINE_GUARD_MS_HEADER: "20",
+            },
+            request_start_s=0.0,
+            trusted=True,
+        )
+
+
+def test_playback_deadline_min_buffer_requires_guard() -> None:
+    with pytest.raises(ValueError, match="requires"):
+        playback_start_config_from_headers(
+            {
+                "x-vllm-omni-playback-buffer-ms": "321",
+                "x-vllm-omni-first-output-deadline-ms": "1000",
+                PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER: "120",
             },
             request_start_s=0.0,
             trusted=True,
@@ -162,6 +250,10 @@ def test_buffer_counts_pcm_frames_across_sample_rates_exactly() -> None:
         "release_reason": "target",
         "deadline_fallback": False,
         "deadline_guard_ms": 0.0,
+        "deadline_guard_min_buffer_ms": None,
+        "deadline_guard_evaluated": False,
+        "deadline_guard_deferred": False,
+        "deadline_guard_released": False,
         "first_audio_deadline_slack_ms": None,
     }
 
