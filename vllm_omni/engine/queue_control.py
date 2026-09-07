@@ -1653,6 +1653,16 @@ class RuntimeQueueController:
         self._config_generation += 1
         return True
 
+    def compact_metrics_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Drop diagnostic histories that online controllers do not consume."""
+
+        snapshot.pop("recent_stage_completions", None)
+        snapshot.pop("recent_stage_cancellations", None)
+        admission = snapshot.get("admission")
+        if isinstance(admission, dict):
+            admission.pop("recent_decisions", None)
+        return snapshot
+
     def enqueue(self, pending: PendingStageDispatch) -> AdmissionDecision | None:
         if pending.stage_id < 0 or pending.stage_id >= self.num_stages:
             raise ValueError(f"stage_id {pending.stage_id} is outside [0, {self.num_stages})")

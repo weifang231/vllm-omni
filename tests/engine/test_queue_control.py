@@ -3528,6 +3528,35 @@ def test_recent_stage_completions_are_bounded_and_count_overwrites(
     ]
 
 
+def test_compact_metrics_snapshot_drops_only_diagnostic_histories() -> None:
+    controller = RuntimeQueueController(num_stages=1)
+    snapshot = {
+        "active_requests": 1,
+        "queued_requests": 2,
+        "stage_class_runtime": {"schema_version": 1, "stages": {}},
+        "online_allocator": {"revision": 3},
+        "recent_stage_completions": [{"request_id": "done"}],
+        "recent_stage_cancellations": [{"request_id": "cancelled"}],
+        "admission": {
+            "enabled": True,
+            "recent_decisions": [{"request_id": "admission"}],
+            "rejected_total": 4,
+        },
+    }
+
+    compact = controller.compact_metrics_snapshot(snapshot)
+
+    assert compact is snapshot
+    assert "recent_stage_completions" not in compact
+    assert "recent_stage_cancellations" not in compact
+    assert "recent_decisions" not in compact["admission"]
+    assert compact["active_requests"] == 1
+    assert compact["queued_requests"] == 2
+    assert compact["stage_class_runtime"] == {"schema_version": 1, "stages": {}}
+    assert compact["online_allocator"] == {"revision": 3}
+    assert compact["admission"]["rejected_total"] == 4
+
+
 def test_default_snapshot_completion_history_has_bounded_serialized_size(tmp_path) -> None:
     now = [0.0]
     controller = RuntimeQueueController(num_stages=1, clock=lambda: now[0])

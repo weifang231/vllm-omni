@@ -10,6 +10,7 @@ import vllm_omni.utils.runtime_instrumentation as runtime_instrumentation_module
 from vllm_omni.utils.runtime_instrumentation import (
     RUNTIME_CONTROL_FILE_ENV,
     RUNTIME_METRICS_DIR_ENV,
+    RUNTIME_METRICS_INTERVAL_ENV,
     RuntimeInstrumentation,
 )
 
@@ -80,6 +81,36 @@ def test_snapshot_payload_cannot_spoof_causal_envelope(monkeypatch, tmp_path) ->
     assert payload["runtime_id"] == instrumentation.runtime_id
     assert payload["snapshot_sequence"] == 1
     assert payload["monotonic_time_s"] >= 0
+
+
+def test_unchanged_snapshot_skips_write_until_heartbeat(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(RUNTIME_METRICS_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(RUNTIME_METRICS_INTERVAL_ENV, "0")
+    instrumentation = RuntimeInstrumentation(
+        engine="test",
+        component="queue",
+        stage_id="pipeline",
+        unchanged_snapshot_interval_s=999.0,
+    )
+
+    assert instrumentation.write_snapshot({"active_requests": 2}, force=True)
+    snapshot_path = instrumentation.snapshot_path
+    assert snapshot_path is not None
+    first_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+
+    assert instrumentation.write_snapshot({"active_requests": 2}, force=False) is False
+    second_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert second_payload == first_payload
+    assert instrumentation.snapshot_sequence == 1
+
+    assert instrumentation.write_snapshot({"active_requests": 3}, force=False)
+    third_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert third_payload["active_requests"] == 3
+    assert third_payload["snapshot_sequence"] == 2
+
+    assert instrumentation.write_snapshot({"active_requests": 3}, force=True)
+    force_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert force_payload["snapshot_sequence"] == 3
 
 
 def test_hot_snapshot_write_cost_stays_bounded(monkeypatch, tmp_path) -> None:
