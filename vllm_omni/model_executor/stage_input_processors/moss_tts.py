@@ -218,6 +218,11 @@ def talker2codec_delay_async_chunk(
         meta=MetaStruct(
             left_context_size=left_context,
             finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+            # The chunk transfer adapter consumes ``finished`` for its own
+            # bookkeeping and strips it from the Stage-1 runtime meta; the
+            # codec-visible terminal flag must travel as ``stream_finished``
+            # (same convention as the audex/cosyvoice3/qwen3_tts processors).
+            stream_finished=torch.tensor(bool(is_finished), dtype=torch.bool),
         ),
     )
 

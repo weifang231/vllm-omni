@@ -257,6 +257,9 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_max_step_frames: int = self._stream_chunk_frames or 100
         self._stream_req_slots: dict[str, int] = {}
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
+        # Per-request code buffers for the non-streaming fallback used when the
+        # codec checkpoint lacks a decoder state pool (v1 codecs).
+        self._stream_fallback_buffers: dict[str, list[torch.Tensor]] = {}
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
         self._streaming_graph_frame_sizes = sorted(
             {frames for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames) if frames > 0}
@@ -488,6 +491,17 @@ class MossTTSCodecDecoder(nn.Module):
             return torch.zeros((self._n_channels, 0), dtype=torch.float32)
         return torch.zeros((0,), dtype=torch.float32)
 
+    def _codec_supports_streaming(self) -> bool:
+        """Whether the loaded codec implements the incremental decoder state pool.
+
+        v1 MOSS Audio Tokenizer checkpoints do not implement
+        ``initialize_decoder_state_pool`` (only v2 does), so
+        ``_MossCodecStreamSession`` cannot be constructed for them.
+        """
+        return self._codec is not None and callable(
+            getattr(self._codec, "initialize_decoder_state_pool", None)
+        )
+
     def _ensure_stream_session(self) -> _MossCodecStreamSession | None:
         if self._codec is None:
             return None
@@ -503,10 +517,45 @@ class MossTTSCodecDecoder(nn.Module):
         )
         return self._stream_session
 
+    def _decode_streaming_fallback(
+        self,
+        items: list[tuple[int, str, torch.Tensor, bool]],
+    ) -> dict[int, torch.Tensor]:
+        """Full-sequence decode for codecs without a decoder state pool.
+
+        Buffers each request's codes and runs one non-streaming
+        ``batch_decode`` over the concatenated sequence when the request's
+        terminal payload arrives, matching ``async_chunk: false`` output
+        semantics (audio is emitted once, so TTFA ~= E2E for these requests).
+        """
+        outputs: dict[int, torch.Tensor] = {}
+        if self._codec is None:
+            return outputs
+        for output_index, request_id, codes_nq_t, finished in items:
+            buffered = self._stream_fallback_buffers.setdefault(request_id, [])
+            buffered.append(codes_nq_t)
+            if not finished:
+                continue
+            codes_full = buffered[0] if len(buffered) == 1 else torch.cat(buffered, dim=1)
+            self._stream_fallback_buffers.pop(request_id, None)
+            if self._cuda_graph_wrapper is not None:
+                out = self._cuda_graph_wrapper.decode(codes_full)
+            else:
+                out = self._codec.batch_decode(codes_list=[codes_full], num_quantizers=self._n_vq)
+            if out.audio is None:
+                continue
+            wav = out.audio[0].to(dtype=torch.float32).cpu()
+            if out.audio_lengths is not None:
+                wav = wav[..., : int(out.audio_lengths[0].item())]
+            outputs[output_index] = wav
+        return outputs
+
     def _decode_streaming_batch(
         self,
         items: list[tuple[int, str, torch.Tensor, bool]],
     ) -> dict[int, torch.Tensor]:
+        if not self._codec_supports_streaming():
+            return self._decode_streaming_fallback(items)
         session = self._ensure_stream_session()
         if session is None:
             return {}
@@ -616,6 +665,7 @@ class MossTTSCodecDecoder(nn.Module):
         session = self._stream_session
         for req_id in finished_req_ids:
             request_id = str(req_id)
+            self._stream_fallback_buffers.pop(request_id, None)
             slot = self._stream_req_slots.get(request_id)
             if slot is None:
                 continue
@@ -783,7 +833,20 @@ class MossTTSCodecDecoder(nn.Module):
         )
 
         self._configure_decoder_cudagraph(device)
-        if self._async_chunk and self._streaming_graph_batch_sizes and self._streaming_graph_frame_sizes:
+        if self._async_chunk and not self._codec_supports_streaming():
+            logger.warning(
+                "MOSS codec at %s does not implement initialize_decoder_state_pool "
+                "(v1 codec); async_chunk streaming decode is disabled. Each request "
+                "falls back to a single full-sequence batch_decode at completion "
+                "(TTFA ~= E2E), matching `async_chunk: false` semantics.",
+                self._codec_path,
+            )
+        if (
+            self._async_chunk
+            and self._codec_supports_streaming()
+            and self._streaming_graph_batch_sizes
+            and self._streaming_graph_frame_sizes
+        ):
             self._ensure_stream_session()
 
         # vLLM's track_weights_loading() compares the returned set against
