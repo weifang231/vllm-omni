@@ -4,8 +4,9 @@
 v1 audio tokenizer through an explicit deployment opt-in. The experimental
 configuration is
 [`moss_tts_v1_streaming.yaml`](../../vllm_omni/deploy/moss_tts_v1_streaming.yaml).
-It uses eight-frame chunks and an FP32 codec decoder. Existing deployments
-without `moss_v1_streaming: true` retain terminal, full-sequence decoding.
+It uses an eight-frame first chunk, 32-frame subsequent chunks, and an FP32
+codec decoder. Existing deployments without `moss_v1_streaming: true` retain
+terminal, full-sequence decoding.
 
 This configuration targets the 8B delay-pattern MOSS-TTS v1 model and its
 v1 codec. Other MOSS variants have different decoding paths.
@@ -55,7 +56,7 @@ The supplied YAML sets these fields:
 | `connectors.shm.extra.moss_v1_streaming` | `true` | Enable incremental delay-pattern processing and the stateful v1 decoder together. |
 | `connectors.shm.extra.moss_v1_decoder_dtype` | `float32` | Select the decoder precision that passed the current equivalence checks. |
 | `connectors.shm.extra.initial_codec_chunk_frames` | `8` | Number of complete frames required for the first chunk. |
-| `connectors.shm.extra.codec_chunk_frames` | `8` | Number of complete frames in subsequent nonterminal chunks. |
+| `connectors.shm.extra.codec_chunk_frames` | `32` | Coalesce later audio to reduce repeated eager decoder calls. |
 | `connectors.shm.extra.codec_left_context_frames` | `0` | Send new frames only; the decoder retains its own attention context. |
 | Stage 1 `max_num_seqs` | `4` | Provide decoder state slots for live streams. |
 | Stage 1 `enforce_eager` | `true` | Use the supported eager decoder path. |
@@ -82,7 +83,7 @@ corresponding row from every codebook, introducing 31 rows of delay. With
 an initial chunk of eight frames, the earliest chunk can be assembled
 after 31 delay rows plus eight complete, valid frames: 39 delayed rows in
 the simple case without discarded padding. The processor then emits
-eight-frame chunks and flushes any remaining complete frames at completion.
+32-frame chunks and flushes any remaining complete frames at completion.
 
 These are audio-code generation rows. An eight-frame chunk does not imply
 audio after eight text tokens or a fixed TTFA. Prefill, queueing, delayed
@@ -115,3 +116,44 @@ For a matched terminal comparison, use the same checkpoints, precision,
 stage capacities, and client workload, and set
 `connectors.shm.extra.moss_v1_streaming: false`. The default terminal path
 performs one full-sequence codec decode when generation finishes.
+
+## Measured goodput and limits
+
+On one GB300, three paired 60-second Poisson traces at 4 requests/s increased
+Ours goodput from **1.622 to 2.156 requests/s (+32.9%)**. Every pair improved.
+Both arms used the same FP32 codec, BF16 talker, stage capacities 4/4, and
+fixed K=3 / gamma=0.50 admission policy. The workload repeated five English
+SeedTTS voice-cloning texts, with a warm reference cache and at most 256
+generated tokens per request. A good request met both scheduled-arrival
+TTFA <=1 second and cumulative playback stall <=0.1 second.
+
+| Metric, pooled over three arrival seeds | Terminal Ours | First 8 / subsequent 32 Ours |
+|---|---:|---:|
+| Good / offered / completed requests | 292 / 714 / 417 | 388 / 714 / 388 |
+| Goodput (requests/s) | 1.622 | 2.156 |
+| Good fraction of all offers | 40.90% | 54.34% |
+| Completed-request TTFA p50 / p95 (s) | 0.916 / 1.323 | 0.642 / 0.758 |
+| Completed-request E2E p50 (s) | 0.917 | 1.112 |
+| Policy rejections / nonpolicy errors | 297 / 0 | 326 / 0 |
+
+All completed requests in both arms had zero cumulative playback stall.
+The paired-seed bootstrap interval for the goodput increase was
+0.333–0.667 requests/s. Three arrival seeds over five repeated texts limit
+generalization. Total completions decreased, so these results establish
+an improvement in first-audio SLO goodput, not total generation throughput
+or 90/90 service qualification.
+
+Uniform eight-frame chunks were substantially slower under load: the
+preceding calibration achieved 0.350 requests/s against 1.700 for matched
+terminal Ours. Coalescing later frames reduces repeated eager decoder calls;
+the implementation still decodes batch rows individually. BF16 equivalence
+remains unresolved, and this FP32 comparison does not replace historical
+BF16 results. Reproducing the reported goodput requires the frozen admission
+control and client deadline headers in addition to this deployment YAML.
+
+The serving-study archive is
+`experiments/topconf_expansion_20260907/moss_v1_streaming_goodput_v1`.
+Its `RESULTS.md`, frozen manifests, and raw records preserve the negative
+candidate, correctness gates, selection, and confirmation seeds
+9707341, 9707342, and 9707343. Measured runtime Python sources match commit
+`66c7dd8bff7b9e3eac7d154179024c5c6f0860a7`.
