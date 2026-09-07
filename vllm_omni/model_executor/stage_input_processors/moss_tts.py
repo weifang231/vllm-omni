@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -40,6 +42,13 @@ def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
                 return ac
 
     return None
+
+
+def _moss_connector_extra(transfer_manager: Any) -> Mapping[str, Any]:
+    connector = getattr(transfer_manager, "connector", None)
+    config = getattr(connector, "config", {}) or {}
+    config = config.get("extra", config) if isinstance(config, Mapping) else {}
+    return config if isinstance(config, Mapping) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +119,12 @@ def talker2codec_delay_async_chunk(
     Returns a dict compatible with the Stage-1 input format, or None to
     signal "not enough data yet — wait for more frames".
     """
+    streaming = _moss_connector_extra(transfer_manager).get("moss_v1_streaming", False)
+    if not isinstance(streaming, bool):
+        raise ValueError(f"moss_v1_streaming must be a boolean, got {streaming!r}")
+    if streaming:
+        return talker2codec_delay_streaming_async_chunk(transfer_manager, multimodal_output, request, is_finished)
+
     req_id: str = str(getattr(request, "request_id", id(request)))
     pooling_output = multimodal_output
 
@@ -224,6 +239,128 @@ def talker2codec_delay_async_chunk(
             # (same convention as the audex/cosyvoice3/qwen3_tts processors).
             stream_finished=torch.tensor(bool(is_finished), dtype=torch.bool),
         ),
+    )
+
+
+@dataclass
+class _MossDelayStreamState:
+    chunk_frames: int
+    initial_chunk_frames: int
+    seen_rows: int = 0
+    nq: int | None = None
+    delayed_tail: torch.Tensor | None = None
+    pending: list[torch.Tensor] = field(default_factory=list)
+    emitted: bool = False
+
+
+def _moss_delay_chunk_sizes(transfer_manager: Any, request: Any) -> tuple[int, int]:
+    config = _moss_connector_extra(transfer_manager)
+    sizes = {
+        "codec_chunk_frames": config.get("codec_chunk_frames", 8),
+        "initial_codec_chunk_frames": config.get("initial_codec_chunk_frames", 8),
+    }
+    info = getattr(request, "additional_information", None)
+    entries = getattr(info, "entries", {}) or {}
+    for name in sizes:
+        if name in entries:
+            values = entries[name].list_data
+            if values is None or len(values) != 1:
+                raise ValueError(f"MOSS delay streaming {name} must contain one frame count")
+            sizes[name] = values[0]
+        value = sizes[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or int(value) != value
+            or value <= 0
+        ):
+            raise ValueError(f"MOSS delay streaming {name} must be a positive integer, got {value!r}")
+        sizes[name] = int(value)
+    return sizes["codec_chunk_frames"], sizes["initial_codec_chunk_frames"]
+
+
+def talker2codec_delay_streaming_async_chunk(
+    transfer_manager: Any,
+    multimodal_output: dict[str, Any] | None,
+    request: Any,
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
+    """Incrementally de-delay cumulative MOSS v1 snapshots for a stateful codec.
+
+    A frame at row t is complete only after delayed row t + NQ - 1 arrives.
+    Keep that unfinished tail across calls and drop all-pad rows only after
+    de-delay, matching full-sequence assembly. Chunk sizes default to 8/8 and
+    can be overridden through connector config or request additional information.
+    The terminal processor remains available as ``talker2codec_delay_async_chunk``.
+    """
+    external_id = getattr(request, "external_req_id", None)
+    req_id = str(external_id if external_id is not None else getattr(request, "request_id", id(request)))
+    if not hasattr(transfer_manager, "request_payload"):
+        transfer_manager.request_payload = {}
+    states = transfer_manager.request_payload
+    state = states.get(req_id)
+    if state is None:
+        chunk_frames, initial_chunk_frames = _moss_delay_chunk_sizes(transfer_manager, request)
+        state = _MossDelayStreamState(chunk_frames, initial_chunk_frames)
+        # The transfer adapter clears this container on abort as well as finish.
+        states[req_id] = state
+    elif not isinstance(state, _MossDelayStreamState):
+        raise ValueError(f"MOSS delay streaming found incompatible state for request {req_id}")
+
+    if isinstance(multimodal_output, Mapping):
+        codes = multimodal_output.get("codes", {}) or {}
+        snapshot = codes.get("audio")
+        if isinstance(snapshot, torch.Tensor) and snapshot.numel() > 0:
+            if snapshot.ndim != 2 or snapshot.shape[1] <= 0:
+                raise ValueError(f"MOSS delayed snapshot must be [T, NQ], got {tuple(snapshot.shape)}")
+            rows, nq = map(int, snapshot.shape)
+            if state.nq is not None and nq != state.nq:
+                raise ValueError(f"MOSS delayed snapshot changed NQ from {state.nq} to {nq}")
+            if rows < state.seen_rows:
+                raise ValueError(f"MOSS cumulative snapshot shrank from {state.seen_rows} to {rows} rows")
+            state.nq = nq
+            if rows > state.seen_rows:
+                # Slice before host transfer: the talker republishes all history.
+                new_rows = snapshot[state.seen_rows :].detach().to(device="cpu", dtype=torch.long)
+                delayed = new_rows if state.delayed_tail is None else torch.cat([state.delayed_tail, new_rows], dim=0)
+                ready = max(0, int(delayed.shape[0]) - nq + 1)
+                if ready:
+                    frames = torch.stack([delayed[i : i + ready, i] for i in range(nq)], dim=1)
+                    frames = frames[frames.ne(_MOSS_AUDIO_PAD_CODE).any(dim=1)]
+                    state.pending.extend(frames.unbind(dim=0))
+                # Clone so a short tail cannot retain a whole CPU snapshot's storage.
+                state.delayed_tail = delayed[ready:].clone()
+                state.seen_rows = rows
+
+    threshold = state.chunk_frames if state.emitted else state.initial_chunk_frames
+    if not is_finished and len(state.pending) < threshold:
+        return None
+
+    emit_frames = len(state.pending) if is_finished else threshold
+    if emit_frames:
+        chunk_codes = torch.stack(state.pending[:emit_frames], dim=0)
+        codec_flat = chunk_codes.transpose(0, 1).contiguous().reshape(-1).tolist()
+        del state.pending[:emit_frames]
+    else:
+        codec_flat = []
+    state.emitted = True
+    if is_finished:
+        states.pop(req_id, None)
+
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=codec_flat),
+        meta=MetaStruct(
+            req_id=[req_id],
+            left_context_size=0,
+            codec_chunk_frames=emit_frames,
+            codec_left_context_frames=0,
+            code_flat_numel=len(codec_flat),
+            codec_streaming=True,
+            stream_finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+            finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+        ),
+        request_id=req_id,
     )
 
 
@@ -343,5 +480,6 @@ def talker2codec_raw_async_chunk(
 __all__ = [
     "talker2codec",
     "talker2codec_delay_async_chunk",
+    "talker2codec_delay_streaming_async_chunk",
     "talker2codec_raw_async_chunk",
 ]

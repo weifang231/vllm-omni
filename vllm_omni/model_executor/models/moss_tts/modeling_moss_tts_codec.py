@@ -58,6 +58,9 @@ class _MossCodecStreamSession:
         self._leased_slots: set[int] = set()
         self._closed = False
         self._cudagraph_wrapper: CUDAGraphStreamingDecoderWrapper | None = None
+        if not getattr(codec, "supports_streaming_cudagraph", True):
+            graph_batch_sizes = []
+            graph_frame_sizes = []
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
         scratch_capacity = max(batch_sizes, default=0) if self._device.type == "cuda" else 0
@@ -170,6 +173,7 @@ class _MossCodecStreamSession:
         if used_cudagraph:
             audio_tensor, _, actual_batch_size = graph_output
             audio_tensor = audio_tensor[:actual_batch_size]
+            audio_lengths = [step_t * self._samples_per_frame] * len(slots)
         else:
             codes_lengths = torch.full(
                 (len(slots),),
@@ -187,6 +191,11 @@ class _MossCodecStreamSession:
             if result.audio is None:
                 return {}
             audio_tensor = result.audio
+            audio_lengths = (
+                result.audio_lengths.detach().cpu().tolist()
+                if result.audio_lengths is not None
+                else [step_t * self._samples_per_frame] * len(slots)
+            )
 
         if terminal_slots:
             terminal_rows = [row for row, slot in enumerate(slots) if slot in terminal_slots]
@@ -194,10 +203,9 @@ class _MossCodecStreamSession:
             self._reset_slot_ids(terminal_slot_ids)
 
         audio = audio_tensor.detach().to("cpu", torch.float32)
-        audio_length = step_t * self._samples_per_frame
         out: dict[int, torch.Tensor] = {}
         for row, slot in enumerate(slots):
-            out[slot] = audio[row, ..., :audio_length].contiguous()
+            out[slot] = audio[row, ..., : int(audio_lengths[row])].contiguous()
         return out
 
 
@@ -226,6 +234,7 @@ class MossTTSCodecDecoder(nn.Module):
     has_postprocess: bool = False
     enable_update_additional_information: bool = True
     requires_raw_input_tokens: bool = True
+    requires_request_ids: bool = True
 
     _OUTPUT_SAMPLE_RATE: int = 24_000
 
@@ -339,8 +348,15 @@ class MossTTSCodecDecoder(nn.Module):
         srs: list[torch.Tensor] = [sr_tensor] * num_req
         device = next(self._codec.parameters()).device
         streaming_work: list[tuple[int, str, torch.Tensor, bool]] = []
+        request_ids = kwargs.get("request_ids")
+        if request_ids is not None and (
+            not isinstance(request_ids, (list, tuple)) or len(request_ids) != len(info_list)
+        ):
+            raise ValueError("MOSS codec request_ids must match the per-request metadata.")
 
         if input_ids is None or input_ids.numel() == 0:
+            if self._async_chunk:
+                self._release_terminal_metadata(info_list, request_ids)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": audios, "sr": srs},
@@ -367,6 +383,8 @@ class MossTTSCodecDecoder(nn.Module):
             ids_flat = ids_flat[:real_token_count]
 
         num_req = len(token_counts)
+        if request_ids is not None and len(request_ids) != num_req:
+            raise ValueError("MOSS codec request_ids must match seq_token_counts.")
         if len(info_list) < num_req:
             info_list.extend({} for _ in range(num_req - len(info_list)))
         elif len(info_list) > num_req:
@@ -386,10 +404,13 @@ class MossTTSCodecDecoder(nn.Module):
             if i + 1 >= len(offsets):
                 break
             seg = ids_flat[offsets[i] : offsets[i + 1]]
-            if seg.numel() == 0:
-                continue
             meta = (info.get("meta", {}) if isinstance(info, dict) else {}) or {}
-            finished = bool(meta.get("stream_finished", meta.get("finished", False)))
+            finished = self._metadata_flag(meta.get("stream_finished", meta.get("finished", False)))
+            req_key = self._runtime_request_key(info, meta, i, request_ids)
+            if seg.numel() == 0:
+                if self._async_chunk and finished:
+                    self.on_requests_finished([req_key])
+                continue
             streaming_enabled = self._async_chunk
             if seg.numel() % self._n_vq != 0:
                 logger.warning(
@@ -413,8 +434,6 @@ class MossTTSCodecDecoder(nn.Module):
             elif isinstance(left_ctx, torch.Tensor):
                 left_ctx = int(left_ctx.reshape(-1)[0].item()) if left_ctx.numel() else 0
             left_ctx = int(left_ctx)
-
-            req_key = self._runtime_request_key(info, meta, i)
 
             if streaming_enabled:
                 streaming_work.append((i, req_key, codes_nq_t, finished))
@@ -475,7 +494,12 @@ class MossTTSCodecDecoder(nn.Module):
                 raise ValueError(f"MossTTS codec seq_token_counts must be non-negative, got {counts}.")
         return counts
 
-    def _runtime_request_key(self, info: Any, meta: dict[str, Any], index: int) -> str:
+    def _runtime_request_key(
+        self, info: Any, meta: dict[str, Any], index: int, request_ids: list[str] | tuple[str, ...] | None = None
+    ) -> str:
+        # Scheduler IDs also reach on_requests_finished; transport IDs may differ.
+        if request_ids is not None:
+            return str(request_ids[index])
         for value in (
             meta.get("req_id"),
             info.get("request_id") if isinstance(info, dict) else None,
@@ -491,16 +515,39 @@ class MossTTSCodecDecoder(nn.Module):
             return torch.zeros((self._n_channels, 0), dtype=torch.float32)
         return torch.zeros((0,), dtype=torch.float32)
 
-    def _codec_supports_streaming(self) -> bool:
-        """Whether the loaded codec implements the incremental decoder state pool.
+    @staticmethod
+    def _metadata_flag(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError("MOSS codec terminal flag must contain one boolean.")
+            value = value.item()
+        elif isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise ValueError("MOSS codec terminal flag must contain one boolean.")
+            value = value[0]
+        if not isinstance(value, (bool, int)) or value not in (False, True):
+            raise ValueError(f"Invalid MOSS codec terminal flag: {value!r}")
+        return bool(value)
 
-        v1 MOSS Audio Tokenizer checkpoints do not implement
-        ``initialize_decoder_state_pool`` (only v2 does), so
-        ``_MossCodecStreamSession`` cannot be constructed for them.
-        """
-        return self._codec is not None and callable(
-            getattr(self._codec, "initialize_decoder_state_pool", None)
-        )
+    def _release_terminal_metadata(
+        self, info_list: list[dict[str, Any]], request_ids: list[str] | tuple[str, ...] | None = None
+    ) -> None:
+        finished_ids = []
+        for index, info in enumerate(info_list):
+            meta = (info.get("meta", {}) if isinstance(info, dict) else {}) or {}
+            if self._metadata_flag(meta.get("stream_finished", meta.get("finished", False))):
+                finished_ids.append(self._runtime_request_key(info, meta, index, request_ids))
+        self.on_requests_finished(finished_ids)
+
+    def _codec_supports_streaming(self) -> bool:
+        """Whether this deployment enables the codec's incremental state pool."""
+        if getattr(self._codec, "requires_streaming_opt_in", False) and not self._connector_int(
+            "moss_v1_streaming", default=0
+        ):
+            return False
+        return self._codec is not None and callable(getattr(self._codec, "initialize_decoder_state_pool", None))
 
     def _ensure_stream_session(self) -> _MossCodecStreamSession | None:
         if self._codec is None:
@@ -566,6 +613,10 @@ class MossTTSCodecDecoder(nn.Module):
 
         for output_index, request_id, codes_nq_t, finished in items:
             slot = self._stream_req_slots.get(request_id)
+            if codes_nq_t.shape[1] == 0:
+                if finished:
+                    self._finish_stream_request(request_id, session, slot)
+                continue
             if slot is None:
                 slot = session.acquire()
                 if slot is None:
@@ -675,6 +726,9 @@ class MossTTSCodecDecoder(nn.Module):
                 self._stream_req_slots.pop(request_id, None)
 
     def _connector_int(self, name: str, default: int = 0) -> int:
+        return int(self._connector_value(name, default))
+
+    def _connector_value(self, name: str, default: Any = None) -> Any:
         model_cfg = getattr(self.vllm_config, "model_config", None)
         connector_cfg = getattr(model_cfg, "stage_connector_config", None)
         if isinstance(connector_cfg, dict):
@@ -682,8 +736,15 @@ class MossTTSCodecDecoder(nn.Module):
         else:
             extra_cfg = getattr(connector_cfg, "extra", None)
         if isinstance(extra_cfg, dict) and name in extra_cfg:
-            return int(extra_cfg[name])
+            return extra_cfg[name]
         return default
+
+    def _decoder_dtype(self, device: torch.device) -> torch.dtype:
+        configured = self._connector_value("moss_v1_decoder_dtype", "bfloat16")
+        dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+        if not isinstance(configured, str) or configured not in dtypes:
+            raise ValueError(f"Unsupported moss_v1_decoder_dtype: {configured!r}")
+        return torch.float32 if device.type == "cpu" else dtypes[configured]
 
     def _streaming_graph_batch_sizes_from_compilation_config(self) -> list[int]:
         if getattr(self.vllm_config.model_config, "enforce_eager", True):
@@ -800,12 +861,16 @@ class MossTTSCodecDecoder(nn.Module):
         )
 
         codec.eval()
-        if device.type != "cpu":
-            codec.decoder.to(dtype=torch.bfloat16)
+        decoder_dtype = self._decoder_dtype(device)
+        codec.decoder.to(dtype=decoder_dtype)
+        if decoder_dtype == torch.float32 and device.type == "cuda":
+            # This worker owns only the codec; preserve strict FP32 equivalence.
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        logger.info("MOSS codec decoder precision: %s (device=%s)", decoder_dtype, device)
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
-            lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-            build_decode_lut(self._n_vq, dtype=lut_dtype)
+            build_decode_lut(self._n_vq, dtype=decoder_dtype)
             lut = codec.quantizer._decode_lut
             logger.info(
                 "MOSS Audio Tokenizer LFQ decoded LUT: shape=%s dtype=%s size=%.1f MiB",
@@ -835,10 +900,10 @@ class MossTTSCodecDecoder(nn.Module):
         self._configure_decoder_cudagraph(device)
         if self._async_chunk and not self._codec_supports_streaming():
             logger.warning(
-                "MOSS codec at %s does not implement initialize_decoder_state_pool "
-                "(v1 codec); async_chunk streaming decode is disabled. Each request "
-                "falls back to a single full-sequence batch_decode at completion "
-                "(TTFA ~= E2E), matching `async_chunk: false` semantics.",
+                "Incremental MOSS decoding is disabled for codec %s. "
+                "Each request uses one full-sequence batch_decode at completion "
+                "(TTFA ~= E2E). Set connector.extra.moss_v1_streaming=true "
+                "to enable the v1 incremental codec and matching input processor.",
                 self._codec_path,
             )
         if (
@@ -878,16 +943,18 @@ class MossTTSCodecDecoder(nn.Module):
     def _configure_decoder_cudagraph(self, device: torch.device) -> None:
         """Select the codec CUDA Graph path.
 
-        ``enforce_eager`` is the single graph on/off switch. If graphing is
-        enabled, ``async_chunk`` decides whether decode uses the persistent
-        streaming-state wrapper or the offline full-chunk wrapper.
+        Incremental codecs must explicitly support the streaming graph wrapper.
         """
         if getattr(self.vllm_config.model_config, "enforce_eager", True):
             self._streaming_graph_batch_sizes = []
             return
         if self._codec is None:
             return
-        if self._async_chunk:
+        if self._async_chunk and self._codec_supports_streaming():
+            if not getattr(self._codec, "supports_streaming_cudagraph", True):
+                self._streaming_graph_batch_sizes = []
+                logger.info("MOSS v1 incremental decoding uses eager execution; streaming CUDA Graph is unsupported.")
+                return
             logger.info(
                 "MOSS-TTS codec CUDA Graph selected streaming wrapper: B=%s exact_T=%s",
                 self._streaming_graph_batch_sizes,
