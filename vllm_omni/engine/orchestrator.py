@@ -710,10 +710,16 @@ class Orchestrator:
         # O(WIP) work to every stage dispatch on the orchestrator event loop.
         if not force and not instrumentation.snapshot_due():
             return
-        instrumentation.write_snapshot(
-            self._ensure_queue_controller().snapshot(),
-            force=force,
-        )
+        controller = self._ensure_queue_controller()
+        payload = controller.snapshot()
+        if os.environ.get("VLLM_OMNI_RUNTIME_COMPACT_METRICS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            payload = controller.compact_metrics_snapshot(payload)
+        instrumentation.write_snapshot(payload, force=force)
 
     async def _queue_control_housekeeping_loop(self) -> None:
         instrumentation = self._queue_instrumentation

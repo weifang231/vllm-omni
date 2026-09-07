@@ -27,6 +27,7 @@ RUNTIME_CONTROL_FILE_ENV = "VLLM_OMNI_RUNTIME_CONTROL_FILE"
 RUNTIME_CONTROL_INTERVAL_ENV = "VLLM_OMNI_RUNTIME_CONTROL_INTERVAL_S"
 RUNTIME_METRICS_DIR_ENV = "VLLM_OMNI_RUNTIME_METRICS_DIR"
 RUNTIME_METRICS_INTERVAL_ENV = "VLLM_OMNI_RUNTIME_METRICS_INTERVAL_S"
+RUNTIME_METRICS_UNCHANGED_INTERVAL_ENV = "VLLM_OMNI_RUNTIME_METRICS_UNCHANGED_INTERVAL_S"
 
 
 def _nonnegative_interval_from_env(name: str, default: float) -> float:
@@ -47,7 +48,14 @@ def _nonnegative_interval_from_env(name: str, default: float) -> float:
 class RuntimeInstrumentation:
     """Read a shared JSON control file and emit a per-process JSON snapshot."""
 
-    def __init__(self, *, engine: str, component: str, stage_id: int | str):
+    def __init__(
+        self,
+        *,
+        engine: str,
+        component: str,
+        stage_id: int | str,
+        unchanged_snapshot_interval_s: float | None = None,
+    ):
         self.engine = str(engine)
         self.component = str(component)
         self.stage_id = stage_id
@@ -63,6 +71,15 @@ class RuntimeInstrumentation:
             RUNTIME_METRICS_INTERVAL_ENV,
             1.0,
         )
+        default_unchanged_interval_s = max(2.0, 2.0 * self.snapshot_interval_s)
+        self.unchanged_snapshot_interval_s = (
+            max(float(unchanged_snapshot_interval_s), 0.0)
+            if unchanged_snapshot_interval_s is not None
+            else _nonnegative_interval_from_env(
+                RUNTIME_METRICS_UNCHANGED_INTERVAL_ENV,
+                default_unchanged_interval_s,
+            )
+        )
         # ``runtime_id`` distinguishes a restarted process even if the OS
         # happens to reuse its PID.  The sequence and monotonic timestamp form
         # the causal clock consumed by the external allocator; wall time is
@@ -70,6 +87,8 @@ class RuntimeInstrumentation:
         self.runtime_id = uuid.uuid4().hex
         self._snapshot_sequence = 0
         self._last_snapshot_monotonic = float("-inf")
+        self._last_snapshot_publish_monotonic = float("-inf")
+        self._last_snapshot_payload_fingerprint: str | None = None
         self._snapshot_lock = threading.Lock()
         self._control_signature: tuple[int, int, int] | None = None
         self._control: dict[str, Any] = {}
@@ -149,7 +168,25 @@ class RuntimeInstrumentation:
             return False
         with self._snapshot_lock:
             now_monotonic = time.monotonic()
-            if not force and now_monotonic - self._last_snapshot_monotonic < self.snapshot_interval_s:
+            if (
+                not force
+                and now_monotonic - self._last_snapshot_monotonic
+                < self.snapshot_interval_s
+            ):
+                return False
+            payload_fingerprint = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if (
+                not force
+                and payload_fingerprint == self._last_snapshot_payload_fingerprint
+                and now_monotonic - self._last_snapshot_publish_monotonic
+                < self.unchanged_snapshot_interval_s
+                and output_path.exists()
+            ):
+                self._last_snapshot_monotonic = now_monotonic
                 return False
 
             next_sequence = self._snapshot_sequence + 1
@@ -190,6 +227,8 @@ class RuntimeInstrumentation:
                 temporary_path = None
                 self._snapshot_sequence = next_sequence
                 self._last_snapshot_monotonic = now_monotonic
+                self._last_snapshot_publish_monotonic = now_monotonic
+                self._last_snapshot_payload_fingerprint = payload_fingerprint
                 return True
             except OSError as exc:
                 self._warn_once("snapshot-write", "Cannot write runtime snapshot %s: %s", output_path, exc)
