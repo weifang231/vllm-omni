@@ -247,6 +247,47 @@ def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
     assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
 
 
+@pytest.mark.asyncio
+async def test_empty_ming_answer_finishes_without_talker_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import thinker2talker_token_only
+
+    thinker = FakeStageClient(final_output=True)
+    talker = FakeStageClient(final_output=True, final_output_type="audio")
+    talker.sample_rate = 44100
+    monkeypatch.setattr(
+        talker,
+        "process_engine_inputs",
+        lambda outputs, prompt, streaming_context: thinker2talker_token_only(outputs, prompt),
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[StagePool(0, [thinker]), StagePool(1, [talker])],
+    )
+    request = OrchestratorRequestState(
+        request_id="empty-ming-answer",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(), SamplingParams()],
+        final_stage_id=1,
+    )
+    orchestrator.request_states[request.request_id] = request
+    output = SimpleNamespace(
+        request_id=request.request_id,
+        finished=True,
+        outputs=[SimpleNamespace(text="", cumulative_text="")],
+    )
+
+    await orchestrator._forward_to_next_stage(request.request_id, 0, output, request)
+
+    terminal = orchestrator.output_async_queue.get_nowait()
+    assert terminal.finished is True
+    assert terminal.engine_outputs.finished is True
+    assert terminal.engine_outputs.outputs[0].multimodal_output["audio"].numel() == 0
+    assert talker.add_request_calls == []
+    assert request.request_id not in orchestrator.request_states
+
+
 class FakeCollectiveRpcStageClient(FakeStageClient):
     def __init__(self, *args, rpc_result: Any = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)

@@ -446,8 +446,16 @@ def _build_talker_inputs(
     for i, source_output in enumerate(source_outputs):
         output = source_output.outputs[0]
 
-        # Get the generated text from thinker
-        generated_text = output.text if hasattr(output, "text") and output.text else ""
+        # A streaming completion's final text is only its last delta.
+        generated_text = getattr(output, "cumulative_text", None)
+        if generated_text is None:
+            generated_text = getattr(output, "text", "")
+        if not isinstance(generated_text, str) or not generated_text.strip():
+            logger.warning(
+                "Ming Thinker produced no completed text for request %s; skipping speech generation",
+                getattr(source_output, "request_id", "<unknown>"),
+            )
+            continue
 
         # Extract additional information from the original prompt
         original_prompt = prompt[i] if i < len(prompt) else None
