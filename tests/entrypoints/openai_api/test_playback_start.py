@@ -13,9 +13,10 @@ from vllm_omni.engine.queue_control import (
 )
 from vllm_omni.entrypoints.openai.playback_start import (
     MAX_PLAYBACK_BUFFER_MS,
+    PLAYBACK_DEADLINE_EVENT,
     PLAYBACK_DEADLINE_GUARD_MS_HEADER,
     PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER,
-    PLAYBACK_DEADLINE_EVENT,
+    PLAYBACK_RELEASE_MODE_HEADER,
     PlaybackStartBuffer,
     PlaybackStartConfig,
     iterate_with_playback_deadline,
@@ -61,12 +62,15 @@ def test_playback_deadline_guard_uses_live_runtime_slack(
     now = [10.7]
     buffer = PlaybackStartBuffer(config, clock=lambda: now[0])
     assert buffer.seconds_until_deadline() == pytest.approx(0.28)
-    assert buffer.add_pcm(
-        "first",
-        pcm_byte_count=14_250,
-        sample_rate=24_000,
-        num_channels=1,
-    ) == ()
+    assert (
+        buffer.add_pcm(
+            "first",
+            pcm_byte_count=14_250,
+            sample_rate=24_000,
+            num_channels=1,
+        )
+        == ()
+    )
     now[0] = 10.98
     assert buffer.deadline_due()
     assert buffer.release_deadline() == ("first",)
@@ -105,12 +109,15 @@ def test_selective_deadline_guard_defers_until_hard_deadline(
     assert buffer.release_deadline() == ()
     assert not buffer.released
     assert buffer.seconds_until_deadline() == pytest.approx(0.02)
-    assert buffer.add_pcm(
-        "first",
-        pcm_byte_count=4_800,
-        sample_rate=24_000,
-        num_channels=1,
-    ) == ()
+    assert (
+        buffer.add_pcm(
+            "first",
+            pcm_byte_count=4_800,
+            sample_rate=24_000,
+            num_channels=1,
+        )
+        == ()
+    )
     now[0] = 11.0
     assert buffer.deadline_due()
     assert buffer.release_deadline() == ("first",)
@@ -132,12 +139,15 @@ def test_selective_deadline_guard_releases_sufficient_buffer() -> None:
         ),
         clock=lambda: now[0],
     )
-    assert buffer.add_pcm(
-        "first",
-        pcm_byte_count=14_250,
-        sample_rate=24_000,
-        num_channels=1,
-    ) == ()
+    assert (
+        buffer.add_pcm(
+            "first",
+            pcm_byte_count=14_250,
+            sample_rate=24_000,
+            num_channels=1,
+        )
+        == ()
+    )
     now[0] = 10.98
     assert buffer.release_deadline() == ("first",)
     telemetry = buffer.telemetry(status="ok")
@@ -255,6 +265,8 @@ def test_buffer_counts_pcm_frames_across_sample_rates_exactly() -> None:
         "deadline_guard_deferred": False,
         "deadline_guard_released": False,
         "first_audio_deadline_slack_ms": None,
+        "release_mode": "target",
+        "buffer_limit_released": False,
     }
 
 
@@ -328,3 +340,180 @@ async def test_deadline_iterator_cancels_pending_pull_when_client_cancels() -> N
     with pytest.raises(asyncio.CancelledError):
         await pending_delivery
     assert generator_closed.is_set()
+
+
+def _deadline_headers(**overrides: str) -> dict[str, str]:
+    return {
+        PLAYBACK_RELEASE_MODE_HEADER: "deadline",
+        "x-vllm-omni-first-output-deadline-ms": "1000",
+        PLAYBACK_DEADLINE_GUARD_MS_HEADER: "20",
+        **overrides,
+    }
+
+
+def test_explicit_deadline_mode_requires_trust_and_uses_fixed_guard() -> None:
+    headers = _deadline_headers()
+    assert playback_start_config_from_headers(headers, request_start_s=10.0, trusted=False) is None
+    config = playback_start_config_from_headers(headers, request_start_s=10.0, trusted=True)
+    assert config == PlaybackStartConfig(
+        target_ms=MAX_PLAYBACK_BUFFER_MS,
+        deadline_monotonic_s=11.0,
+        deadline_guard_ms=20.0,
+        release_mode="deadline",
+    )
+    buffer = PlaybackStartBuffer(config, clock=lambda: 10.9)
+    assert buffer.seconds_until_deadline() == pytest.approx(0.08)
+    assert buffer.add_pcm("first", pcm_byte_count=200, sample_rate=1000, num_channels=1) == ()
+    assert buffer.release_deadline(now=10.98) == ("first",)
+    telemetry = buffer.telemetry(status="ok")
+    assert telemetry["release_mode"] == "deadline"
+    assert telemetry["release_reason"] == "deadline"
+    assert telemetry["deadline_fallback"] is False
+    assert telemetry["buffer_limit_released"] is False
+
+
+@pytest.mark.parametrize("missing", ["x-vllm-omni-first-output-deadline-ms", PLAYBACK_DEADLINE_GUARD_MS_HEADER])
+def test_deadline_mode_requires_deadline_and_explicit_guard(missing: str) -> None:
+    headers = _deadline_headers()
+    del headers[missing]
+    with pytest.raises(ValueError, match="requires"):
+        playback_start_config_from_headers(headers, request_start_s=0.0, trusted=True)
+
+
+@pytest.mark.parametrize("conflict", ["x-vllm-omni-playback-buffer-ms", PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER])
+def test_deadline_mode_rejects_target_and_conditional_guard(conflict: str) -> None:
+    with pytest.raises(ValueError, match="does not allow"):
+        playback_start_config_from_headers(_deadline_headers(**{conflict: "0"}), request_start_s=0.0, trusted=True)
+
+
+@pytest.mark.parametrize("guard", ["-1", "nan", "inf", "1001"])
+def test_deadline_mode_rejects_invalid_or_excessive_guard(guard: str) -> None:
+    with pytest.raises(ValueError, match="playback-deadline-guard-ms"):
+        playback_start_config_from_headers(
+            _deadline_headers(**{PLAYBACK_DEADLINE_GUARD_MS_HEADER: guard}), request_start_s=0.0, trusted=True
+        )
+
+
+@pytest.mark.parametrize("guard", ["0", "1000"])
+def test_deadline_mode_accepts_guard_budget_boundaries(guard: str) -> None:
+    config = playback_start_config_from_headers(
+        _deadline_headers(**{PLAYBACK_DEADLINE_GUARD_MS_HEADER: guard}), request_start_s=10.0, trusted=True
+    )
+    assert config is not None
+    assert PlaybackStartBuffer(config).deadline_monotonic_s == pytest.approx(11.0 - float(guard) / 1000.0)
+
+
+def test_invalid_release_mode_is_rejected_and_explicit_target_preserves_defaults() -> None:
+    with pytest.raises(ValueError, match="release-mode"):
+        playback_start_config_from_headers({PLAYBACK_RELEASE_MODE_HEADER: "invalid"}, request_start_s=0.0, trusted=True)
+    config = playback_start_config_from_headers(
+        {PLAYBACK_RELEASE_MODE_HEADER: "target", "x-vllm-omni-playback-buffer-ms": "321"},
+        request_start_s=0.0,
+        trusted=True,
+    )
+    assert config == PlaybackStartConfig(target_ms=321.0)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"release_mode": "invalid"},
+        {"deadline_monotonic_s": None},
+        {"deadline_monotonic_s": float("inf")},
+        {"deadline_guard_min_buffer_ms": 0.0},
+        {"target_ms": 321.0},
+        {"deadline_guard_ms": -1.0},
+    ],
+)
+def test_direct_deadline_config_rejects_incompatible_inputs(overrides: dict) -> None:
+    params = {"target_ms": MAX_PLAYBACK_BUFFER_MS, "deadline_monotonic_s": 100.0, "release_mode": "deadline"}
+    with pytest.raises(ValueError):
+        PlaybackStartConfig(**(params | overrides))
+
+
+@pytest.mark.parametrize("pcm_frames", [60_000, 60_001])
+def test_deadline_mode_retention_limit_has_distinct_release_reason(pcm_frames: int) -> None:
+    buffer = PlaybackStartBuffer(
+        PlaybackStartConfig(target_ms=MAX_PLAYBACK_BUFFER_MS, deadline_monotonic_s=100.0, release_mode="deadline"),
+        clock=lambda: 1.0,
+    )
+    assert buffer.add_pcm("empty", pcm_byte_count=0, sample_rate=1000, num_channels=1) == ()
+    assert buffer.add_pcm("large", pcm_byte_count=2 * pcm_frames, sample_rate=1000, num_channels=1) == (
+        "empty",
+        "large",
+    )
+    telemetry = buffer.telemetry(status="ok")
+    assert telemetry["release_reason"] == "buffer_limit"
+    assert telemetry["buffer_limit_released"] is True
+    assert telemetry["deadline_fallback"] is False
+    assert buffer.add_pcm("later", pcm_byte_count=200, sample_rate=1000, num_channels=1) == ("later",)
+    assert buffer.finish() == ()
+
+
+def test_deadline_mode_timer_before_first_audio_adds_no_late_hold() -> None:
+    buffer = PlaybackStartBuffer(
+        PlaybackStartConfig(target_ms=MAX_PLAYBACK_BUFFER_MS, deadline_monotonic_s=1.0, release_mode="deadline"),
+        clock=lambda: 1.0,
+    )
+    assert buffer.deadline_due()
+    assert buffer.release_deadline() == ()
+    assert buffer.released
+    assert buffer.seconds_until_deadline() is None
+    assert buffer.add_pcm("empty", pcm_byte_count=0, sample_rate=1000, num_channels=1) == ("empty",)
+    assert buffer.add_pcm("late", pcm_byte_count=200, sample_rate=1000, num_channels=1) == ("late",)
+    assert buffer.telemetry(status="ok")["hold_ms"] == 0.0
+
+
+@pytest.mark.parametrize("terminal", ["eos", "error", "cancelled"])
+def test_deadline_mode_eos_flushes_but_failures_discard_held_audio(terminal: str) -> None:
+    buffer = PlaybackStartBuffer(
+        PlaybackStartConfig(target_ms=MAX_PLAYBACK_BUFFER_MS, deadline_monotonic_s=100.0, release_mode="deadline"),
+        clock=lambda: 1.0,
+    )
+    assert buffer.add_pcm("audio", pcm_byte_count=200, sample_rate=1000, num_channels=1) == ()
+    if terminal == "eos":
+        assert buffer.finish() == ("audio",)
+    else:
+        buffer.terminate(terminal)
+        assert buffer.finish() == ()
+    assert buffer.telemetry(status="ok" if terminal == "eos" else terminal)["release_reason"] == terminal
+
+
+@pytest.mark.asyncio
+async def test_explicit_deadline_mode_keeps_pending_engine_pull_alive() -> None:
+    engine_waiting = asyncio.Event()
+    allow_second_audio = asyncio.Event()
+    engine_cancelled = asyncio.Event()
+
+    async def results():
+        yield "first"
+        engine_waiting.set()
+        try:
+            await allow_second_audio.wait()
+        except asyncio.CancelledError:
+            engine_cancelled.set()
+            raise
+        yield "second"
+
+    loop = asyncio.get_running_loop()
+    buffer = PlaybackStartBuffer(
+        PlaybackStartConfig(
+            target_ms=MAX_PLAYBACK_BUFFER_MS,
+            deadline_monotonic_s=loop.time() + 0.02,
+            deadline_guard_ms=10.0,
+            release_mode="deadline",
+        ),
+        clock=loop.time,
+    )
+    stream = iterate_with_playback_deadline(results(), buffer)
+    first = await anext(stream)
+    assert buffer.add_pcm(first, pcm_byte_count=200, sample_rate=1000, num_channels=1) == ()
+    assert await asyncio.wait_for(anext(stream), timeout=1.0) is PLAYBACK_DEADLINE_EVENT
+    assert engine_waiting.is_set()
+    assert not engine_cancelled.is_set()
+    assert buffer.release_deadline() == ("first",)
+    allow_second_audio.set()
+    assert await asyncio.wait_for(anext(stream), timeout=1.0) == "second"
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert not engine_cancelled.is_set()

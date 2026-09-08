@@ -3,10 +3,10 @@
 
 """Opt-in playback-start buffering for streaming audio responses.
 
-The controller chooses a startup-buffer target.  This module only implements
-the serving mechanism that holds playable PCM until that target, the
-first-output deadline, or a clean end of stream.  It never replays an already
-delivered chunk and does not stop the serving loop from draining the engine.
+Target mode releases a playable-audio prefix at its configured target. Deadline
+mode waits for the guarded first-output deadline. Both modes flush a clean end
+of stream; deadline mode also releases at the PCM retention limit. Held audio
+does not prevent the serving loop from pulling subsequent engine results.
 """
 
 from __future__ import annotations
@@ -27,19 +27,17 @@ from vllm_omni.engine.queue_control import (
 )
 
 PLAYBACK_BUFFER_MS_HEADER = "x-vllm-omni-playback-buffer-ms"
+PLAYBACK_RELEASE_MODE_HEADER = "x-vllm-omni-playback-release-mode"
 PLAYBACK_DEADLINE_GUARD_MS_HEADER = "x-vllm-omni-playback-deadline-guard-ms"
-PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER = (
-    "x-vllm-omni-playback-deadline-min-buffer-ms"
-)
+PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER = "x-vllm-omni-playback-deadline-min-buffer-ms"
 
 # A trusted proxy can select the target, but a typo must not make the adapter
 # retain an arbitrarily long response.  At 24 kHz mono PCM16 this limit is
 # about 2.75 MiB, plus at most one runtime audio chunk.
 MAX_PLAYBACK_BUFFER_MS = 60_000.0
 
-PlaybackReleaseReason = Literal[
-    "target", "deadline_guard", "deadline", "eos", "cancelled", "error"
-]
+PlaybackReleaseReason = Literal["target", "deadline_guard", "deadline", "eos", "cancelled", "error", "buffer_limit"]
+PlaybackReleaseMode = Literal["target", "deadline"]
 PlaybackTerminalStatus = Literal["ok", "cancelled", "engine_dead", "error"]
 PLAYBACK_DEADLINE_EVENT = object()
 
@@ -60,12 +58,29 @@ def _nonnegative_header_ms(value: Any, *, field_name: str, maximum: float | None
 
 @dataclass(frozen=True, slots=True)
 class PlaybackStartConfig:
-    """Per-request mechanism inputs supplied by a trusted ingress."""
+    """Ingress inputs; deadline mode uses target_ms as the PCM retention limit."""
 
     target_ms: float
     deadline_monotonic_s: float | None = None
     deadline_guard_ms: float = 0.0
     deadline_guard_min_buffer_ms: float | None = None
+    release_mode: PlaybackReleaseMode = "target"
+
+    def __post_init__(self) -> None:
+        if self.release_mode not in ("target", "deadline"):
+            raise ValueError("release_mode must be target or deadline")
+        if self.release_mode == "deadline":
+            if self.deadline_monotonic_s is None or not math.isfinite(self.deadline_monotonic_s):
+                raise ValueError("deadline playback mode requires a finite deadline")
+            if self.deadline_guard_min_buffer_ms is not None:
+                raise ValueError("deadline playback mode does not allow a conditional guard")
+            if self.target_ms != MAX_PLAYBACK_BUFFER_MS:
+                raise ValueError("deadline playback mode uses MAX_PLAYBACK_BUFFER_MS as its retention limit")
+            _nonnegative_header_ms(
+                self.deadline_guard_ms,
+                field_name="deadline_guard_ms",
+                maximum=MAX_PLAYBACK_BUFFER_MS,
+            )
 
 
 def playback_start_config_from_headers(
@@ -74,23 +89,37 @@ def playback_start_config_from_headers(
     request_start_s: float,
     trusted: bool | None = None,
 ) -> PlaybackStartConfig | None:
-    """Parse the opt-in playback target and its deadline fallback.
+    """Parse a trusted target gate or an explicit guarded-deadline gate.
 
-    The same trust gate as queue scheduling metadata applies.  A deadline by
-    itself does not enable buffering: the controller must explicitly provide a
-    startup-buffer target.
+    A deadline alone does not enable buffering. Deadline mode requires an
+    explicit guard, rejects target/conditional-guard headers, and uses the
+    maximum buffer duration only as a retention limit.
     """
     if not scheduling_headers_trusted(trusted=trusted) or headers is None:
         return None
     normalized = {str(key).lower(): value for key, value in headers.items()}
+    raw_mode = str(normalized.get(PLAYBACK_RELEASE_MODE_HEADER, "target")).strip().lower()
+    if raw_mode not in ("target", "deadline"):
+        raise ValueError(f"{PLAYBACK_RELEASE_MODE_HEADER} must be target or deadline")
+    release_mode: PlaybackReleaseMode = "deadline" if raw_mode == "deadline" else "target"
     raw_target = normalized.get(PLAYBACK_BUFFER_MS_HEADER)
-    if raw_target is None:
-        return None
-    target_ms = _nonnegative_header_ms(
-        raw_target,
-        field_name=PLAYBACK_BUFFER_MS_HEADER,
-        maximum=MAX_PLAYBACK_BUFFER_MS,
-    )
+    if release_mode == "deadline":
+        if raw_target is not None:
+            raise ValueError(f"deadline playback mode does not allow {PLAYBACK_BUFFER_MS_HEADER}")
+        if PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER in normalized:
+            raise ValueError(f"deadline playback mode does not allow {PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER}")
+        for required_header in (FIRST_OUTPUT_DEADLINE_MS_HEADER, PLAYBACK_DEADLINE_GUARD_MS_HEADER):
+            if required_header not in normalized:
+                raise ValueError(f"deadline playback mode requires {required_header}")
+        target_ms = MAX_PLAYBACK_BUFFER_MS
+    else:
+        if raw_target is None:
+            return None
+        target_ms = _nonnegative_header_ms(
+            raw_target,
+            field_name=PLAYBACK_BUFFER_MS_HEADER,
+            maximum=MAX_PLAYBACK_BUFFER_MS,
+        )
     deadline_monotonic_s = None
     deadline_guard_ms = 0.0
     if FIRST_OUTPUT_DEADLINE_MS_HEADER in normalized:
@@ -102,15 +131,14 @@ def playback_start_config_from_headers(
     raw_guard = normalized.get(PLAYBACK_DEADLINE_GUARD_MS_HEADER)
     if raw_guard is not None:
         if deadline_monotonic_s is None:
-            raise ValueError(
-                f"{PLAYBACK_DEADLINE_GUARD_MS_HEADER} requires "
-                f"{FIRST_OUTPUT_DEADLINE_MS_HEADER}"
-            )
+            raise ValueError(f"{PLAYBACK_DEADLINE_GUARD_MS_HEADER} requires {FIRST_OUTPUT_DEADLINE_MS_HEADER}")
         deadline_guard_ms = _nonnegative_header_ms(
             raw_guard,
             field_name=PLAYBACK_DEADLINE_GUARD_MS_HEADER,
             maximum=MAX_PLAYBACK_BUFFER_MS,
         )
+        if release_mode == "deadline" and deadline_guard_ms > deadline_ms:
+            raise ValueError(f"{PLAYBACK_DEADLINE_GUARD_MS_HEADER} must not exceed {FIRST_OUTPUT_DEADLINE_MS_HEADER}")
     deadline_guard_min_buffer_ms = None
     raw_min_buffer = normalized.get(PLAYBACK_DEADLINE_MIN_BUFFER_MS_HEADER)
     if raw_min_buffer is not None:
@@ -130,6 +158,7 @@ def playback_start_config_from_headers(
         deadline_monotonic_s=deadline_monotonic_s,
         deadline_guard_ms=deadline_guard_ms,
         deadline_guard_min_buffer_ms=deadline_guard_min_buffer_ms,
+        release_mode=release_mode,
     )
 
 
@@ -157,10 +186,7 @@ class PlaybackStartBuffer:
     def deadline_monotonic_s(self) -> float | None:
         if self.config.deadline_monotonic_s is None:
             return None
-        if (
-            self.config.deadline_guard_min_buffer_ms is not None
-            and self._deadline_guard_evaluated
-        ):
+        if self.config.deadline_guard_min_buffer_ms is not None and self._deadline_guard_evaluated:
             return self.config.deadline_monotonic_s
         return self.config.deadline_monotonic_s - self.config.deadline_guard_ms / 1000.0
 
@@ -199,14 +225,15 @@ class PlaybackStartBuffer:
         if pcm_byte_count > 0 and self._first_audio_ready_s is None:
             self._first_audio_ready_s = current
             if self.config.deadline_monotonic_s is not None:
-                self._first_audio_deadline_slack_ms = (
-                    self.config.deadline_monotonic_s - current
-                ) * 1000.0
+                self._first_audio_deadline_slack_ms = (self.config.deadline_monotonic_s - current) * 1000.0
         self._pending.extend(prefix_items)
         self._pending.append(delivery_item)
         frames = pcm_byte_count // frame_width
         self._buffered_audio_ms += frames * 1000.0 / sample_rate
-        if self._buffered_audio_ms >= self.config.target_ms:
+        if self.config.release_mode == "deadline":
+            if self._buffered_audio_ms >= MAX_PLAYBACK_BUFFER_MS:
+                return self.release("buffer_limit", now=current)
+        elif self._buffered_audio_ms >= self.config.target_ms:
             return self.release("target", now=current)
         return ()
 
@@ -229,7 +256,7 @@ class PlaybackStartBuffer:
         return self.release("deadline", now=current)
 
     def finish(self, *, now: float | None = None) -> tuple[Any, ...]:
-        """Flush a short final utterance that never reached its target."""
+        """Flush a completed stream while its playback gate is still closed."""
         return self.release("eos", now=now)
 
     def terminate(self, reason: Literal["cancelled", "error"], *, now: float | None = None) -> None:
@@ -243,7 +270,7 @@ class PlaybackStartBuffer:
 
     def release(
         self,
-        reason: Literal["target", "deadline_guard", "deadline", "eos"],
+        reason: Literal["target", "deadline_guard", "deadline", "eos", "buffer_limit"],
         *,
         now: float | None = None,
     ) -> tuple[Any, ...]:
@@ -266,7 +293,9 @@ class PlaybackStartBuffer:
             "buffered_audio_ms": round(self._buffered_audio_ms, 3),
             "hold_ms": round(hold_ms, 3),
             "release_reason": self._release_reason or "none",
-            "deadline_fallback": self._release_reason in ("deadline_guard", "deadline"),
+            "deadline_fallback": (
+                self.config.release_mode == "target" and self._release_reason in ("deadline_guard", "deadline")
+            ),
             "deadline_guard_ms": round(self.config.deadline_guard_ms, 3),
             "deadline_guard_min_buffer_ms": (
                 None
@@ -277,10 +306,10 @@ class PlaybackStartBuffer:
             "deadline_guard_deferred": self._deadline_guard_deferred,
             "deadline_guard_released": self._release_reason == "deadline_guard",
             "first_audio_deadline_slack_ms": (
-                None
-                if self._first_audio_deadline_slack_ms is None
-                else round(self._first_audio_deadline_slack_ms, 3)
+                None if self._first_audio_deadline_slack_ms is None else round(self._first_audio_deadline_slack_ms, 3)
             ),
+            "release_mode": self.config.release_mode,
+            "buffer_limit_released": self._release_reason == "buffer_limit",
         }
 
     def record_telemetry(
@@ -303,7 +332,7 @@ class PlaybackStartBuffer:
             "deadline_fallback=%s deadline_guard_ms=%.3f "
             "deadline_guard_min_buffer_ms=%s deadline_guard_evaluated=%s "
             "deadline_guard_deferred=%s deadline_guard_released=%s "
-            "first_audio_deadline_slack_ms=%s",
+            "first_audio_deadline_slack_ms=%s release_mode=%s buffer_limit_released=%s",
             request_id,
             telemetry["status"],
             telemetry["target_ms"],
@@ -317,6 +346,8 @@ class PlaybackStartBuffer:
             telemetry["deadline_guard_deferred"],
             telemetry["deadline_guard_released"],
             telemetry["first_audio_deadline_slack_ms"],
+            telemetry["release_mode"],
+            telemetry["buffer_limit_released"],
         )
         return telemetry
 
@@ -325,7 +356,7 @@ async def iterate_with_playback_deadline(
     generator: AsyncIterator[Any],
     buffer: PlaybackStartBuffer,
 ) -> AsyncGenerator[Any, None]:
-    """Yield engine results and one event when the fallback deadline expires.
+    """Yield engine results and events when playback deadlines expire.
 
     A pending ``__anext__`` call remains active at the deadline so opening the
     playback gate never cancels or restarts engine generation.  If the HTTP

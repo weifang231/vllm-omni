@@ -205,7 +205,8 @@ enabled for its class, an expired request is rejected with HTTP 429.
 ## Audio playback-start adapters
 
 The Qwen3-TTS HTTP raw-audio/SSE paths and the standard Qwen3-Omni
-`/v1/chat/completions` SSE path recognize one additional trusted header:
+`/v1/chat/completions` SSE path enable target-based buffering with this trusted
+header:
 
 - `x-vllm-omni-playback-buffer-ms`
 
@@ -233,8 +234,31 @@ and at most 60 seconds. Each enabled request emits one bounded telemetry record
 with the target, buffered audio duration at release, actual wall-clock hold,
 release reason, and whether deadline fallback was used.
 
-This interface deliberately accepts the selected target rather than deriving
-one. The paper's Brownian rule can run in an external or future in-process
+To release at a guarded deadline, send these trusted headers instead of a
+playback target:
+
+```text
+x-vllm-omni-playback-release-mode: deadline
+x-vllm-omni-first-output-deadline-ms: 1000
+x-vllm-omni-playback-deadline-guard-ms: 20
+```
+
+`deadline` mode requires an explicit first-output budget and guard, with the
+guard no larger than that budget. It rejects
+`x-vllm-omni-playback-buffer-ms` and
+`x-vllm-omni-playback-deadline-min-buffer-ms`. Audio stays held until the budget
+minus guard expires, clean EOS arrives, or held PCM reaches the 60-second
+retention limit. The last case releases with reason `buffer_limit`, including
+the whole chunk that reaches the limit. Errors and cancellation discard held
+audio. Telemetry appends `release_mode` and `buffer_limit_released`; an explicit
+deadline release is not labeled a target fallback. The 20-ms guard above is an
+example operator-selected delivery budget, not a guarantee of client receipt:
+event-loop scheduling, encoding, transport, and client parsing still take time.
+Without the mode header, behavior remains `target`; a deadline alone does not
+enable buffering.
+
+This interface accepts a selected target or release mode. The paper's Brownian
+rule can run in an external or future in-process
 controller using calibrated generation drift and variance. The current
 adapters do not apply to other model families, non-streaming responses,
 full-duplex chat, or the sentence-oriented speech WebSocket endpoint.
