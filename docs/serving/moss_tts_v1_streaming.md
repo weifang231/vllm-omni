@@ -143,6 +143,40 @@ generalization. Total completions decreased, so these results establish
 an improvement in first-audio SLO goodput, not total generation throughput
 or 90/90 service qualification.
 
+A later Native follow-up reused the exact three arrival traces and ran
+six fresh servers on the same physical GPU and host, with matching runtime,
+weights, YAMLs, and packages. Native sent no scheduling headers and enabled
+no admission control. Pooled Native goodput did **not** improve:
+
+| Metric, pooled over the same three arrival traces | Terminal Native | First 8 / subsequent 32 Native |
+|---|---:|---:|
+| Good / offered / completed requests | 22 / 714 / 714 | 16 / 714 / 714 |
+| Goodput (requests/s) | 0.122 | 0.089 |
+| Good fraction of all offers | 3.08% | 2.24% |
+| Scheduled TTFA p50 / p95 (s) | 3.133 / 10.632 | 9.127 / 23.543 |
+| Scheduled E2E p50 (s) | 3.134 | 9.809 |
+| Total drain beyond three 60-second offered windows (s) | 20.216 | 64.020 |
+| Policy rejections / nonpolicy errors | 0 / 0 | 0 / 0 |
+
+The observed pooled change was -27.3%. Per-seed good counts changed from
+2 to 7, 16 to 4, and 4 to 5; the paired-seed bootstrap difference interval
+was -0.200 to +0.083 requests/s. These mixed, small counts do not establish
+a consistent goodput improvement or regression. Latency and drain were
+worse in all three pairs. Every request completed and passed the cumulative
+stall limit. All streaming-good requests arrived within the first 2.209
+seconds of their traces, while terminal decoding also met the SLO later.
+Client queue time averaged below 1 ms, so it does not explain the
+multi-second delays.
+
+Repeated eager codec work can increase server queueing under Native load;
+the earlier codec microprofile and these latency measurements are consistent
+with that mechanism. A consistent goodput gain was observed at the
+admission-controlled Ours operating point. Native was measured later with
+the Ours-selected cadence. The two paired campaigns are not a
+contemporaneously interleaved four-arm
+trial or a search for Native's best setting. The follow-up therefore does
+not support using this recipe as a general Native throughput optimization.
+
 Uniform eight-frame chunks were substantially slower under load: the
 preceding calibration achieved 0.350 requests/s against 1.700 for matched
 terminal Ours. Coalescing later frames reduces repeated eager decoder calls;
@@ -154,6 +188,6 @@ control and client deadline headers in addition to this deployment YAML.
 The serving-study archive is
 `experiments/topconf_expansion_20260907/moss_v1_streaming_goodput_v1`.
 Its `RESULTS.md`, frozen manifests, and raw records preserve the negative
-candidate, correctness gates, selection, and confirmation seeds
+candidate, correctness gates, selection, Native follow-up, and confirmation seeds
 9707341, 9707342, and 9707343. Measured runtime Python sources match commit
 `66c7dd8bff7b9e3eac7d154179024c5c6f0860a7`.
