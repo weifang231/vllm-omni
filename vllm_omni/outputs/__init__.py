@@ -10,6 +10,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.outputs.termination import TerminationEvidence
 
 
 @dataclass
@@ -104,6 +105,9 @@ _OMNI_CONTENT_ATTRS = (
     "trajectory_decoded",
     "_multimodal_output",
     "_custom_output",
+    "request_policy",
+    "runtime_event",
+    "termination",
 )
 
 
@@ -160,6 +164,9 @@ class OmniRequestOutput(RequestOutput):
     stage_id: int | None = None
     replica_id: int | None = None
     final_output_type: str = "text"
+    request_policy: dict[str, Any] | None = None
+    runtime_event: dict[str, Any] | None = None
+    termination: TerminationEvidence | None = None
 
     # --- Diffusion model fields ---
     images: list[Image.Image] = field(default_factory=list)

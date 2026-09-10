@@ -44,6 +44,7 @@ SOFT_RESERVATION_CACHE_HEAD_EXEMPT_LIMIT = 1
 REQUEST_CLASS_HEADER = "x-vllm-omni-request-class"
 REQUEST_PATH_HEADER = "x-vllm-omni-request-path"
 FIRST_OUTPUT_DEADLINE_MS_HEADER = "x-vllm-omni-first-output-deadline-ms"
+FIRST_OUTPUT_DEADLINE_MONOTONIC_HEADER = "x-vllm-omni-first-output-deadline-monotonic-s"
 ADMISSION_CORRELATION_ID_HEADER = "x-vllm-omni-admission-correlation-id"
 TRUST_SCHEDULING_HEADERS_ENV = "VLLM_OMNI_TRUST_SCHEDULING_HEADERS"
 
@@ -89,6 +90,13 @@ def scheduling_kwargs_from_headers(
         return {}
     normalized_headers = {str(key).lower(): value for key, value in headers.items()}
     kwargs: dict[str, Any] = {}
+    if FIRST_OUTPUT_DEADLINE_MONOTONIC_HEADER in normalized_headers:
+        if FIRST_OUTPUT_DEADLINE_MS_HEADER in normalized_headers:
+            raise ValueError("Absolute and relative first-output deadlines are mutually exclusive")
+        deadline = float(normalized_headers[FIRST_OUTPUT_DEADLINE_MONOTONIC_HEADER])
+        if not math.isfinite(deadline) or deadline < 0:
+            raise ValueError("Absolute first-output deadline must be finite and non-negative")
+        kwargs["first_output_deadline_monotonic_s"] = deadline
     if REQUEST_CLASS_HEADER in normalized_headers:
         request_class = normalized_headers[REQUEST_CLASS_HEADER]
         kwargs["request_class"] = _label(

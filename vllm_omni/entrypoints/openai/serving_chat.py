@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -47,6 +48,7 @@ from vllm_omni.model_extras import (
     get_extra_body_params,
     get_extra_output_params,
 )
+from vllm_omni.outputs.termination import TerminationEvidence
 
 try:
     import soundfile
@@ -125,6 +127,7 @@ from vllm_omni.entrypoints.openai.playback_start import (
     PlaybackTerminalStatus,
     iterate_with_playback_deadline,
     playback_start_config_from_headers,
+    playback_start_config_from_policy,
 )
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -1554,14 +1557,41 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         playback_start = PlaybackStartBuffer(playback_start_config) if playback_start_config is not None else None
+        policy_receipt = None
+        termination = None
+        last_runtime_output = None
+        runtime_terminal_recorded = False
+        runtime_text_recorded = False
+        runtime_recorder = None
+        factory_path = os.environ.get("VLLM_OMNI_QUEUE_CONTROLLER_FACTORY")
+        if factory_path:
+            import importlib
+
+            runtime_recorder = getattr(importlib.import_module(factory_path.partition(":")[0]),
+                                       "record_frontend_event", None)
+
+        def record_runtime_audio(output) -> None:
+            event = getattr(output, "runtime_event", None)
+            if runtime_recorder is not None and event is not None and event.get("frames", 0) > 0:
+                runtime_recorder("audio_emit", output)
 
         def record_playback_telemetry(status: PlaybackTerminalStatus) -> None:
-            if playback_start is not None:
-                playback_start.record_telemetry(
-                    request_id=request_id,
-                    status=status,
-                    request_state=getattr(raw_request, "state", None),
-                )
+            nonlocal runtime_terminal_recorded
+            try:
+                if playback_start is not None:
+                    playback_start.record_telemetry(
+                        request_id=request_id,
+                        status=status,
+                        request_state=getattr(raw_request, "state", None),
+                    )
+            finally:
+                if runtime_recorder is not None and not runtime_terminal_recorded:
+                    runtime_recorder("request_terminal", last_runtime_output,
+                                     correlation_id=(raw_request.headers.get("x-vllm-omni-admission-correlation-id")
+                                                     if raw_request is not None else None),
+                                     outcome=("completed" if status == "ok" else
+                                              "cancelled" if status == "cancelled" else "failed"))
+                    runtime_terminal_recorded = True
 
         first_iteration_dict = {}
         assert hasattr(request, "modalities") and request.modalities is not None, (
@@ -1574,9 +1604,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
-        modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
-        modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
-        stop_reason_emitted: list[bool] = [False] * num_choices
+        tool_call_finished = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
         num_cache_creation_tokens = None
@@ -1643,8 +1671,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         req_state_audio_ref: Any = None
         result_stream = result_generator
         deadline_stream = None
-        if playback_start is not None and playback_start.deadline_monotonic_s is not None:
-            deadline_stream = iterate_with_playback_deadline(result_generator, playback_start)
+        if factory_path or (playback_start is not None and playback_start.deadline_monotonic_s is not None):
+            deadline_stream = iterate_with_playback_deadline(result_generator, lambda: playback_start)
             result_stream = deadline_stream
         try:
             async for omni_res in result_stream:
@@ -1657,20 +1685,30 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             pcm_byte_count=held_delivery.pcm_byte_count,
                             sample_rate=held_delivery.sample_rate,
                         )
+                        record_runtime_audio(held_delivery.omni_res)
                         yield held_delivery.data
                     continue
+                last_runtime_output = omni_res
+                incoming_termination = getattr(omni_res, "termination", None)
+                if incoming_termination is not None:
+                    termination = incoming_termination
+                incoming_policy = getattr(omni_res, "request_policy", None)
+                if incoming_policy is not None:
+                    if policy_receipt is None:
+                        if playback_start_config is not None:
+                            raise ValueError("Coordinator policy cannot be combined with a client playback target")
+                        policy_receipt = incoming_policy
+                        pinned_config = playback_start_config_from_policy(policy_receipt)
+                        playback_start = PlaybackStartBuffer(pinned_config) if pinned_config is not None else None
+                        if raw_request is not None:
+                            raw_request.state.analytical_policy = policy_receipt
+                    elif incoming_policy != policy_receipt:
+                        raise ValueError("Coordinator candidate or condition changed within a request")
                 final_output_type = omni_res.final_output_type
                 res = omni_res
                 if final_output_type not in first_iteration_dict:
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
-
-                # Track which modalities have actually appeared in the stream.
-                # This is used to determine when all *produced* modalities have
-                # finished, which may be a subset of request.modalities when the
-                # engine does not produce every requested modality.
-                for output in res.outputs:
-                    modality_seen[output.index].add(final_output_type)
 
                 if omni_res.metrics:
                     last_metrics = omni_res.metrics
@@ -2204,24 +2242,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 or (tools_streamed[i] and not tool_choice_function_name)
                                 or (self.use_harmony and harmony_tools_streamed[i])
                             ):
-                                finish_reason_ = "tool_calls"
-                            else:
-                                finish_reason_ = output.finish_reason if output.finish_reason else "stop"
-                            # Only emit finish_reason on the last modality to
-                            # comply with OpenAI streaming spec: exactly one
-                            # chunk per choice carries finish_reason="stop".
-                            modality_finished[i].add("text")
-                            if modality_seen[i] < set(request.modalities) or not all(
-                                m in modality_finished[i] for m in modality_seen[i]
-                            ):
-                                finish_reason_ = None
-                            else:
-                                stop_reason_emitted[i] = True
+                                tool_call_finished[i] = True
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=i,
                                 delta=delta_message,
                                 logprobs=logprobs,
-                                finish_reason=finish_reason_,
+                                finish_reason=None,
                                 stop_reason=output.stop_reason,
                                 token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                             )
@@ -2249,6 +2275,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             )
 
                         data = chunk.model_dump_json(exclude_unset=True)
+                        if (runtime_recorder is not None and not runtime_text_recorded
+                                and getattr(choice_data.delta, "content", None)):
+                            runtime_recorder("text_emit", omni_res)
+                            runtime_text_recorded = True
                         yield f"data: {data}\n\n"
 
                 elif final_output_type == "audio":
@@ -2288,17 +2318,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices_data.error.message,
                         )
                         continue
-                    # Only emit finish_reason on the last modality to
-                    # comply with OpenAI streaming spec.
+                    # Stage-local completion is not the pipeline's termination.
                     for choice in choices_data:
-                        if choice.finish_reason is not None:
-                            modality_finished[choice.index].add("audio")
-                        if modality_seen[choice.index] < set(request.modalities) or not all(
-                            m in modality_finished[choice.index] for m in modality_seen[choice.index]
-                        ):
-                            choice.finish_reason = None
-                        else:
-                            stop_reason_emitted[choice.index] = True
+                        choice.finish_reason = None
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -2316,6 +2338,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     data = chunk.model_dump_json(exclude_unset=True)
                     serialized = f"data: {data}\n\n"
                     if playback_start is None:
+                        record_runtime_audio(omni_res)
                         yield serialized
                         continue
 
@@ -2340,6 +2363,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             pcm_byte_count=ready_delivery.pcm_byte_count,
                             sample_rate=ready_delivery.sample_rate,
                         )
+                        record_runtime_audio(ready_delivery.omni_res)
                         yield ready_delivery.data
 
                 elif final_output_type == "image":
@@ -2354,17 +2378,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             index=choice.index,
                             delta=delta,
                             logprobs=None,
-                            finish_reason=choice.finish_reason,
+                            finish_reason=None,
                             stop_reason=choice.stop_reason,
                         )
-                        if stream_choice.finish_reason is not None:
-                            modality_finished[stream_choice.index].add("image")
-                        if modality_seen[stream_choice.index] < set(request.modalities) or not all(
-                            m in modality_finished[stream_choice.index] for m in modality_seen[stream_choice.index]
-                        ):
-                            stream_choice.finish_reason = None
-                        else:
-                            stop_reason_emitted[stream_choice.index] = True
                         choices_data.append(stream_choice)
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
@@ -2393,27 +2409,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         pcm_byte_count=held_delivery.pcm_byte_count,
                         sample_rate=held_delivery.sample_rate,
                     )
+                    record_runtime_audio(held_delivery.omni_res)
                     yield held_delivery.data
 
-            # Fallback: if a choice had modalities finish but no finish_reason="stop"
-            # was emitted (e.g. request.modalities included a modality the engine
-            # never produced), emit a final stop chunk for that choice.
-            for i in range(num_choices):
-                if modality_finished[i] and not stop_reason_emitted[i]:
-                    stop_choice = ChatCompletionResponseStreamChoice(
-                        index=i,
-                        delta=DeltaMessage(),
-                        finish_reason="stop",
-                    )
-                    stop_chunk = OmniChatCompletionStreamResponse(
-                        id=request_id,
-                        object=chunk_object_type,
-                        created=created_time,
-                        choices=[stop_choice],
-                        model=model_name,
-                    )
-                    data = stop_chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+            # Only the collected stage terminals can establish natural completion.
+            termination = termination or TerminationEvidence((), (), complete=False)
+            terminal_chunk = OmniChatCompletionStreamResponse(
+                id=request_id,
+                object=chunk_object_type,
+                created=created_time,
+                choices=[ChatCompletionResponseStreamChoice(
+                    index=i, delta=DeltaMessage(),
+                    finish_reason=(None if num_choices != 1 else
+                                   "tool_calls" if tool_call_finished[i] and termination.finish_reason == "stop"
+                                   else termination.finish_reason),
+                ) for i in range(num_choices)],
+                model=model_name,
+                termination=termination,
+            )
+            data = terminal_chunk.model_dump_json(exclude_unset=True)
+            yield f"data: {data}\n\n"
             # Emit audio_underrun_s + audio_continuity_ok_total once per
             # request after the audio chunk stream is exhausted. The
             # captured reference (req_state_audio_ref) outlives the inner
@@ -2531,11 +2546,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
         finally:
-            if deadline_stream is not None:
-                await deadline_stream.aclose()
-            if playback_start is not None:
-                playback_start.terminate("cancelled")
-                record_playback_telemetry("cancelled")
+            try:
+                if deadline_stream is not None:
+                    await deadline_stream.aclose()
+            finally:
+                try:
+                    if playback_start is not None:
+                        playback_start.terminate("cancelled")
+                finally:
+                    record_playback_telemetry("cancelled")
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
@@ -3011,15 +3030,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Prefer the talker-reported sample rate when present. Qwen3-Omni
         # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
         # AudioVAE rate via multimodal_output["sr"].
-        sr_raw = mm_output.get("sr")
-        if isinstance(sr_raw, (list, tuple)):
-            sr_raw = next((item for item in sr_raw if item is not None), None)
-        if sr_raw is None:
-            sample_rate = 24000
-        elif hasattr(sr_raw, "item"):
-            sample_rate = int(sr_raw.item())
+        runtime_event = getattr(final_res, "runtime_event", None)
+        if runtime_event is not None:
+            if runtime_event.get("frames") != int(audio_tensor.size):
+                raise ValueError("Captured audio packet does not match the streaming waveform")
+            sample_rate = runtime_event["sample_rate"]
         else:
-            sample_rate = int(sr_raw)
+            sr_raw = mm_output.get("sr")
+            if isinstance(sr_raw, (list, tuple)):
+                sr_raw = next((item for item in sr_raw if item is not None), None)
+            if sr_raw is None:
+                sample_rate = 24000
+            elif hasattr(sr_raw, "item"):
+                sample_rate = int(sr_raw.item())
+            else:
+                sample_rate = int(sr_raw)
 
         audio_format = self._resolve_audio_format(request)
         if isinstance(audio_format, ErrorResponse):

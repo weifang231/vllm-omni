@@ -23,7 +23,9 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.queue_control import (
     FIRST_OUTPUT_DEADLINE_MS_HEADER,
+    FIRST_OUTPUT_DEADLINE_MONOTONIC_HEADER,
     scheduling_headers_trusted,
+    scheduling_kwargs_from_headers,
 )
 
 PLAYBACK_BUFFER_MS_HEADER = "x-vllm-omni-playback-buffer-ms"
@@ -93,12 +95,11 @@ def playback_start_config_from_headers(
     )
     deadline_monotonic_s = None
     deadline_guard_ms = 0.0
-    if FIRST_OUTPUT_DEADLINE_MS_HEADER in normalized:
-        deadline_ms = _nonnegative_header_ms(
-            normalized[FIRST_OUTPUT_DEADLINE_MS_HEADER],
-            field_name=FIRST_OUTPUT_DEADLINE_MS_HEADER,
+    if FIRST_OUTPUT_DEADLINE_MS_HEADER in normalized or FIRST_OUTPUT_DEADLINE_MONOTONIC_HEADER in normalized:
+        scheduling = scheduling_kwargs_from_headers(
+            normalized, trusted=True, deadline_anchor_monotonic_s=request_start_s,
         )
-        deadline_monotonic_s = request_start_s + deadline_ms / 1000.0
+        deadline_monotonic_s = scheduling["first_output_deadline_monotonic_s"]
     raw_guard = normalized.get(PLAYBACK_DEADLINE_GUARD_MS_HEADER)
     if raw_guard is not None:
         if deadline_monotonic_s is None:
@@ -131,6 +132,23 @@ def playback_start_config_from_headers(
         deadline_guard_ms=deadline_guard_ms,
         deadline_guard_min_buffer_ms=deadline_guard_min_buffer_ms,
     )
+
+
+def playback_start_config_from_policy(receipt: Mapping[str, Any]) -> PlaybackStartConfig | None:
+    """Use the coordinator's pinned decision, never a client-selected target."""
+    if receipt.get("schema_version") != 1:
+        raise ValueError("Unsupported coordinator policy receipt")
+    if not receipt["d3_enabled"] or receipt["request_class"] != "speech":
+        return None
+    if receipt["status"] == "unavailable":
+        return None
+    target = receipt["buffer_s"]
+    deadline = receipt["deadline_monotonic_s"]
+    guard = receipt["guard_s"]
+    if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in (target, deadline, guard)):
+        raise ValueError("Coordinator playback values must be finite and non-negative")
+    return PlaybackStartConfig(target_ms=1000 * target, deadline_monotonic_s=deadline,
+                               deadline_guard_ms=1000 * guard)
 
 
 @dataclass(slots=True)
@@ -323,7 +341,7 @@ class PlaybackStartBuffer:
 
 async def iterate_with_playback_deadline(
     generator: AsyncIterator[Any],
-    buffer: PlaybackStartBuffer,
+    buffer: PlaybackStartBuffer | Callable[[], PlaybackStartBuffer | None],
 ) -> AsyncGenerator[Any, None]:
     """Yield engine results and one event when the fallback deadline expires.
 
@@ -336,7 +354,8 @@ async def iterate_with_playback_deadline(
     pending_next: asyncio.Future | None = None
     try:
         while True:
-            remaining = buffer.seconds_until_deadline()
+            current_buffer = buffer() if callable(buffer) else buffer
+            remaining = None if current_buffer is None else current_buffer.seconds_until_deadline()
             if remaining is None:
                 if pending_next is None:
                     yield await anext(iterator)

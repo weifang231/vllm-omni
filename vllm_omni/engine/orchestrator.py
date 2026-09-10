@@ -90,6 +90,7 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
+from vllm_omni.outputs.termination import StageTermination, TerminationEvidence
 from vllm_omni.utils.runtime_instrumentation import RuntimeInstrumentation
 
 logger = init_logger(__name__)
@@ -135,7 +136,7 @@ def _build_terminal_empty_output(
         token_ids=[],
         cumulative_logprob=None,
         logprobs=None,
-        finish_reason="stop",
+        finish_reason=None,
         stop_reason=None,
     )
     if final_output_type == "audio":
@@ -225,6 +226,9 @@ class OrchestratorRequestState:
     final_stage_id: int = -1
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
+    termination_stage_ids: set[int] = field(default_factory=set)
+    stage_terminations: tuple[StageTermination, ...] = ()
+    termination_interrupted: bool = False
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
@@ -498,7 +502,7 @@ class Orchestrator:
             initial_queue_config_valid = False
         self._queue_control_document = initial_queue_document
         self._queue_control_parsed_config = initial_queue_config if initial_queue_config_valid else None
-        self._queue_controller = RuntimeQueueController(
+        self._queue_controller = self._create_queue_controller(
             num_stages=self.num_stages,
             config=initial_queue_config,
         )
@@ -640,16 +644,65 @@ class Orchestrator:
             logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
             self._stat_logger = None
 
+    def _create_queue_controller(self, *, num_stages, config=None) -> RuntimeQueueController:
+        factory_path = os.environ.get("VLLM_OMNI_QUEUE_CONTROLLER_FACTORY")
+        if not factory_path:
+            return RuntimeQueueController(num_stages=num_stages, config=config)
+        import importlib
+
+        module_name, separator, attribute = factory_path.partition(":")
+        if not separator or not module_name or not attribute:
+            raise ValueError("Queue controller factory must be module:callable")
+        factory = getattr(importlib.import_module(module_name), attribute)
+        controller = factory(num_stages=num_stages, config=config or QueueControlConfig(),
+                             stage_pools=self.stage_pools)
+        if not isinstance(controller, RuntimeQueueController):
+            raise TypeError("Queue controller factory must retain RuntimeQueueController credits")
+        return controller
+
+    async def _put_output(self, message) -> None:
+        controller = getattr(self, "_queue_controller", None)
+        observer = getattr(controller, "observe_output", None)
+        if isinstance(message, OutputMessage) and (observer is not None or message.finished):
+            if not isinstance(message.engine_outputs, OmniRequestOutput):
+                pool = self.stage_pools[message.stage_id]
+                output_type = pool.stage_client.final_output_type
+                message.engine_outputs = OmniRequestOutput.from_stage_output(
+                    message.engine_outputs, request_id=message.request_id,
+                    finished=message.engine_outputs.finished, stage_id=message.stage_id,
+                    final_output_type=output_type,
+                )
+            if message.finished:
+                state = self.request_states.get(message.request_id)
+                if state is not None:
+                    required = state.termination_stage_ids | set(state.stage_submit_ts) | state.final_output_stage_ids
+                    single_choice = all(
+                        (params.get("n", 1) if isinstance(params, dict) else getattr(params, "n", 1)) == 1
+                        for params in state.sampling_params_list
+                    )
+                    message.engine_outputs.termination = TerminationEvidence(
+                        tuple(sorted(required)), state.stage_terminations,
+                        complete=single_choice and state.duplex_identity is None and not state.termination_interrupted,
+                    )
+            if observer is not None:
+                observer(message.request_id, message.stage_id, message.engine_outputs, finished=message.finished)
+        error_observer = getattr(controller, "observe_error", None)
+        if error_observer is not None and isinstance(message, ErrorMessage):
+            error_observer(message.request_id, message.error)
+        await self.output_async_queue.put(message)
+
     def _ensure_queue_controller(self) -> RuntimeQueueController:
         controller = getattr(self, "_queue_controller", None)
         if controller is None:
             num_stages = getattr(self, "num_stages", len(getattr(self, "stage_pools", ())))
-            controller = RuntimeQueueController(num_stages=num_stages)
+            controller = self._create_queue_controller(num_stages=num_stages)
             self._queue_controller = controller
             self._queue_control_draining = False
         return controller
 
     def _refresh_queue_control(self) -> bool:
+        if getattr(getattr(self, "_queue_controller", None), "owns_control_document", False):
+            return False
         instrumentation = getattr(self, "_queue_instrumentation", None)
         if instrumentation is None or not instrumentation.control_enabled:
             return False
@@ -761,6 +814,9 @@ class Orchestrator:
                 rollback_acquired_stage=pending.acquired_stage_for_dispatch,
             )
 
+        req_state = self.request_states.get(logical_request_id)
+        if req_state is not None:
+            req_state.termination_stage_ids.add(stage_id)
         controller = self._ensure_queue_controller()
         pending = PendingStageDispatch(
             request_id=request_id,
@@ -844,7 +900,7 @@ class Orchestrator:
             f"threshold_slack_s={threshold_slack}"
         )
         logger.info("[Orchestrator] req=%s %s", request_id, error)
-        await self.output_async_queue.put(
+        await self._put_output(
             ErrorMessage(
                 error=error,
                 status_code=HTTPStatus.TOO_MANY_REQUESTS.value,
@@ -1242,7 +1298,7 @@ class Orchestrator:
             )
         elif abort_outputs:
             for output_msg in abort_outputs:
-                await self.output_async_queue.put(output_msg)
+                await self._put_output(output_msg)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""
@@ -1252,7 +1308,7 @@ class Orchestrator:
         req_state = self.request_states.get(request_id)
         if req_state is None:
             logger.info("[Orchestrator] Dropping interaction for inactive req %s", request_id)
-            await self.output_async_queue.put(
+            await self._put_output(
                 ErrorMessage(
                     error=f"No active request for interaction: {request_id}",
                     fatal=False,
@@ -1272,7 +1328,7 @@ class Orchestrator:
                 exc,
                 exc_info=True,
             )
-            await self.output_async_queue.put(
+            await self._put_output(
                 ErrorMessage(
                     error=f"Failed interaction for request {request_id}: {exc}",
                     fatal=False,
@@ -1291,6 +1347,10 @@ class Orchestrator:
         """
         if not request_ids:
             return []
+        for request_id in request_ids:
+            state = self.request_states.get(request_id)
+            if state is not None:
+                state.termination_interrupted = True
         abort_outputs: list[OutputMessage] = []
         for pool in self.stage_pools:
             stage_outputs = await pool.abort_requests(request_ids) or []
@@ -1475,7 +1535,7 @@ class Orchestrator:
                     break
 
             cleanup_failed = cleanup_error is not None
-            await self.output_async_queue.put(
+            await self._put_output(
                 ErrorMessage(
                     request_id=request_id,
                     stage_id=stage_id,
@@ -1530,7 +1590,10 @@ class Orchestrator:
                     float(kv_wait_s),
                 )
             req_state = self.request_states.get(getattr(eco, "request_id", None))
-            if req_state is None or not req_state.streaming.enabled:
+            if req_state is None:
+                continue
+            if not req_state.streaming.enabled:
+                await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
                 continue
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
             raw_mm = self._completion_multimodal_output(eco, None)
@@ -1950,7 +2013,7 @@ class Orchestrator:
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
             parent_id = output.request_id
-        await self.output_async_queue.put(
+        await self._put_output(
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
@@ -2020,7 +2083,7 @@ class Orchestrator:
                 continue
             bound = pool.get_bound_replica_id(req_id)
             if bound == replica_id or not stage_has_live:
-                await self.output_async_queue.put(
+                await self._put_output(
                     ErrorMessage(
                         error=str(error),
                         fatal=True,
@@ -2054,7 +2117,7 @@ class Orchestrator:
             req_id,
             stage_id,
         )
-        await self.output_async_queue.put(
+        await self._put_output(
             ErrorMessage(
                 error=f"Stage-{stage_id} has no live replica",
                 fatal=True,
@@ -2083,7 +2146,7 @@ class Orchestrator:
         client-error ErrorMessage (default `fatal=False`) so the engine keeps
         serving, then releases the request's state across every stage pool.
         """
-        await self.output_async_queue.put(
+        await self._put_output(
             ErrorMessage(
                 error=error,
                 status_code=status_code,
@@ -2226,7 +2289,7 @@ class Orchestrator:
                 orphaned_parents.setdefault(pid, rid)
         for pid, cid in orphaned_parents.items():
             deferred = self._cfg_tracker.pop_pending_parent(pid)
-            await self.output_async_queue.put(
+            await self._put_output(
                 ErrorMessage(
                     request_id=pid,
                     stage_id=deferred["stage_id"] if deferred is not None else None,
@@ -2261,6 +2324,10 @@ class Orchestrator:
         try:
             controller = self._ensure_queue_controller()
             for request_id in cleanup_ids:
+                if abort:
+                    abort_observer = getattr(controller, "observe_abort", None)
+                    if abort_observer is not None:
+                        abort_observer(request_id)
                 controller.cancel_request(request_id)
             if abort:
                 abort_outputs = await self._abort_request_ids(cleanup_ids)
@@ -2308,6 +2375,13 @@ class Orchestrator:
         if getattr(eco, "is_segment_finished", False):
             return False
 
+        terminal = StageTermination(
+            stage_id=stage_id, request_id=eco.request_id,
+            finish_reason=str(eco.finish_reason), stop_reason=getattr(eco, "stop_reason", None),
+        )
+        if terminal not in req_state.stage_terminations:
+            req_state.stage_terminations += (terminal,)
+        req_state.termination_stage_ids.add(stage_id)
         final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
         if stage_id in final_output_stage_ids:
             req_state.finished_final_output_stage_ids.add(stage_id)
@@ -2351,7 +2425,7 @@ class Orchestrator:
                 final_output_type=final_output_type,
                 audio_sample_rate=pool._infer_audio_sample_rate(),
             )
-            await self.output_async_queue.put(
+            await self._put_output(
                 OutputMessage(
                     request_id=request_id,
                     stage_id=stage_id,
@@ -2448,7 +2522,7 @@ class Orchestrator:
             stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment(0).finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
-            await self.output_async_queue.put(
+            await self._put_output(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -2466,7 +2540,7 @@ class Orchestrator:
                 )
             )
         elif stage_metrics is not None:
-            await self.output_async_queue.put(
+            await self._put_output(
                 StageMetricsMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -2716,7 +2790,7 @@ class Orchestrator:
             ),
             decision,
         )
-        await self.output_async_queue.put(
+        await self._put_output(
             OutputMessage(
                 request_id=req_id,
                 stage_id=stage_id,
@@ -2984,7 +3058,7 @@ class Orchestrator:
                     len(companion_outputs),
                     expected,
                 )
-                await self.output_async_queue.put(
+                await self._put_output(
                     ErrorMessage(
                         request_id=req_id,
                         stage_id=src_stage_id,
@@ -3039,7 +3113,7 @@ class Orchestrator:
                         src_stage_id,
                         next_logical,
                     )
-                    await self.output_async_queue.put(
+                    await self._put_output(
                         OutputMessage(
                             request_id=req_id,
                             stage_id=next_logical,
@@ -3065,7 +3139,7 @@ class Orchestrator:
                             src_stage_id,
                             next_logical,
                         )
-                        await self.output_async_queue.put(
+                        await self._put_output(
                             OutputMessage(
                                 request_id=req_id,
                                 stage_id=next_logical,
@@ -3238,7 +3312,7 @@ class Orchestrator:
             )
             if not self._is_duplex_session_request(req_state):
                 raise
-            await self.output_async_queue.put(
+            await self._put_output(
                 ErrorMessage(
                     request_id=req_id,
                     stage_id=next_logical,
@@ -3284,7 +3358,7 @@ class Orchestrator:
                 final_output_type or "text",
                 final_stage_id,
             )
-            await self.output_async_queue.put(
+            await self._put_output(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,
