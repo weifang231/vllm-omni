@@ -118,4 +118,3 @@ CUDA_VISIBLE_DEVICES=1 python tests/benchmarks/test_reference_replay_worker.py
 
 Use a GPU allocated to your task and the CUDA libraries required by your local vLLM installation.
 The experiment runner also records real decoder trajectories, EOS behavior, per-request timing, and source snapshots.
-The earlier logits-processor implementation remains in the local experiment's diagnostic archives; it is not installed by this extension.
