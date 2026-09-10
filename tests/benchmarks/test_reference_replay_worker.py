@@ -166,6 +166,58 @@ class PostSamplerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "previously failed"):
             w.reference_replay_finish()
 
+    def test_cached_numpy_tracks_inplace_updates_and_tensor_replacement(self):
+        w = Worker()
+        r = w.model_runner
+        w.reference_replay_configure("replay", {"a": refs()["a"]})
+        r.add("internal-a", "a", [0, 5, 15])
+        c = r._reference_replay_controller
+        old_tensor, old_numpy = c.seq_lens_tensor, c.seq_lens_numpy
+        self.assertEqual(r.sample(["internal-a"], [1]), [0])
+        self.assertEqual(r.sample(["internal-a"], [2]), [5])
+        self.assertIs(c.seq_lens_numpy, old_numpy)
+        self.assertEqual(old_numpy[0], 3)
+        r.optimistic_seq_lens_cpu = torch.zeros(4, dtype=torch.int32)
+        self.assertEqual(r.sample(["internal-a"], [3]), [15])
+        self.assertIsNot(c.seq_lens_tensor, old_tensor)
+        self.assertIs(c.seq_lens_tensor, r.optimistic_seq_lens_cpu)
+        self.assertIsNot(c.seq_lens_numpy, old_numpy)
+        self.assertEqual(w.reference_replay_finish()["valid_reference_lookups"], 3)
+        self.assertEqual(r.calls, 3)
+
+    def test_cached_frames_canonical_then_reordered_have_distinct_ownership(self):
+        w = Worker()
+        r = w.model_runner
+        references = {"a": refs()["a"], "b": {"prompt_token_ids": [1, 2], "token_ids": [8, 9, 15]}}
+        w.reference_replay_configure("replay", references)
+        for key, row in references.items():
+            r.add("internal-" + key, key, row["token_ids"])
+        c = r._reference_replay_controller
+        original_table = c.table.clone()
+        self.assertEqual(r.sample(["internal-a", "internal-b"], [1, 1]), [0, 8])
+        self.assertIs(c.batch_frames, c.canonical_frames)
+        first_frame = c.batch_frames[0]
+        self.assertEqual(r.sample(["internal-b", "internal-a"], [2, 2]), [9, 5])
+        self.assertIsNot(c.batch_frames, c.canonical_frames)
+        self.assertEqual(first_frame[:, 0].tolist(), [0, 8])
+        self.assertTrue(torch.equal(c.table, original_table))
+        self.assertEqual(w.reference_replay_finish()["valid_reference_lookups"], 4)
+        self.assertEqual(r.calls, 2)
+
+    def test_prompt_array_replacement_refreshes_memoryview(self):
+        w = Worker()
+        r = w.model_runner
+        w.reference_replay_configure("replay", {"a": refs()["a"]})
+        r.add("internal-a", "a", [0, 5, 15])
+        c = r._reference_replay_controller
+        self.assertEqual(r.sample(["internal-a"], [1]), [0])
+        old = c.prompt_array
+        r.input_batch.num_prompt_tokens = r.input_batch.num_prompt_tokens.copy()
+        self.assertEqual(r.sample(["internal-a"], [2]), [5])
+        self.assertIsNot(c.prompt_array, old)
+        self.assertIs(c.prompt_array, r.input_batch.num_prompt_tokens)
+        self.assertEqual(w.reference_replay_finish()["valid_reference_lookups"], 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

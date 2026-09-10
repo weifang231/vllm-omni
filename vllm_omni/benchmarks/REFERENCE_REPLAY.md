@@ -91,6 +91,9 @@ In the tested 0.26 source, these steps are in `gpu_model_runner.py` at lines 206
 Subtracting each prompt length from `optimistic_seq_lens_cpu` therefore gives the current output offset without copying token history from GPU.
 When every active row has the same valid offset, the hook selects a preloaded time-major GPU view.
 Noop selects that view too; it does not run a per-step GPU gather on this path.
+The controller retains CPU memory views and pre-created GPU frame views instead of converting the same CPU tensor and constructing a GPU slice each step.
+It reads the current sequence and prompt lengths on every call, and refreshes a cached view if its source object changes.
+The views retain their backing storage; they do not replace actual positions with a call counter.
 Mixed offsets, untracked rows, partial prefill, and boundary samples use the fused GPU path.
 The first mapping or row-reordering operation remains inside the sample call.
 The full canonical slot vector is preloaded during the idle configuration RPC, so the first canonical binding does not copy it from CPU to GPU.
@@ -106,6 +109,7 @@ The caller must still compare every emitted ID and termination condition; the co
 
 The focused test calls the installed GPU `Sampler` through the actual wrapper and uses small request/position fixtures.
 It checks row movement, additions/removals, mixed offsets, partial prefill, boundary errors, exception retention, and native restoration.
+It also checks in-place length updates, replacement of both CPU source arrays, and the lifetime of GPU frames after a row reorder.
 It does not load an Omni model.
 
 ```bash

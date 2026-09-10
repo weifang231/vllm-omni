@@ -93,6 +93,7 @@ class _ReplayController:
         )
         self.counters = torch.zeros(5, device=runner.device, dtype=torch.int64)
         self.canonical_row_slots = torch.arange(len(self.keys), device=runner.device, dtype=torch.long)
+        self.canonical_frames = self.time_major.unbind(0)
         self.batch_ids = None
         self.row_slots = None
         self.bindings = []
@@ -104,6 +105,11 @@ class _ReplayController:
         self.fast_valid = 0
         self.fast_checksum = 0
         self.batch_view = None
+        self.seq_lens_tensor = runner.optimistic_seq_lens_cpu
+        self.seq_lens_numpy = self.seq_lens_tensor.numpy()
+        self.seq_lens_memory = memoryview(self.seq_lens_numpy)
+        self.prompt_array = runner.input_batch.num_prompt_tokens
+        self.prompt_memory = memoryview(self.prompt_array)
 
     def bind(self, runner, ids):
         slots = []
@@ -144,6 +150,9 @@ class _ReplayController:
             rows = [self.references[self.keys[slot]]["token_ids"] for slot in slots]
             self.common_length = min(map(len, rows))
             self.batch_checksums = [sum(row[index] for row in rows) for index in range(self.common_length)]
+            self.batch_frames = (
+                self.canonical_frames if self.batch_view is self.time_major else self.batch_view.unbind(0)
+            )
 
     def apply(self, runner, sampled, spec_decode_metadata):
         self.checked = False
@@ -164,12 +173,23 @@ class _ReplayController:
         if self.batch_view is not None and sampled.sampled_token_ids.dtype == self.batch_view.dtype:
             # Without speculative decoding, V1 copies these CPU lengths to GPU
             # unchanged before computing positions (gpu_model_runner.py:2152).
-            offsets = (
-                runner.optimistic_seq_lens_cpu.numpy()[: len(ids)] - runner.input_batch.num_prompt_tokens[: len(ids)]
-            )
-            offset = int(offsets[0])
-            if 0 <= offset < self.common_length and (offsets == offset).all():
-                reference_view = self.batch_view[offset]
+            # The V1 buffer is updated in place; a replacement must refresh its view.
+            if runner.optimistic_seq_lens_cpu is not self.seq_lens_tensor:
+                self.seq_lens_tensor = runner.optimistic_seq_lens_cpu
+                self.seq_lens_numpy = self.seq_lens_tensor.numpy()
+                self.seq_lens_memory = memoryview(self.seq_lens_numpy)
+            if runner.input_batch.num_prompt_tokens is not self.prompt_array:
+                self.prompt_array = runner.input_batch.num_prompt_tokens
+                self.prompt_memory = memoryview(self.prompt_array)
+            offset = self.seq_lens_memory[0] - self.prompt_memory[0]
+            common_offset = 0 <= offset < self.common_length
+            if common_offset:
+                for index in range(1, len(ids)):
+                    if self.seq_lens_memory[index] - self.prompt_memory[index] != offset:
+                        common_offset = False
+                        break
+            if common_offset:
+                reference_view = self.batch_frames[offset]
                 self.fast_calls += 1
                 self.fast_valid += len(ids)
                 self.fast_checksum += self.batch_checksums[offset]
