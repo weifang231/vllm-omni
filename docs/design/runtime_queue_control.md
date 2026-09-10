@@ -1,16 +1,8 @@
 # Runtime Queue Control
 
-## Development baseline
-
-- Fork remote: `origin = https://github.com/weifang231/vllm-omni.git`
-- Official remote: `upstream = https://github.com/vllm-project/vllm-omni.git`
-- Base commit: `a6b559cf54ff1c3c8c0a386f3c93fcd8ff1bde41`
-- Base branch: `main`
-- Feature branch: `feature/runtime-queue-control`
-- Recorded: `2026-08-30`
-
-The official remote has a disabled push URL. Development is based on the
-common `origin/main` and `upstream/main` commit above.
+Working requirements are maintained in
+[Project Requirements and Audit](../../../experiments/workload/REQUIREMENTS.md).
+This document describes runtime APIs; experiment settings belong to the run configuration.
 
 ## Scope
 
@@ -19,11 +11,10 @@ multi-stage request dispatch. It is disabled by default, so existing request
 submission, batching, placement, cache management, and GPU execution remain
 unchanged unless an operator explicitly supplies a queue-control policy.
 
-The primary contract is the paper's class-level, end-to-end concurrency lease:
+The queue-control layer provides class-level, end-to-end concurrency leases:
 a request acquires global, path, and class credit immediately before its first
 stage-0 submission and holds that lease until success, cancellation, or failure.
-Per-stage WIP limits are a separately configured runtime extension; they are
-not an implementation of the paper's current class-level optimizer.
+Per-stage WIP limits are separately configured runtime controls.
 
 The control layer is responsible for:
 
@@ -34,18 +25,17 @@ The control layer is responsible for:
    public engine API through the orchestrator and downstream stage requests;
 4. exposing bounded-cardinality queue, active-lease, dispatch, and wait-time
    telemetry for evaluation and controller feedback; and
-5. optionally applying the paper's calibrated Erlang--empirical ingress score
+5. optionally applying a calibrated Erlang--empirical ingress score
    before a request first enters stage 0, with rechecks after queue/configuration
    changes and immediately before dispatch; and
 6. for Qwen3-TTS speech streams and standard Qwen3-Omni chat audio streams,
    optionally holding client-visible PCM until a controller-selected startup
    buffer is available or the first-output deadline expires.
 
-It does not implement the paper's dynamic-program optimizer or compute the
-Brownian startup-buffer formula. The admission implementation is a model-based
-score using operator-supplied calibration data; it is not a formal
-out-of-sample guarantee. The playback adapter is the runtime mechanism to apply
-a target computed by that controller.
+Allocation decisions and playback targets are supplied by an external controller.
+The admission implementation is a model-based score using operator-supplied
+calibration data; it does not establish an out-of-sample guarantee or compute
+the Brownian startup-buffer formula. The playback adapter applies the supplied target.
 
 Full-duplex session submissions currently preserve scheduling metadata but do
 not pass through this queue. The standard Qwen3-Omni and Qwen3-TTS request,
@@ -164,7 +154,7 @@ causal allocator:
 - `queued_by_class` counts only accepted initial stage-0 requests that are
   waiting to acquire their end-to-end request lease. It excludes downstream
   dispatches and streaming updates. Together with `active_by_class`, it is the
-  runtime observation of the model's class queue and running count.
+  runtime observation of queued and active logical requests by class.
 - `config_generation`, `queue_control_config_fingerprint`, class/stage limits,
   and `online_allocator` acknowledge exactly which atomic control revision and
   complete semantic configuration produced the observed queue state.
@@ -233,8 +223,7 @@ and at most 60 seconds. Each enabled request emits one bounded telemetry record
 with the target, buffered audio duration at release, actual wall-clock hold,
 release reason, and whether deadline fallback was used.
 
-This interface deliberately accepts the selected target rather than deriving
-one. The paper's Brownian rule can run in an external or future in-process
-controller using calibrated generation drift and variance. The current
+This interface applies a supplied playback target. Computing a target from
+calibrated generation drift and variance belongs to the controller. These
 adapters do not apply to other model families, non-streaming responses,
 full-duplex chat, or the sentence-oriented speech WebSocket endpoint.
