@@ -1600,7 +1600,8 @@ class Orchestrator:
             if req_state is None:
                 continue
             if not req_state.streaming.enabled:
-                await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
+                    raw_terminal_request_ids.add(req_state.request_id)
                 continue
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
             raw_mm = self._completion_multimodal_output(eco, None)

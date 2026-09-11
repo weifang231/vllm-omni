@@ -2189,21 +2189,25 @@ async def test_nonfinal_stage_ack_after_all_outputs_keeps_execution_alive(
         ))
     try:
         for stage_id in (2, 0):
-            raw = _terminal_engine_core_outputs(request_id).outputs[0]
-            await orchestrator._apply_raw_terminal_stage_finish(stage_id, raw, state)
+            terminals = set()
+            await orchestrator._process_llm_stage_outputs(
+                stage_id, 0, _terminal_engine_core_outputs(request_id), terminals,
+            )
             if processed_final and stage_id == 0:
                 output = _build_terminal_empty_output(request_id, final_output_type="text")
                 await orchestrator._route_output(stage_id, 0, output, state, None)
                 message = await _get_output_message(fixture)
                 assert not message.finished
-            await orchestrator._finish_raw_terminal_requests(stage_id, 0, {request_id})
+            await orchestrator._finish_raw_terminal_requests(stage_id, 0, terminals)
             assert request_id in orchestrator.request_states
         snapshot = controller.snapshot()
         assert snapshot["active_by_stage_class"] == {"1": {"speech": 1}}
 
-        raw = _terminal_engine_core_outputs(request_id).outputs[0]
-        await orchestrator._apply_raw_terminal_stage_finish(1, raw, state)
-        await orchestrator._finish_raw_terminal_requests(1, 0, {request_id})
+        terminals = set()
+        await orchestrator._process_llm_stage_outputs(
+            1, 0, _terminal_engine_core_outputs(request_id), terminals,
+        )
+        await orchestrator._finish_raw_terminal_requests(1, 0, terminals)
         terminal = await _get_output_message(fixture)
         assert terminal.finished
         assert terminal.stage_id == 2
