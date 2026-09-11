@@ -1043,14 +1043,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request,
             )
 
-        (conversation,), (engine_prompt,) = await renderer.render_chat_async(
-            [messages],
-            chat_params,
-            tok_params,
-            prompt_extras={
-                k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
-            },
-        )
+        if self.engine_client.engine.get_stage_metadata(0).stage_type != "diffusion":
+            # The engine selects the receiver replica before touching its
+            # multimodal sender cache, and controlled admission may defer it.
+            conversation, prompt = await renderer.render_messages_async(messages, chat_params)
+            (engine_prompt,) = await renderer.tokenize_prompts_async([prompt], tok_params)
+        else:
+            (conversation,), (engine_prompt,) = await renderer.render_chat_async(
+                [messages],
+                chat_params,
+                tok_params,
+                prompt_extras={
+                    k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
+                },
+            )
 
         tokenizer = renderer.get_tokenizer()
 
