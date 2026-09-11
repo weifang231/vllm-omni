@@ -367,7 +367,6 @@ class StageRuntime:
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]
-            launch_mode = self._get_launch_mode(stage_id)
 
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
@@ -401,6 +400,7 @@ class StageRuntime:
                 )
 
             for replica_id in range(num_replicas):
+                launch_mode = self._get_launch_mode(stage_id, replica_id)
                 replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
                 if stage_idx in replica_devices_map:
                     replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
@@ -434,8 +434,8 @@ class StageRuntime:
 
         return stage_plans
 
-    def _get_launch_mode(self, stage_id: int) -> str:
-        """Determine launch mode for a stage. Overridden by DistStageRuntime."""
+    def _get_launch_mode(self, stage_id: int, replica_id: int = 0) -> str:
+        """Determine launch mode for a replica. Overridden by DistStageRuntime."""
         return "local"
 
     def _initialize_stage_replicas(
@@ -1021,7 +1021,7 @@ class DistStageRuntime(StageRuntime):
         return super()._prepare_stage_plans()
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
-        """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
+        """Keep declared remote slots while allowing CLI-only local replication."""
         target_stage_id = self._single_stage_id_filter
         if target_stage_id is None:
             return
@@ -1032,11 +1032,17 @@ class DistStageRuntime(StageRuntime):
             if runtime_cfg is None:
                 continue
             if stage_id == target_stage_id:
+                declared = (
+                    runtime_cfg.get("num_replicas", 1)
+                    if hasattr(runtime_cfg, "get")
+                    else getattr(runtime_cfg, "num_replicas", 1)
+                )
+                total = max(int(declared), self._omni_dp_size_local)
                 try:
-                    runtime_cfg.num_replicas = self._omni_dp_size_local
+                    runtime_cfg.num_replicas = total
                 except (AttributeError, TypeError):
                     if hasattr(runtime_cfg, "__setitem__"):
-                        runtime_cfg["num_replicas"] = self._omni_dp_size_local
+                        runtime_cfg["num_replicas"] = total
                         continue
                     logger.warning(
                         "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
@@ -1071,9 +1077,10 @@ class DistStageRuntime(StageRuntime):
 
     # ---- Distributed overrides ----
 
-    def _get_launch_mode(self, stage_id: int) -> str:
-        if self._single_stage_id_filter is not None and stage_id != self._single_stage_id_filter:
-            return "remote"
+    def _get_launch_mode(self, stage_id: int, replica_id: int = 0) -> str:
+        if self._single_stage_id_filter is not None:
+            if stage_id != self._single_stage_id_filter or replica_id >= self._omni_dp_size_local:
+                return "remote"
         return "local"
 
     def _get_coordinator_address(self) -> str | None:

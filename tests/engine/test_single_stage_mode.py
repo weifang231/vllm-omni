@@ -722,12 +722,17 @@ class TestSingleStageInitialization:
         with pytest.raises(ValueError, match="requires both"):
             runtime._start_omni_master_server([_make_llm_plan(0, stage_id=0, launch_mode="local")])
 
-    def test_build_logical_stage_init_plans_preserves_runtime_cfg_for_local_llm_in_single_stage_mode(
-        self, mocker: MockerFixture
+    @pytest.mark.parametrize("total,local", [(1, 1), (2, 1), (4, 2), (6, 3), (1, 2)])
+    def test_build_logical_stage_init_plans_preserves_declared_remote_slots(
+        self, mocker: MockerFixture, total: int, local: int
     ):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
         runtime = self._build_runtime([_make_stage_cfg(0)], stage_id_filter=0)
+        runtime._stage_configs[0].runtime.num_replicas = total
+        runtime._omni_dp_size_local = local
+        runtime._validate_single_stage_mode_replica_constraints()
+        assert runtime._stage_configs[0].runtime.num_replicas == max(total, local)
 
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
@@ -749,11 +754,13 @@ class TestSingleStageInitialization:
             lambda *_, **__: (SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)), object),
         )
         try:
-            stage_plans = runtime._build_logical_stage_init_plans(None, [1], {})
+            stage_plans = runtime._build_logical_stage_init_plans(None, [max(total, local)], {})
         finally:
             monkeypatch.undo()
 
-        assert stage_plans[0].replicas[0].metadata.runtime_cfg == {"devices": "0"}
+        replicas = stage_plans[0].replicas
+        assert [r.launch_mode for r in replicas] == ["local"] * local + ["remote"] * max(0, total - local)
+        assert [r.metadata.runtime_cfg for r in replicas] == [{"devices": "0"}] * local + [None] * max(0, total - local)
 
     def test_validate_single_stage_mode_allows_diffusion_replicas(self):
         stage_cfg = _make_stage_cfg(0, stage_type="diffusion")
