@@ -64,7 +64,7 @@ def _nonnegative_header_ms(value: Any, *, field_name: str, maximum: float | None
 class PlaybackStartConfig:
     """Per-request mechanism inputs supplied by a trusted ingress."""
 
-    target_ms: float
+    target_ms: float | None
     deadline_monotonic_s: float | None = None
     deadline_guard_ms: float = 0.0
     deadline_guard_min_buffer_ms: float | None = None
@@ -135,19 +135,15 @@ def playback_start_config_from_headers(
 
 
 def playback_start_config_from_policy(receipt: Mapping[str, Any]) -> PlaybackStartConfig | None:
-    """Use the coordinator's pinned decision, never a client-selected target."""
-    if receipt.get("schema_version") != 1:
+    """Implement the pinned latest feasible playback boundary."""
+    if receipt.get("schema_version") != 2:
         raise ValueError("Unsupported coordinator policy receipt")
     if not receipt["d3_enabled"] or receipt["request_class"] != "speech":
         return None
-    if receipt["status"] == "unavailable":
-        return None
-    target = receipt["buffer_s"]
-    deadline = receipt["deadline_monotonic_s"]
-    guard = receipt["guard_s"]
-    if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in (target, deadline, guard)):
+    deadline, guard = receipt["deadline_monotonic_s"], receipt["guard_s"]
+    if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in (deadline, guard)):
         raise ValueError("Coordinator playback values must be finite and non-negative")
-    return PlaybackStartConfig(target_ms=1000 * target, deadline_monotonic_s=deadline,
+    return PlaybackStartConfig(target_ms=None, deadline_monotonic_s=deadline,
                                deadline_guard_ms=1000 * guard)
 
 
@@ -224,7 +220,7 @@ class PlaybackStartBuffer:
         self._pending.append(delivery_item)
         frames = pcm_byte_count // frame_width
         self._buffered_audio_ms += frames * 1000.0 / sample_rate
-        if self._buffered_audio_ms >= self.config.target_ms:
+        if self.config.target_ms is not None and self._buffered_audio_ms >= self.config.target_ms:
             return self.release("target", now=current)
         return ()
 
@@ -280,7 +276,7 @@ class PlaybackStartBuffer:
             hold_ms = max((self._released_s - self._first_audio_ready_s) * 1000.0, 0.0)
         return {
             "status": status,
-            "target_ms": round(self.config.target_ms, 3),
+            "target_ms": None if self.config.target_ms is None else round(self.config.target_ms, 3),
             "buffered_audio_ms": round(self._buffered_audio_ms, 3),
             "hold_ms": round(hold_ms, 3),
             "release_reason": self._release_reason or "none",
@@ -316,7 +312,7 @@ class PlaybackStartBuffer:
         if request_state is not None:
             request_state.playback_start_telemetry = telemetry
         logger.info(
-            "[PlaybackStart] request_id=%s status=%s target_ms=%.3f "
+            "[PlaybackStart] request_id=%s status=%s target_ms=%s "
             "buffered_audio_ms=%.3f hold_ms=%.3f release_reason=%s "
             "deadline_fallback=%s deadline_guard_ms=%.3f "
             "deadline_guard_min_buffer_ms=%s deadline_guard_evaluated=%s "
