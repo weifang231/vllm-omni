@@ -130,6 +130,35 @@ def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
     )
 
 
+def test_controlled_request_does_not_process_inputs_until_admitted(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.default_sampling_params_list = [SamplingParams(max_tokens=8)]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=True, final_output_type="text", stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.prompt_expand_func = None
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine._scope_stage0_multimodal_cache_to_replica = mocker.Mock(return_value=None)
+    prompt = {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": "image-bytes"}}
+    raw = engine._build_add_request_message(
+        "req-1",
+        prompt,
+        defer_processing=True,
+        arrival_time=12.0,
+        priority=3,
+    )
+    engine.input_processor.process_inputs.assert_not_called()
+    engine._scope_stage0_multimodal_cache_to_replica.assert_not_called()
+    assert raw.input_processing.priority == 3
+    prepared, companions = engine._prepare_admitted_stage0(raw)
+    engine.input_processor.process_inputs.assert_called_once()
+    assert prepared.input_processing is None
+    assert prepared.request_timestamp == raw.request_timestamp
+    assert prepared.enqueue_ts == raw.enqueue_ts
+    assert prepared.prompt.external_req_id == "req-1"
+    assert companions == []
+
+
 def test_build_add_request_message_preserves_additional_information(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)

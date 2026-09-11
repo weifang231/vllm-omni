@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import janus
+import msgspec
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -46,6 +47,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     OutputMessage,
     ShutdownRequestMessage,
+    StageInputProcessingOptions,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import (
@@ -604,6 +606,7 @@ async def _enqueue_add_request(
     sampling_params_list,
     final_stage_id: int,
     scheduling_metadata: RequestSchedulingMetadata | None = None,
+    input_processing: StageInputProcessingOptions | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -618,6 +621,7 @@ async def _enqueue_add_request(
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
             scheduling_metadata=scheduling_metadata,
+            input_processing=input_processing,
         )
     )
 
@@ -1399,6 +1403,40 @@ async def test_dispatch_failure_is_counted_as_rollback_before_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_admitted_stage0_prepares_before_submitting_to_engine(orchestrator_factory) -> None:
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory([stage])
+    calls = []
+
+    def preprocess(raw):
+        calls.append(raw.request_id)
+        return msgspec.structs.replace(
+            raw,
+            prompt=FakePromptRequest(raw.request_id, [7, 8]),
+            input_processing=None,
+            preprocess_ms=12.0,
+        ), []
+
+    fixture.orchestrator._prepare_stage0 = preprocess
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="admitted",
+            prompt={"prompt_token_ids": [1]},
+            original_prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            input_processing=StageInputProcessingOptions(),
+        )
+        await _wait_for(lambda: len(stage.add_request_calls) == 1)
+        assert calls == ["admitted"]
+        assert stage.add_request_calls[0][0].prompt_token_ids == [7, 8]
+        assert fixture.orchestrator.request_states["admitted"].pipeline_timings["preprocess_ms"] == 12.0
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
 async def test_runtime_admission_rejection_is_nonfatal_429_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -1429,6 +1467,13 @@ async def test_runtime_admission_rejection_is_nonfatal_429_and_cleans_up(
 
     stage = FakeStageClient(final_output=True)
     fixture = orchestrator_factory([stage])
+    prepared = []
+
+    def preprocess(raw):
+        prepared.append(raw.request_id)
+        raise AssertionError("Rejected request must not mutate the multimedia sender cache")
+
+    fixture.orchestrator._prepare_stage0 = preprocess
     await _enqueue_add_request(
         fixture,
         request_id="rejected",
@@ -1436,6 +1481,7 @@ async def test_runtime_admission_rejection_is_nonfatal_429_and_cleans_up(
         original_prompt={"prompt": "rejected"},
         sampling_params_list=[_sampling_params()],
         final_stage_id=0,
+        input_processing=StageInputProcessingOptions(),
         scheduling_metadata=RequestSchedulingMetadata(
             request_class="interactive",
             deadline_monotonic_s=time.monotonic() + 10.0,
@@ -1453,6 +1499,7 @@ async def test_runtime_admission_rejection_is_nonfatal_429_and_cleans_up(
     assert error.error.startswith("OMNI_ADMISSION_REJECTED:")
     assert "reason=zero_effective_k" in error.error
     assert stage.add_request_calls == []
+    assert prepared == []
     await _wait_for(lambda: "rejected" not in fixture.orchestrator.request_states)
     assert fixture.orchestrator._queue_controller.snapshot()["active_requests"] == 0
     assert fixture.orchestrator._queue_controller.snapshot()["queued_requests"] == 0
@@ -1856,7 +1903,9 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         assert all(token_id == 0 for token_id in prewarmed_request.prompt_token_ids)
 
         stage0.push_engine_core_outputs(_engine_core_outputs("stage0-final", 2.0))
-        await _wait_for(lambda: 0 in orchestrator_fixture.orchestrator.request_states["req-async"].finished_execution_stage_ids)
+        await _wait_for(
+            lambda: 0 in orchestrator_fixture.orchestrator.request_states["req-async"].finished_execution_stage_ids
+        )
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-final", 3.0))
 
         output_msg = await _get_output_message(orchestrator_fixture)
@@ -1919,7 +1968,11 @@ async def test_async_chunk_raw_terminal_without_processed_output_finishes_reques
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         stage0.push_engine_core_outputs(_terminal_engine_core_outputs(request.request_id))
-        await _wait_for(lambda: 0 in orchestrator_fixture.orchestrator.request_states[request.request_id].finished_execution_stage_ids)
+        await _wait_for(
+            lambda: (
+                0 in orchestrator_fixture.orchestrator.request_states[request.request_id].finished_execution_stage_ids
+            )
+        )
         stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request.request_id))
 
         output_msg = await _get_output_message(orchestrator_fixture)
@@ -2163,7 +2216,8 @@ async def test_raw_only_multi_final_stage_releases_before_other_branch_finishes(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("processed_final", [False, True])
 async def test_nonfinal_stage_ack_after_all_outputs_keeps_execution_alive(
-    orchestrator_factory, processed_final,
+    orchestrator_factory,
+    processed_final,
 ) -> None:
     request_id = "req-late-talker-ack"
     stages = [
@@ -2176,22 +2230,34 @@ async def test_nonfinal_stage_ack_after_all_outputs_keeps_execution_alive(
     controller = orchestrator._ensure_queue_controller()
     metadata = RequestSchedulingMetadata(request_class="speech", path="audio")
     state = OrchestratorRequestState(
-        request_id=request_id, final_stage_id=2, final_output_stage_ids={0, 2},
+        request_id=request_id,
+        final_stage_id=2,
+        final_output_stage_ids={0, 2},
         stage_submit_ts={0: 1, 1: 1, 2: 1},
-        sampling_params_list=[SamplingParams()] * 3, scheduling_metadata=metadata,
+        sampling_params_list=[SamplingParams()] * 3,
+        scheduling_metadata=metadata,
     )
     orchestrator.request_states[request_id] = state
     for stage_id in range(3):
-        controller.acquire_immediate(PendingStageDispatch(
-            request_id=request_id, logical_request_id=request_id, stage_id=stage_id,
-            metadata=metadata, dispatch=lambda: asyncio.sleep(0, result=True),
-            operation="test", starts_request=stage_id == 0,
-        ))
+        controller.acquire_immediate(
+            PendingStageDispatch(
+                request_id=request_id,
+                logical_request_id=request_id,
+                stage_id=stage_id,
+                metadata=metadata,
+                dispatch=lambda: asyncio.sleep(0, result=True),
+                operation="test",
+                starts_request=stage_id == 0,
+            )
+        )
     try:
         for stage_id in (2, 0):
             terminals = set()
             await orchestrator._process_llm_stage_outputs(
-                stage_id, 0, _terminal_engine_core_outputs(request_id), terminals,
+                stage_id,
+                0,
+                _terminal_engine_core_outputs(request_id),
+                terminals,
             )
             if processed_final and stage_id == 0:
                 output = _build_terminal_empty_output(request_id, final_output_type="text")
@@ -2205,7 +2271,10 @@ async def test_nonfinal_stage_ack_after_all_outputs_keeps_execution_alive(
 
         terminals = set()
         await orchestrator._process_llm_stage_outputs(
-            1, 0, _terminal_engine_core_outputs(request_id), terminals,
+            1,
+            0,
+            _terminal_engine_core_outputs(request_id),
+            terminals,
         )
         await orchestrator._finish_raw_terminal_requests(1, 0, terminals)
         terminal = await _get_output_message(fixture)
@@ -2215,9 +2284,7 @@ async def test_nonfinal_stage_ack_after_all_outputs_keeps_execution_alive(
         assert terminal.engine_outputs.termination.truncated is False
         assert request_id not in orchestrator.request_states
         snapshot = controller.snapshot()
-        assert snapshot["completed_by_stage_class_total"] == {
-            str(stage_id): {"speech": 1} for stage_id in range(3)
-        }
+        assert snapshot["completed_by_stage_class_total"] == {str(stage_id): {"speech": 1} for stage_id in range(3)}
         assert snapshot["cancelled_active_by_stage_class_total"] == {
             str(stage_id): {"speech": 0} for stage_id in range(3)
         }
@@ -2263,7 +2330,9 @@ async def test_async_chunk_data_then_raw_terminal_finishes_once(orchestrator_fac
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         stage0.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
-        await _wait_for(lambda: 0 in orchestrator_fixture.orchestrator.request_states[request_id].finished_execution_stage_ids)
+        await _wait_for(
+            lambda: 0 in orchestrator_fixture.orchestrator.request_states[request_id].finished_execution_stage_ids
+        )
         stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
 
         data_msg = await _get_output_message(orchestrator_fixture)
@@ -2343,7 +2412,9 @@ async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         stage0.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
-        await _wait_for(lambda: 0 in orchestrator_fixture.orchestrator.request_states[request_id].finished_execution_stage_ids)
+        await _wait_for(
+            lambda: 0 in orchestrator_fixture.orchestrator.request_states[request_id].finished_execution_stage_ids
+        )
         stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
 
         terminal_msg = await _get_output_message(orchestrator_fixture)

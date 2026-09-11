@@ -472,10 +472,15 @@ class Orchestrator:
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = False,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
+        prepare_stage0: Callable[
+            [StageSubmissionMessage], tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]
+        ]
+        | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
+        self._prepare_stage0 = prepare_stage0
 
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
@@ -655,8 +660,7 @@ class Orchestrator:
         if not separator or not module_name or not attribute:
             raise ValueError("Queue controller factory must be module:callable")
         factory = getattr(importlib.import_module(module_name), attribute)
-        controller = factory(num_stages=num_stages, config=config or QueueControlConfig(),
-                             stage_pools=self.stage_pools)
+        controller = factory(num_stages=num_stages, config=config or QueueControlConfig(), stage_pools=self.stage_pools)
         if not isinstance(controller, RuntimeQueueController):
             raise TypeError("Queue controller factory must retain RuntimeQueueController credits")
         return controller
@@ -669,8 +673,10 @@ class Orchestrator:
                 pool = self.stage_pools[message.stage_id]
                 output_type = pool.stage_client.final_output_type
                 message.engine_outputs = OmniRequestOutput.from_stage_output(
-                    message.engine_outputs, request_id=message.request_id,
-                    finished=message.engine_outputs.finished, stage_id=message.stage_id,
+                    message.engine_outputs,
+                    request_id=message.request_id,
+                    finished=message.engine_outputs.finished,
+                    stage_id=message.stage_id,
                     final_output_type=output_type,
                 )
             if message.finished:
@@ -682,7 +688,8 @@ class Orchestrator:
                         for params in state.sampling_params_list
                     )
                     message.engine_outputs.termination = TerminationEvidence(
-                        tuple(sorted(required)), state.stage_terminations,
+                        tuple(sorted(required)),
+                        state.stage_terminations,
                         complete=single_choice and state.duplex_identity is None and not state.termination_interrupted,
                     )
             if observer is not None:
@@ -1133,18 +1140,32 @@ class Orchestrator:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
 
         async def dispatch_initial() -> None:
+            prepared = msg
+            if msg.input_processing is not None:
+                if self._prepare_stage0 is None:
+                    raise RuntimeError("Stage-0 preprocessing callback is not installed")
+                # Rejection must precede P0 sender-cache updates. Only admitted
+                # requests may establish cache entries that P1 will receive.
+                prepared, companions = await asyncio.to_thread(self._prepare_stage0, msg)
+                req_state.prompt = prepared.original_prompt
+                req_state.mm_features = getattr(prepared.prompt, "mm_features", None)
+                req_state.request_artifact_dirs.update(prepared.request_artifact_dirs or ())
+                req_state.streaming.enabled = bool(getattr(prepared.prompt, "resumable", False))
+                req_state.pipeline_timings["preprocess_ms"] = prepared.preprocess_ms
+                for companion in companions:
+                    await self.request_async_queue.put(companion)
             req_state.stage_submit_ts[stage_id] = _time.time()
             if enqueue_ts > 0:
                 req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
             await self.stage_pools[stage_id].submit_initial(
                 request_id,
                 req_state,
-                prompt,
-                prompt_text=msg.output_prompt_text,
+                prepared.prompt,
+                prompt_text=prepared.output_prompt_text,
             )
             self._register_running_request(req_state)
             if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-                await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+                await self._prewarm_async_chunk_stages(request_id, prepared.prompt, req_state)
 
         await self._enqueue_stage_dispatch(
             dispatch_initial,
@@ -2384,8 +2405,10 @@ class Orchestrator:
             return False
 
         terminal = StageTermination(
-            stage_id=stage_id, request_id=eco.request_id,
-            finish_reason=str(eco.finish_reason), stop_reason=getattr(eco, "stop_reason", None),
+            stage_id=stage_id,
+            request_id=eco.request_id,
+            finish_reason=str(eco.finish_reason),
+            stop_reason=getattr(eco, "stop_reason", None),
         )
         if terminal not in req_state.stage_terminations:
             req_state.stage_terminations += (terminal,)
@@ -2415,8 +2438,9 @@ class Orchestrator:
             # misclassified as cancelled during aggregate cleanup.
             await self._release_stage_credit(request_id, stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            if (not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
-                    or not self._request_execution_finished(req_state)):
+            if not final_output_stage_ids.issubset(
+                req_state.finished_final_output_stage_ids
+            ) or not self._request_execution_finished(req_state):
                 continue
 
             # A non-output stage can acknowledge last. Keep its lease until that
@@ -2520,10 +2544,9 @@ class Orchestrator:
         if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            request_finished = (
-                final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
-                and self._request_execution_finished(req_state)
-            )
+            request_finished = final_output_stage_ids.issubset(
+                req_state.finished_final_output_stage_ids
+            ) and self._request_execution_finished(req_state)
         # Duplex stage-0 segment boundaries are not client-visible outputs:
         # direct decisions are emitted by the model runtime extension below,
         # while spoken content flows through the next stage. Forwarding

@@ -16,6 +16,17 @@ class EngineQueueMessage(msgspec.Struct, forbid_unknown_fields=True):
     pass
 
 
+class StageInputProcessingOptions(msgspec.Struct, kw_only=True):
+    arrival_time: float | None = None
+    lora_request: object | None = None
+    tokenization_kwargs: dict[str, object] | None = None
+    trace_headers: dict[str, str] | None = None
+    priority: int = 0
+    data_parallel_rank: int | None = None
+    reasoning_ended: bool | None = None
+    resumable: bool = False
+
+
 class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     type: Literal["add_request", "streaming_update"]
     request_id: str
@@ -30,6 +41,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
     scheduling_metadata: RequestSchedulingMetadata | None = None
+    input_processing: StageInputProcessingOptions | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

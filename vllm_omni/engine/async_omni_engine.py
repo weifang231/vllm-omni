@@ -67,6 +67,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     InteractionMessage,
     OutputMessage,
+    StageInputProcessingOptions,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -424,6 +425,10 @@ class AsyncOmniEngine:
                 duplex_runtime_extension=duplex_runtime_extension,
                 enable_duplex_control=self._duplex_control_enabled,
                 duplex_session_config=self.duplex_session_config,
+                prepare_stage0=self._prepare_admitted_stage0,
+            )
+            self._defer_stage0_preprocessing = (
+                orchestrator._queue_controller.active or orchestrator._queue_instrumentation.control_enabled
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -679,8 +684,9 @@ class AsyncOmniEngine:
         scheduling_metadata: RequestSchedulingMetadata | None = None,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
+        defer_processing: bool = False,
     ) -> StageSubmissionMessage:
-        """Build an add_request message after stage-0 preprocessing."""
+        """Build a stage submission, optionally deferring processing until admission."""
         request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
         effective_sampling_params_list: list[OmniSamplingParams] = (
             list(cast(Sequence[OmniSamplingParams], sampling_params_list))
@@ -692,6 +698,32 @@ class AsyncOmniEngine:
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
         params = effective_sampling_params_list[0]
+
+        if defer_processing and not isinstance(prompt, EngineCoreRequest):
+            return StageSubmissionMessage(
+                type=message_type,
+                request_id=request_id,
+                prompt=prompt,
+                original_prompt=prompt,
+                output_prompt_text=prompt_text,
+                sampling_params_list=effective_sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=list(final_output_stage_ids) if final_output_stage_ids is not None else None,
+                preprocess_ms=0.0,
+                request_timestamp=request_timestamp,
+                enqueue_ts=time.perf_counter(),
+                scheduling_metadata=scheduling_metadata,
+                input_processing=StageInputProcessingOptions(
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=dict(trace_headers) if trace_headers is not None else None,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                    reasoning_ended=reasoning_ended,
+                    resumable=resumable,
+                ),
+            )
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
@@ -1089,6 +1121,53 @@ class AsyncOmniEngine:
 
     # ==================== Public API ====================
 
+    def _prepare_admitted_stage0(
+        self,
+        raw: StageSubmissionMessage,
+    ) -> tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]:
+        options = raw.input_processing
+        if options is None:
+            raise ValueError("Admitted preprocessing requires input-processing options")
+        msg = self._build_add_request_message(
+            request_id=raw.request_id,
+            prompt=raw.prompt,
+            prompt_text=raw.output_prompt_text,
+            sampling_params_list=raw.sampling_params_list,
+            final_stage_id=raw.final_stage_id,
+            final_output_stage_ids=raw.final_output_stage_ids,
+            arrival_time=options.arrival_time,
+            lora_request=options.lora_request,
+            tokenization_kwargs=options.tokenization_kwargs,
+            trace_headers=options.trace_headers,
+            priority=options.priority,
+            data_parallel_rank=options.data_parallel_rank,
+            reasoning_ended=options.reasoning_ended,
+            scheduling_metadata=raw.scheduling_metadata,
+            resumable=options.resumable,
+        )
+        msg.request_timestamp = raw.request_timestamp
+        msg.enqueue_ts = raw.enqueue_ts
+        try:
+            companions = (
+                self._build_cfg_companions(
+                    raw.request_id,
+                    msg.original_prompt,
+                    msg.sampling_params_list[0],
+                    msg.sampling_params_list,
+                    msg.scheduling_metadata,
+                )
+                if self.prompt_expand_func is not None and raw.final_stage_id > 0
+                else []
+            )
+            return msg, companions
+        except BaseException:
+            for artifact_dir in msg.request_artifact_dirs or ():
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+            raise
+        finally:
+            if isinstance(msg.original_prompt, dict):
+                msg.original_prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
+
     def add_request(
         self,
         request_id: str,
@@ -1108,10 +1187,10 @@ class AsyncOmniEngine:
         scheduling_metadata: RequestSchedulingMetadata | None = None,
         resumable: bool = False,
     ) -> None:
-        """Process stage-0 input locally, then send to the Orchestrator.
+        """Prepare Native inputs locally; defer controlled inputs until admission.
 
         Input processing and output
-        processor registration happen here in the caller's thread, avoiding
+        processor registration happen here in the Native caller's thread, avoiding
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
@@ -1132,6 +1211,7 @@ class AsyncOmniEngine:
                 reasoning_ended=reasoning_ended,
                 scheduling_metadata=scheduling_metadata,
                 resumable=resumable,
+                defer_processing=getattr(self, "_defer_stage0_preprocessing", False),
             )
         except BaseException:
             if isinstance(prompt, dict):
@@ -1147,7 +1227,7 @@ class AsyncOmniEngine:
         # whose companion never arrived.
         companions: list[AddCompanionRequestMessage] = []
         try:
-            if self.prompt_expand_func is not None and final_stage_id > 0:
+            if msg.input_processing is None and self.prompt_expand_func is not None and final_stage_id > 0:
                 effective_spl = msg.sampling_params_list
                 stage0_params = effective_spl[0] if effective_spl else None
                 if stage0_params is not None:
