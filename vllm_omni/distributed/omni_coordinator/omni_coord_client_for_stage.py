@@ -38,6 +38,7 @@ class OmniCoordClientForStage:
 
         self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.DEALER)
+        self._socket.setsockopt(zmq.IPV6, 1)
         try:
             self._socket.connect(self._coord_zmq_addr)
         except zmq.ZMQError as e:
@@ -91,6 +92,7 @@ class OmniCoordClientForStage:
                 try:
                     self._ctx = zmq.Context()
                     self._socket = self._ctx.socket(zmq.DEALER)
+                    self._socket.setsockopt(zmq.IPV6, 1)
                     self._socket.connect(self._coord_zmq_addr)
                     return True
                 except zmq.ZMQError as e:

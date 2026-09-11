@@ -48,12 +48,14 @@ class OmniCoordinator:
         # Dedicated ZMQ context for this coordinator instance.
         self._ctx = zmq.Context()
         self._router = self._ctx.socket(zmq.ROUTER)
+        self._router.setsockopt(zmq.IPV6, 1)
         self._router.bind(router_zmq_addr)
         # Recover the actual bound address (port=0 → real port).
         self.router_zmq_addr = self._router.getsockopt_string(zmq.LAST_ENDPOINT)
         self._pub_zmq_addr = pub_zmq_addr  # keep original for internal use
 
         self._pub = self._ctx.socket(zmq.PUB)
+        self._pub.setsockopt(zmq.IPV6, 1)
         self._pub.bind(pub_zmq_addr)
         # Recover the actual bound address (port=0 → real port).
         self.pub_zmq_addr = self._pub.getsockopt_string(zmq.LAST_ENDPOINT)

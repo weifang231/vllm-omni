@@ -21,7 +21,7 @@ import zmq
 from omegaconf import OmegaConf
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
+from vllm.utils.network_utils import get_open_ports_list, make_zmq_path, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     CoreEngine,
@@ -43,6 +43,8 @@ from vllm_omni.engine.stage_init_utils import (
 )
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.platforms import current_omni_platform
+
+from vllm_omni.utils.network import resolve_tcp_host, tcp_endpoint
 
 logger = init_logger(__name__)
 
@@ -171,7 +173,7 @@ class OmniMasterServer:
         on_register: OnRegisterCallback | None = None,
         head_local_replicas: dict[int, list[int]] | None = None,
     ) -> None:
-        self._address = master_address
+        self._address = resolve_tcp_host(master_address)
         self._port = master_port
         self._stage_routes: dict[StageRoute, StageAllocation] = {}
         self._stage_configs: dict[StageRoute, Any] = {}
@@ -275,12 +277,12 @@ class OmniMasterServer:
         self._stage_coordinator_addresses[route] = StageCoordinatorAddresses()
         hs_port, inp_port, out_port = self._alloc_unique_ports(3)
         alloc = StageAllocation(
-            handshake_bind_address=f"tcp://{self._address}:{hs_port}",
-            handshake_connect_address=f"tcp://{self._address}:{hs_port}",
-            input_bind_address=f"tcp://{self._address}:{inp_port}",
-            input_connect_address=f"tcp://{self._address}:{inp_port}",
-            output_bind_address=f"tcp://{self._address}:{out_port}",
-            output_connect_address=f"tcp://{self._address}:{out_port}",
+            handshake_bind_address=make_zmq_path("tcp", self._address, hs_port),
+            handshake_connect_address=make_zmq_path("tcp", self._address, hs_port),
+            input_bind_address=make_zmq_path("tcp", self._address, inp_port),
+            input_connect_address=make_zmq_path("tcp", self._address, inp_port),
+            output_bind_address=make_zmq_path("tcp", self._address, out_port),
+            output_connect_address=make_zmq_path("tcp", self._address, out_port),
         )
         self._stage_routes[route] = alloc
         return alloc
@@ -304,12 +306,13 @@ class OmniMasterServer:
             for port in get_open_ports_list(count=count - len(picked)):
                 if port in self._allocated_ports:
                     continue
-                reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                family = socket.AF_INET6 if ":" in self._address else socket.AF_INET
+                reservation = socket.socket(family, socket.SOCK_STREAM)
                 try:
                     # Reserve on every local interface. The advertised address
                     # can be a routable interface IP, but wildcard binding also
                     # protects the route from local NCCL/socket allocations.
-                    reservation.bind(("", port))
+                    reservation.bind(("::" if family == socket.AF_INET6 else "", port))
                 except OSError:
                     reservation.close()
                     continue
@@ -507,7 +510,8 @@ class OmniMasterServer:
         # Registration socket for the initial stage registration.
         # Per-stage handshake sockets are bound by the launch helpers.
         reg_socket: zmq.Socket = ctx.socket(zmq.ROUTER)  # type: ignore[attr-defined]
-        reg_socket.bind(f"tcp://{self.address}:{self.port}")
+        reg_socket.setsockopt(zmq.IPV6, 1)
+        reg_socket.bind(make_zmq_path("tcp", self.address, self.port))
 
         poller = zmq.Poller()
         poller.register(reg_socket, zmq.POLLIN)
@@ -688,7 +692,9 @@ def _detect_local_bind_address(master_address: str, master_port: int) -> str:
     returns the NIC IP that's reachable from the master, which is exactly the
     address the headless's per-stage ZMQ sockets must bind on.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    master_address = resolve_tcp_host(master_address)
+    family = socket.AF_INET6 if ":" in master_address else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_DGRAM)
     try:
         s.connect((master_address, master_port))
         return s.getsockname()[0]
@@ -736,7 +742,8 @@ def register_stage_with_omni_master(
     try:
         reg_sock: zmq.Socket = reg_ctx.socket(zmq.DEALER)  # type: ignore[attr-defined]
         try:
-            reg_sock.connect(f"tcp://{omni_master_address}:{omni_master_port}")
+            reg_sock.setsockopt(zmq.IPV6, 1)
+            reg_sock.connect(tcp_endpoint(omni_master_address, omni_master_port))
             payload: dict[str, Any] = {
                 "stage_id": omni_stage_id,
                 "replica_id": wire_replica_id,

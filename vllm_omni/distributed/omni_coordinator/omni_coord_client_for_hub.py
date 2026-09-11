@@ -66,6 +66,7 @@ class OmniCoordClientForHub:
         sub: zmq.Socket | None = None
         try:
             sub = self._ctx.socket(zmq.SUB)
+            sub.setsockopt(zmq.IPV6, 1)
             sub.setsockopt(zmq.SUBSCRIBE, b"")
             sub.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout, avoids busy-wait
             sub.connect(self._coord_zmq_addr)
@@ -81,6 +82,7 @@ class OmniCoordClientForHub:
                 if sub is None:
                     try:
                         sub = self._ctx.socket(zmq.SUB)
+                        sub.setsockopt(zmq.IPV6, 1)
                         sub.setsockopt(zmq.SUBSCRIBE, b"")
                         sub.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout, avoids busy-wait
                         sub.connect(self._coord_zmq_addr)

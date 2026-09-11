@@ -221,6 +221,9 @@ def test_reconnect_respects_retry_limit(monkeypatch):
     attempts = {"connect": 0}
 
     class _FailSocket:
+        def setsockopt(self, option, value):
+            assert option == zmq.IPV6 and value == 1
+
         def close(self, *_args, **_kwargs):
             pass
 

@@ -27,6 +27,8 @@ from vllm.utils.network_utils import get_open_ports_list
 
 from vllm_omni.distributed.omni_coordinator.omni_coordinator import OmniCoordinator
 
+from vllm_omni.utils.network import tcp_endpoint
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,8 +104,8 @@ class OmniCoordinatorRuntime:
             raise ValueError("heartbeat_timeout must be positive")
 
         router_port, pub_port = get_open_ports_list(count=2)
-        self.router_address: str = f"tcp://{host}:{router_port}"
-        self.pub_address: str = f"tcp://{host}:{pub_port}"
+        self.router_address: str = tcp_endpoint(host, router_port)
+        self.pub_address: str = tcp_endpoint(host, pub_port)
 
         self._closed = False
 
