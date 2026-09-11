@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -16,6 +21,36 @@ from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+async def test_native_media_preprocessing_keeps_api_responsive_and_fifo():
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_metadata = [SimpleNamespace(stage_type="llm")]
+    started, release = threading.Event(), threading.Event()
+    order = []
+    main_thread = threading.get_ident()
+
+    def add_request(**kwargs):
+        assert threading.get_ident() != main_thread
+        if kwargs["request_id"] == "first":
+            started.set()
+            assert release.wait(5)
+        order.append(kwargs["request_id"])
+
+    engine.add_request = add_request
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        engine.input_processor = SimpleNamespace(renderer=SimpleNamespace(_mm_executor=executor))
+        first = asyncio.create_task(engine.add_request_async("first", {"multi_modal_data": {"image": ["media"]}}))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            second = asyncio.create_task(engine.add_request_async("second", {"multi_modal_data": {"image": ["media"]}}))
+            await asyncio.sleep(0)
+            assert order == []
+        finally:
+            release.set()
+        await asyncio.gather(first, second)
+    assert order == ["first", "second"]
 
 
 class _SyntheticSyncQueueShutDownError(Exception):

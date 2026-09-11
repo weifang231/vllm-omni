@@ -20,6 +20,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Mapping, Sequence
+from functools import partial
 from typing import Any, Literal, cast
 
 import janus
@@ -1276,7 +1277,7 @@ class AsyncOmniEngine:
         resumable: bool = False,
     ) -> None:
         """Async add_request API."""
-        self.add_request(
+        arguments = dict(
             request_id=request_id,
             prompt=prompt,
             prompt_text=prompt_text,
@@ -1293,6 +1294,20 @@ class AsyncOmniEngine:
             scheduling_metadata=scheduling_metadata,
             resumable=resumable,
         )
+        if (
+            not getattr(self, "_defer_stage0_preprocessing", False)
+            and isinstance(prompt, dict)
+            and prompt.get("multi_modal_data")
+            and self.stage_metadata[0].stage_type != "diffusion"
+        ):
+            # Keep upstream's single-worker cache ordering without blocking
+            # the API event loop on media preprocessing.
+            await asyncio.get_running_loop().run_in_executor(
+                self.input_processor.renderer._mm_executor,
+                partial(self.add_request, **arguments),
+            )
+        else:
+            self.add_request(**arguments)
 
     def add_streaming_update(
         self,
