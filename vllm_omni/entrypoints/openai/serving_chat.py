@@ -3002,7 +3002,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 audio_tensor = torch.cat(audio_data, dim=-1)
         else:
             audio_tensor = audio_data
-        if audio_tensor is None:
+        if audio_tensor is None or audio_tensor.numel() == 0:
             if not stream:
                 return self._create_error_response("Audio generation completed but no audio was produced.")
             # A streamed message can legitimately carry no waveform: the talker
