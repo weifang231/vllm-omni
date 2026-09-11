@@ -14,6 +14,7 @@ from typing import Any
 import msgspec
 import torch
 import zmq
+from vllm.utils.network_utils import make_zmq_path
 
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
@@ -134,6 +135,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         self.config = config
         host_config = config.get("host")
+        if config.get("host_env") is not None:
+            if host_config not in (None, "auto"):
+                raise ValueError("Declare host or host_env, not both")
+            host_config = os.environ[config["host_env"]]
+            if not host_config or host_config in {"auto", "*", "0.0.0.0", "::"}:
+                raise ValueError("host_env must resolve to a concrete local address")
         host_value = "auto" if host_config is None else str(host_config)
         # Default sender/receiver bootstrap to a routable local IP so the
         # advertised endpoint matches the interface Mooncake binds.
@@ -221,6 +228,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     def _init_listener(self, config: dict[str, Any]) -> None:
         """Initialize control-plane sockets and start the sender listener."""
         self.zmq_ctx = zmq.Context()
+        self.zmq_ctx.set(zmq.IPV6, 1)
         self._sender_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mooncake-sender")
 
         # Log complete connector configuration for debugging
@@ -571,7 +579,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         Returns ``{source_host, source_port, data_size, is_fast_path}``
         or ``None`` when the key is not found / the query fails.
         """
-        zmq_addr = f"tcp://{host}:{port}"
+        zmq_addr = make_zmq_path("tcp", host, port)
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=5000)
         try:
             req_socket.send(QUERY_INFO + msgspec.msgpack.encode(QueryRequest(request_id=get_key)))
@@ -796,7 +804,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # Timeout scales with data size: base 30s + 5s per 100MB.
         size_timeout_ms = (data_size // _TRANSFER_TIMEOUT_STEP_BYTES) * _TRANSFER_TIMEOUT_PER_STEP_MS
         total_timeout_ms = _BASE_TRANSFER_TIMEOUT_MS + size_timeout_ms
-        zmq_addr = f"tcp://{source_host}:{source_port}"
+        zmq_addr = make_zmq_path("tcp", source_host, source_port)
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=total_timeout_ms)
         try:
             req_socket.send(msgspec.msgpack.encode(agent_meta))
@@ -1017,7 +1025,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     def _zmq_listener_loop(self):
         socket = self.zmq_ctx.socket(zmq.ROUTER)
         try:
-            socket.bind(f"tcp://{self.host}:{self.zmq_port}")
+            socket.bind(make_zmq_path("tcp", self.host, self.zmq_port))
         except zmq.ZMQError as exc:
             # Any bind failure (EADDRINUSE, EADDRNOTAVAIL, EACCES, etc.)
             # is fatal for a sender — fail fast so __init__ propagates the error.
