@@ -226,6 +226,7 @@ class OrchestratorRequestState:
     final_stage_id: int = -1
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
+    finished_execution_stage_ids: set[int] = field(default_factory=set)
     termination_stage_ids: set[int] = field(default_factory=set)
     stage_terminations: tuple[StageTermination, ...] = ()
     termination_interrupted: bool = False
@@ -915,8 +916,14 @@ class Orchestrator:
         )
 
     async def _release_stage_credit(self, request_id: str, stage_id: int) -> None:
+        state = self.request_states.get(request_id)
+        if state is not None:
+            state.finished_execution_stage_ids.add(stage_id)
         if self._ensure_queue_controller().release_stage(request_id, stage_id):
             await self._drain_queue_control()
+
+    def _request_execution_finished(self, state: OrchestratorRequestState) -> bool:
+        return set(state.stage_submit_ts).issubset(state.finished_execution_stage_ids)
 
     @property
     def duplex_sessions(self) -> DuplexSessionRuntimeManager:
@@ -2406,14 +2413,16 @@ class Orchestrator:
             # terminal check so an earlier raw-only final branch is not later
             # misclassified as cancelled during aggregate cleanup.
             await self._release_stage_credit(request_id, stage_id)
-            if not pool.final_output:
-                continue
-
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
+            if (not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
+                    or not self._request_execution_finished(req_state)):
                 continue
 
-            final_output_type = getattr(pool.stage_client, "final_output_type", None)
+            # A non-output stage can acknowledge last. Keep its lease until that
+            # acknowledgement, then close the frontend on a declared output stage.
+            output_stage_id = stage_id if pool.final_output else req_state.final_stage_id
+            output_pool = self.stage_pools[output_stage_id]
+            final_output_type = getattr(output_pool.stage_client, "final_output_type", None)
             logger.info(
                 "[Orchestrator] req=%s stage-%s raw terminal produced no processed terminal; returning empty %s output",
                 request_id,
@@ -2423,17 +2432,17 @@ class Orchestrator:
             terminal_output = _build_terminal_empty_output(
                 request_id,
                 final_output_type=final_output_type,
-                audio_sample_rate=pool._infer_audio_sample_rate(),
+                audio_sample_rate=output_pool._infer_audio_sample_rate(),
             )
             await self._put_output(
                 OutputMessage(
                     request_id=request_id,
-                    stage_id=stage_id,
-                    replica_id=replica_id,
+                    stage_id=output_stage_id,
+                    replica_id=replica_id if output_stage_id == stage_id else None,
                     engine_outputs=terminal_output,
                     metrics=None,
                     finished=True,
-                    stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
+                    stage_submit_ts=req_state.stage_submit_ts.get(output_stage_id),
                 )
             )
             await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
@@ -2510,7 +2519,10 @@ class Orchestrator:
         if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
+            request_finished = (
+                final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
+                and self._request_execution_finished(req_state)
+            )
         # Duplex stage-0 segment boundaries are not client-visible outputs:
         # direct decisions are emitted by the model runtime extension below,
         # while spoken content flows through the next stage. Forwarding
