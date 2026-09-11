@@ -1880,6 +1880,18 @@ def get_stage_connector_spec(
     """Return the first connector spec for a stage data-plane edge."""
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
+    if async_chunk:
+        edges = getattr(omni_transfer_config, "connectors", {})
+        incoming = [spec for (source, target), spec in edges.items() if target == str(stage_id)]
+        outgoing = [spec for (source, target), spec in edges.items() if source == str(stage_id)]
+        specs = incoming + outgoing
+        if specs and any(spec.name == "MooncakeTransferEngineConnector" for spec in specs):
+            if len(incoming) > 1 or len(outgoing) > 1 or any(spec != specs[0] for spec in specs):
+                raise ValueError("Async Mooncake stages require one shared connector specification for adjacent edges")
+            extra = dict(specs[0].extra or {})
+            extra["role"] = "both" if incoming and outgoing else "receiver" if incoming else "sender"
+            return {"name": specs[0].name, "extra": extra}
+
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))

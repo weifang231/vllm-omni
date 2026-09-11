@@ -59,6 +59,15 @@ class AdditionalInformationPayload(msgspec.Struct):
     entries: dict[str, AdditionalInformationEntry]
 
 
+class ChunkTransferSource(msgspec.Struct, frozen=True):
+    """The upstream replica bound to one request's chunk stream."""
+
+    stage_id: int
+    replica_id: int
+    host: str
+    port: int
+
+
 class OmniEngineCoreRequest(EngineCoreRequest):
     """Engine core request for omni models with embeddings support.
 
@@ -85,6 +94,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # correlation id. Stage workers preserve this metadata but do not
     # interpret it.
     scheduling_metadata: RequestSchedulingMetadata | None = None
+    chunk_transfer_source: ChunkTransferSource | None = None
 
     @classmethod
     def from_request(
@@ -95,6 +105,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
         scheduling_metadata: RequestSchedulingMetadata | None = None,
+        chunk_transfer_source: ChunkTransferSource | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -106,6 +117,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
         if scheduling_metadata is None:
             scheduling_metadata = getattr(request, "scheduling_metadata", None)
+        if chunk_transfer_source is None:
+            chunk_transfer_source = getattr(request, "chunk_transfer_source", None)
 
         return cls(
             request_id=request.request_id,
@@ -131,6 +144,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
             scheduling_metadata=scheduling_metadata,
+            chunk_transfer_source=chunk_transfer_source,
         )
 
 

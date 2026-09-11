@@ -15,6 +15,7 @@ if TYPE_CHECKING:
         OmniTokensPrompt,
     )
     from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.engine import ChunkTransferSource
 
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
@@ -93,6 +94,8 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         base_port: int = ...,
         kv_transfer_port_offset: int = ...,
     ) -> dict[str, Any] | None: ...
+
+    def get_chunk_transfer_source(self) -> ChunkTransferSource: ...
 
 
 class StagePoolDiffusionClient(StagePoolClient, Protocol):

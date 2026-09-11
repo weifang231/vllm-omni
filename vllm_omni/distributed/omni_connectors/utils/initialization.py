@@ -39,6 +39,16 @@ KV_RANK_PORT_STRIDE = 16
 KV_REPLICA_PORT_STRIDE = 1024
 
 
+def chunk_zmq_port(base_port: int | str, stage_id: int, replica_id: int) -> int:
+    """Reserve the scheduler chunk endpoint in each replica's port block."""
+    if not 0 <= stage_id < KV_RANK_PORT_STRIDE or replica_id < 0:
+        raise ValueError("Invalid stage or replica for a chunk endpoint")
+    port = expand_env_int(base_port, "zmq_port") + replica_id * KV_REPLICA_PORT_STRIDE + stage_id
+    if not 0 < port < 65536:
+        raise ValueError(f"Chunk endpoint port is outside the TCP range: {port}")
+    return port
+
+
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
     purpose: str = "request_forwarding",

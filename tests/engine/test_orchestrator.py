@@ -701,6 +701,9 @@ async def test_async_prewarm_drains_after_upstream_release_and_stage_class_incre
 
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    from vllm_omni.engine import ChunkTransferSource
+    source = ChunkTransferSource(0, 2, "upstream-worker", 52099)
+    stage0.get_chunk_transfer_source = lambda: source
     processors = [
         FakeOutputProcessor(request_outputs=[_build_request_output("req-dependency", finished=True)]),
         FakeOutputProcessor(request_outputs=[_build_request_output("req-dependency", finished=True)]),
@@ -709,6 +712,9 @@ async def test_async_prewarm_drains_after_upstream_release_and_stage_class_incre
         [stage0, stage1],
         output_processors=processors,
         async_chunk=True,
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+                           SimpleNamespace(model_config=SimpleNamespace(max_model_len=64,
+                               stage_connector_config={"name": "MooncakeTransferEngineConnector"}))],
     )
 
     try:
@@ -744,6 +750,7 @@ async def test_async_prewarm_drains_after_upstream_release_and_stage_class_incre
         )
         replacement.replace(control_path)
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        assert stage1.add_request_calls[0][0].chunk_transfer_source == source
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-finished", 2.0))
         await _wait_for(lambda: "req-dependency" not in fixture.orchestrator.request_states)

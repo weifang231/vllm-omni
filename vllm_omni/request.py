@@ -14,7 +14,7 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import AdditionalInformationPayload, ChunkTransferSource, OmniEngineCoreRequest, PromptEmbedsPayload
 from vllm_omni.engine.queue_control import RequestSchedulingMetadata
 
 
@@ -41,6 +41,7 @@ class OmniRequest(Request):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
         scheduling_metadata: RequestSchedulingMetadata | None = None,
+        chunk_transfer_source: ChunkTransferSource | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -61,6 +62,7 @@ class OmniRequest(Request):
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
         self.scheduling_metadata = scheduling_metadata
+        self.chunk_transfer_source = chunk_transfer_source
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -109,6 +111,7 @@ class OmniRequest(Request):
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             scheduling_metadata=getattr(request, "scheduling_metadata", None),
+            chunk_transfer_source=getattr(request, "chunk_transfer_source", None),
             resumable=request.resumable,
             session_id=request.session_id,
             reasoning_ended=request.reasoning_ended,

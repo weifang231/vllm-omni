@@ -176,14 +176,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # --- Role ---
         # "sender": bind ZMQ listener, accept put() calls.
         # "receiver": skip ZMQ bind, only accept get() calls.
+        # "both": an intermediate async stage receives and publishes chunks.
         # The orchestration layer (get_connectors_config_for_stage /
         # kv_transfer_manager) is responsible for injecting the correct role.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
+        if role not in {"sender", "receiver", "both"}:
             raise ValueError(
-                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender' or 'receiver'."
+                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender', 'receiver', or 'both'."
             )
-        self.can_put = role == "sender"
+        self.can_put = role in {"sender", "both"}
 
         self.engine_id = str(uuid.uuid4())
 

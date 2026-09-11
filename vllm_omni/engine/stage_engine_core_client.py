@@ -24,9 +24,10 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
+    chunk_zmq_port,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import ChunkTransferSource, OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
@@ -151,6 +152,7 @@ class StageEngineCoreClientBase(StageClientBase):
         self.client_addresses = dict(client_addresses or {})
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._stage_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        self._stage_connector_config = getattr(vllm_config.model_config, "stage_connector_config", None)
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
@@ -349,6 +351,26 @@ class StageEngineCoreClientBase(StageClientBase):
             "host": str(self._kv_sender_host),
             "zmq_port": int(sender_port),
         }
+
+    def get_chunk_transfer_source(self) -> ChunkTransferSource:
+        """Advertise the same scheduler endpoint that the replica binds."""
+        config = self._stage_connector_config
+        if not config or config.get("name") != "MooncakeTransferEngineConnector":
+            raise ValueError("This replica has no Mooncake chunk endpoint")
+        extra = config.get("extra", {})
+        if extra.get("role") not in {"sender", "both"}:
+            raise ValueError("A receiver-only replica cannot be a chunk source")
+        # host_env belongs to the worker process; resolve remote hosts from the
+        # master's registration rather than evaluating that env on the head.
+        host = self._resolve_contact_host() if extra.get("host_env") else self._resolve_sender_host_from_config(extra)
+        if not host:
+            raise ValueError("The chunk source has no registered contact host")
+        return ChunkTransferSource(
+            stage_id=self.stage_id,
+            replica_id=self.replica_id,
+            host=host,
+            port=chunk_zmq_port(extra.get("zmq_port", 50051), self.stage_id, self.replica_id),
+        )
 
     def get_kv_sender_info(
         self,

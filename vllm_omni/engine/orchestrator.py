@@ -3583,7 +3583,16 @@ class Orchestrator:
                 async def submit_prewarm(
                     stage_pool: StagePool = next_pool,
                     stage_request: Any = request,
+                    destination_stage_id: int = next_stage_id,
                 ) -> None:
+                    # Upstream selection may have waited in the dispatch queue.
+                    # Bind at submission, after that replica is known.
+                    config = getattr(stage_pool.stage_vllm_config.model_config, "stage_connector_config", None)
+                    if config and config.get("name") == "MooncakeTransferEngineConnector":
+                        source_client = self.stage_pools[destination_stage_id - 1].get_bound_client(request_id)
+                        if source_client is None:
+                            raise RuntimeError("Async chunk dispatch has no bound upstream replica")
+                        stage_request.chunk_transfer_source = source_client.get_chunk_transfer_source()
                     await stage_pool.submit_initial(
                         request_id,
                         req_state,

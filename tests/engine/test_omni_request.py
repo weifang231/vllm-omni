@@ -111,3 +111,20 @@ def test_model_intermediate_buffer_round_trips_to_streaming_update():
     assert update is not None
     assert request.model_intermediate_buffer is buffer
     assert update.model_intermediate_buffer is buffer
+
+
+def test_chunk_source_survives_wire_clone_and_scheduler_conversion():
+    import msgspec
+    from vllm_omni.engine import ChunkTransferSource, OmniEngineCoreRequest
+
+    source = ChunkTransferSource(0, 2, "upstream-worker", 52099)
+    request = OmniEngineCoreRequest(
+        request_id="remote-chunk", prompt_token_ids=[1], mm_features=None,
+        sampling_params=SamplingParams(max_tokens=16), pooling_params=None,
+        arrival_time=1.0, lora_request=None, cache_salt=None,
+        data_parallel_rank=None, chunk_transfer_source=source,
+    )
+    restored = msgspec.msgpack.decode(msgspec.msgpack.encode(request), type=OmniEngineCoreRequest)
+    cloned = OmniEngineCoreRequest.from_request(restored)
+    scheduled = OmniRequest.from_engine_core_request(cloned, block_hasher=None)
+    assert scheduled.chunk_transfer_source == source

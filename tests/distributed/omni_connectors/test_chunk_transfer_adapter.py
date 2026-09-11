@@ -465,6 +465,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
                 )
             )
         model_config = SimpleNamespace(
+            stage_id=stage_id,
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
@@ -572,6 +573,33 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._finished_load_reqs
     assert "req-1" in adapter.upstream_exhausted_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_remote_poll_uses_each_requests_upstream_endpoint(build_adapter):
+    from vllm_omni.engine import ChunkTransferSource
+
+    adapter, connector = build_adapter(stage_id=1)
+    adapter._requires_chunk_source = True
+    connector.get.return_value = None
+    for replica in (2, 0, 2, 1):
+        request = _req(f"request-{replica}", RequestStatus.WAITING)
+        request.chunk_transfer_source = ChunkTransferSource(0, replica, f"worker-{replica}", 50051 + replica * 1024)
+        entry = _dequeue_load_entry(adapter, request)
+        adapter._poll_single_request(entry)
+        assert connector.get.call_args.kwargs["metadata"] == {
+            "source_host": f"worker-{replica}", "source_port": 50051 + replica * 1024}
+        adapter.cleanup_receiver(request.request_id)
+
+
+def test_remote_load_rejects_missing_upstream_before_enqueue(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    adapter._requires_chunk_source = True
+    request = _req("unbound", RequestStatus.WAITING)
+    request.chunk_transfer_source = None
+    with pytest.raises(ValueError, match="bound upstream chunk endpoint"):
+        adapter.load_async(request)
+    connector.get.assert_not_called()
+    assert not adapter._pending_load_reqs
 
 
 def test_load_async_does_not_requeue_registered_inflight_request(build_adapter):

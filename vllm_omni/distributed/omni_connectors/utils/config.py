@@ -39,7 +39,7 @@ def stage_sends_async_output(model_config: Any) -> bool:
     """Whether async output should be partitioned for connector transport."""
     role = get_stage_connector_role(model_config)
     if role is not None:
-        return role == "sender"
+        return role in {"sender", "both"}
     # Preserve legacy partitioning while keeping stage-0 orchestrator bridges
     # on the normal RequestOutput path.
     return getattr(model_config, "stage_id", None) != 0
