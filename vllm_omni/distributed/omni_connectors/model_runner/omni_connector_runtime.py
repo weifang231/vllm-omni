@@ -33,7 +33,9 @@ if TYPE_CHECKING:
 
 
 def needs_omni_connector(model_config: Any) -> bool:
-    """Whether a runner owns an input, output, or explicitly routed connector."""
+    """Runner payload transport excludes scheduler-owned async chunks."""
+    if getattr(model_config, "async_chunk", False):
+        return False
     return (
         bool(getattr(model_config, "requires_full_payload_input", False))
         or bool(getattr(model_config, "custom_process_next_stage_input_func", None))

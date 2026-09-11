@@ -15,6 +15,52 @@ class _Scheduler(OmniSchedulerMixin):
     pass
 
 
+@pytest.mark.parametrize("role", ["sender", "receiver"])
+def test_async_transport_has_one_owner_across_runner_and_scheduler(monkeypatch, role):
+    import zmq
+
+    from vllm_omni.worker.omni_connector_model_runner_mixin import needs_omni_connector
+
+    model_config = SimpleNamespace(
+        stage_id=0 if role == "sender" else 1,
+        async_chunk=True,
+        requires_full_payload_input=role == "receiver",
+        custom_process_next_stage_input_func="test.produce" if role == "sender" else None,
+        stage_connector_config={"name": "MooncakeTransferEngineConnector", "extra": {"role": role}},
+    )
+    context = zmq.Context()
+    sockets = []
+    endpoint = None
+
+    def create_transport(_config):
+        nonlocal endpoint
+        listener = context.socket(zmq.ROUTER)
+        sockets.append(listener)
+        if endpoint is None:
+            port = listener.bind_to_random_port("tcp://127.0.0.1")
+            endpoint = f"tcp://127.0.0.1:{port}"
+        else:
+            listener.bind(endpoint)
+        return listener
+
+    monkeypatch.setattr(omni_scheduler_mixin, "OmniChunkTransferAdapter", create_transport)
+    try:
+        # EngineCore constructs the runner before constructing the scheduler.
+        if needs_omni_connector(model_config):
+            create_transport(model_config)
+        scheduler = _Scheduler()
+        scheduler.vllm_config = SimpleNamespace(model_config=model_config)
+        scheduler._init_omni_io_scheduling_state()
+        assert len(sockets) == 1
+        assert scheduler.chunk_transfer_adapter is sockets[0]
+        model_config.async_chunk = False
+        assert needs_omni_connector(model_config)
+    finally:
+        for listener in sockets:
+            listener.close(linger=0)
+        context.term()
+
+
 def test_async_chunk_adapter_initializes_for_stage_zero_sender_and_stage_one_receiver(monkeypatch):
     created_adapters = []
 
