@@ -10,8 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponseStreamChoice
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.outputs import CompletionOutput, RequestOutput
 
 from tests.helpers.serving_chat import (
