@@ -1506,6 +1506,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             audio_chunk_arrivals_s.append(max(time.perf_counter() - stream_start_s, 0.0))
             audio_chunk_bytes.append(len(audio_bytes))
+
         adapter = self._get_tts_adapter()
         playback_start = (
             PlaybackStartBuffer(playback_start_config)
@@ -1680,6 +1681,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # bytes, but they must terminate as an error rather than cleanly.
             if tts_params is not None and usage_acc is not None:
                 self._validate_tts_generation(tts_params, usage_acc)
+            if playback_start is not None:
+                for held_item in emit_audio_items(playback_start.finish()):
+                    yield held_item
             mod_metrics = getattr(getattr(self, "engine_client", None), "mod_metrics", None)
             if mod_metrics is not None and audio_stage_id is not None and audio_replica_id is not None:
                 observe_audio_streaming_finalize(
@@ -1691,9 +1695,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     sample_rate=target_sample_rate or sample_rate_val,
                     channels=audio_channels,
                 )
-            if playback_start is not None:
-                for held_item in emit_audio_items(playback_start.finish()):
-                    yield held_item
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             if mod_metrics is not None:

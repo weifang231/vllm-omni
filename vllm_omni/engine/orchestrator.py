@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from itertools import islice
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import janus
 import torch

@@ -5813,6 +5813,34 @@ class TestTTSAsyncOffloading:
         assert len(chunks[0]) == 200
 
     @pytest.mark.asyncio
+    async def test_playback_start_preserves_resampled_tail_and_final_metrics(self, qwen3_tts_server, monkeypatch):
+        async def pcm_generator():
+            output = create_mock_audio_output_for_test()
+            output.multimodal_output.update(audio=torch.zeros(2400, dtype=torch.float32), sr=24000)
+            yield output
+
+        monkeypatch.setattr(qwen3_tts_server, "_observe_speech_audio_ttfp", lambda **_kwargs: (0, 0, True))
+        finalized = []
+        monkeypatch.setattr(
+            serving_speech_module, "observe_audio_streaming_finalize",
+            lambda _metrics, **values: finalized.append(values),
+        )
+        raw_request = SimpleNamespace(state=SimpleNamespace())
+        chunks = [chunk async for chunk in qwen3_tts_server._generate_audio_chunks(
+            pcm_generator(), "req-resampled-playback", response_format="wav",
+            target_sample_rate=8000, raw_request=raw_request,
+            playback_start_config=PlaybackStartConfig(target_ms=500.0),
+        )]
+        assert chunks[0][:4] == b"RIFF"
+        assert struct.unpack_from("<I", chunks[0], 24)[0] == 8000
+        assert len(b"".join(chunks[1:])) == 800 * 2
+        assert raw_request.state.playback_start_telemetry["release_reason"] == "eos"
+        assert raw_request.state.playback_start_telemetry["buffered_audio_ms"] == pytest.approx(100.0)
+        assert len(finalized) == 1
+        assert sum(finalized[0]["chunk_bytes"]) == 800 * 2
+        assert finalized[0]["sample_rate"] == 8000
+
+    @pytest.mark.asyncio
     async def test_playback_start_deadline_flushes_while_engine_pull_continues(self, qwen3_tts_server):
         engine_waiting = asyncio.Event()
         allow_second_chunk = asyncio.Event()
