@@ -13,13 +13,14 @@ own ZMQ allocation from :class:`OmniMasterServer` and (when an
 ``omni_coordinator_address`` is provided) its own
 :class:`OmniCoordClientForStage` reporting heartbeat / status.
 
-Liveness monitoring and shutdown are inherited from
-:class:`CoreEngineProcManager` unchanged.
+Liveness monitoring and shutdown timeouts follow :class:`CoreEngineProcManager`.
+Shutdown also records each child's exit status when runtime metrics are enabled.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import weakref
 from multiprocessing.process import BaseProcess
@@ -30,10 +31,10 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import numa_utils
 from vllm.utils.system_utils import get_mp_context
-from vllm.v1.engine.utils import CoreEngineProcManager
+from vllm.v1.engine.utils import CoreEngineProcManager, get_engine_process_shutdown_timeout
 from vllm.v1.executor import Executor
-from vllm.v1.utils import shutdown
 
+from vllm_omni.engine.process_cleanup import shutdown_stage_processes
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
 logger = init_logger(__name__)
@@ -59,6 +60,13 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
       added to every subprocess's kwargs.
     """
 
+    def shutdown(self, timeout: float | None = None) -> None:
+        self.manager_stopped.set()
+        finalizer = self._finalizer.detach()
+        if finalizer is not None:
+            _, callback, args, _ = finalizer
+            callback(*args, timeout=get_engine_process_shutdown_timeout(self._request_shutdown_timeout, timeout))
+
     def __init__(
         self,
         local_engine_count: int,
@@ -79,11 +87,11 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
-        # while reusing the parent's instance methods (shutdown, monitor).
+        # while reusing the parent's liveness monitor.
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
-        # Mirrors the vLLM 0.29 parent __init__: the inherited shutdown() reads
+        # Mirrors the vLLM 0.29 parent __init__: shutdown() reads
         # this to bound how long in-flight requests may drain. Omitting it makes
         # shutdown raise AttributeError, which leaves the engine core
         # subprocesses alive and hangs interpreter exit until the job timeout.
@@ -139,7 +147,13 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self._finalizer = weakref.finalize(
+            self,
+            shutdown_stage_processes,
+            self.processes,
+            omni_stage_id,
+            os.environ.get("VLLM_OMNI_RUNTIME_METRICS_DIR"),
+        )
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 

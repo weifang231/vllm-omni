@@ -8,6 +8,7 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
 import signal
 from typing import Any
@@ -134,6 +135,7 @@ class StageEngineCoreProc(EngineCoreProc):
             )
 
         engine_core: StageEngineCoreProc | None = None
+        clean_shutdown = False
         coord_client = None
         try:
             # NOTE: previous revisions hardcoded data_parallel_size=1 here
@@ -222,7 +224,13 @@ class StageEngineCoreProc(EngineCoreProc):
 
             engine_core.run_busy_loop()
 
-        except SystemExit:
+        except SystemExit as error:
+            clean_shutdown = (
+                error.code in (None, 0, _signal_exit_code(signal.SIGTERM), _signal_exit_code(signal.SIGINT))
+                and engine_core is not None
+                and engine_core.shutdown_state in (EngineShutdownState.REQUESTED, EngineShutdownState.SHUTTING_DOWN)
+                and not engine_core.has_work()
+            )
             logger.debug("StageEngineCoreProc exiting.")
             raise
         except Exception:
@@ -242,3 +250,7 @@ class StageEngineCoreProc(EngineCoreProc):
                     coord_client.close()
             if engine_core is not None:
                 engine_core.shutdown()
+            if clean_shutdown:
+                # shutdown() already unfreezes and collects the heap. Avoid a
+                # second full scan at interpreter exit after a drained run.
+                gc.freeze()
