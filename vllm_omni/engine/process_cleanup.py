@@ -9,6 +9,7 @@ import time
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 
+from vllm import envs
 from vllm.v1.utils import shutdown
 
 
@@ -19,6 +20,10 @@ def shutdown_stage_processes(
     timeout: float | None = None,
 ) -> None:
     started = time.monotonic()
+    if timeout is None:
+        # The parent must outlive worker grace (5s by default), SIGTERM
+        # escalation (4s), and EngineCore's own resource teardown.
+        timeout = envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS + 4.0 + 5.0
     try:
         shutdown(processes, timeout=timeout)
     finally:
